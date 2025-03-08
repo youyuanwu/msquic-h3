@@ -18,8 +18,20 @@ jobs:
     - name: Install rust stable
       uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: 1.78.0
+        toolchain: 1.85.0
         components: rustfmt, clippy
+
+    - name: run cmake
+      run: > 
+        cmake . -DCMAKE_BUILD_TYPE=${{ matrix.BUILD_TYPE }} -B build
+
+    - name: Prepare machine
+      working-directory: ./build/_deps/msquic-src
+      run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild -InstallTestCertificates
+      shell: pwsh
+
+    - name: run build
+      run: cmake --build build --config ${{ matrix.BUILD_TYPE }}
     
     - name: Run cargo check
       run: cargo check
@@ -29,12 +41,6 @@ jobs:
     
     - name: Run cargo clippy
       run: cargo clippy -- -D warnings
-
-    - name: run cmake
-      run: > 
-        cmake . -DCMAKE_BUILD_TYPE=${{ matrix.BUILD_TYPE }} -B build
-    - name: run build
-      run: cmake --build build --config ${{ matrix.BUILD_TYPE }}
 
     - name: Run cargo test
       if: runner.os == 'Windows' # ubuntu test skipped

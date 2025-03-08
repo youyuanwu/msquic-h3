@@ -16,41 +16,10 @@ FetchContent_Declare(
   URL ${release_url}
 )
 FetchContent_MakeAvailable(msquic_release)
-# generate winmd. defer generation task in .metadata csproj.
-find_program (
-    dotnet_exe
-    NAMES dotnet.exe
-    REQUIRED
-)
-
-set(_out_winmds
-  Microsoft.MsQuic.winmd
-  Windows.Win32.winmd
-)
-set(_out_winmd_paths "")
-foreach(_out_winmd ${_out_winmds})
-list(APPEND _out_winmd_paths ${CMAKE_CURRENT_SOURCE_DIR}/.windows/winmd/${_out_winmd})
-endforeach()
-
-add_custom_command(
-  OUTPUT ${_out_winmd_paths}
-  COMMAND ${dotnet_exe} build
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/.metadata
-  VERBATIM
-)
-
-add_custom_target(generate_winmd
-  DEPENDS ${_out_winmd_paths}
-)
 
 find_program(cargo_exe
   NAMES cargo
   REQUIRED
-)
-
-add_custom_target(generate_rust
-  COMMAND ${cargo_exe} run -p tools_api
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 # generate cert on windows:
@@ -78,3 +47,17 @@ endif()
   
 message(STATUS "Using TEST_CERT_HASH ${TEST_CERT_HASH}")
 endif(WIN32)
+
+# add msquic as git deps
+message(STATUS "fetching msquic")
+include(FetchContent)
+FetchContent_Declare(
+  msquic
+  GIT_REPOSITORY https://github.com/youyuanwu/msquic.git
+  GIT_TAG        9320b515fe9102eb605eaafc32abb3a704b97b1f
+)
+
+FetchContent_GetProperties(msquic)
+if(NOT msquic_POPULATED)
+  FetchContent_Populate(msquic)
+endif()

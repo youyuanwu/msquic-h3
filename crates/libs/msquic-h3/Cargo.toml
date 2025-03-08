@@ -1,17 +1,17 @@
 [package]
-name = "msquic"
+name = "msquic-h3"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-"msquic-sys2" = {path = "../msquic-sys2"}
 "hex" = "0.4"
 tokio = {version = "1", features = ["sync", "rt"]}
 tracing = { version = "0.1", features = ["log"] }
 bytes = "*"
 h3 = "0.0.6"
+msquic.workspace = true
 
 
 [dev-dependencies]
