@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/libs/msquic-h3-b"]
+  "crates/libs/msquic-h3"]
 
 [workspace.dependencies]
 # msquic-h3 = {path = "crates/libs/msquic-h3"}

@@ -364,7 +364,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "msquic-h3-b"
+name = "msquic-h3"
 version = "0.1.0"
 dependencies = [
  "bytes",
