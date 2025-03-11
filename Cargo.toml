@@ -1,10 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-#  "crates/libs/msquic-h3",
-  "build/_deps/msquic-src"
-, "crates/libs/msquic-h3-b"]
+  "crates/libs/msquic-h3-b"]
 
 [workspace.dependencies]
 # msquic-h3 = {path = "crates/libs/msquic-h3"}
-msquic = {path = "build/_deps/msquic-src"}
+msquic = { path = "build/_deps/msquic-src" }
