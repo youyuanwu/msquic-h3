@@ -5,4 +5,7 @@ members = [
 
 [workspace.dependencies]
 # msquic-h3 = {path = "crates/libs/msquic-h3"}
-msquic = { path = "build/_deps/msquic-src" }
+msquic = { path = "submodules/msquic" }
+
+# git dep will pull all submodules which recursively, which is too big.
+# msquic = { git = "https://github.com/youyuanwu/msquic.git", rev = "789b1b5eb25f867b3436547c68220b52bc2c1e4a"}

@@ -14,3 +14,15 @@ One can install msquic from apt:
 ```
 sudo apt-get install libmsquic
 ```
+
+## use submodules
+```sh
+git submodule update --init
+# init only 1 level
+cd submodules/msquic
+# for all
+git submodule update --init
+
+# for windows
+git submodule update --init submodules/xdp-for-windows
+```

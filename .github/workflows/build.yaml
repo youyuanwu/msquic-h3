@@ -21,12 +21,19 @@ jobs:
         toolchain: 1.85.0
         components: rustfmt, clippy
 
+    - name: Init submodules
+      run: git submodule update --init
+
+    - name: Init submodules of msquic
+      run: git submodule update --init
+      working-directory: ./submodules/msquic
+
     - name: run cmake
       run: > 
         cmake . -DCMAKE_BUILD_TYPE=${{ matrix.BUILD_TYPE }} -B build
 
     - name: Prepare machine
-      working-directory: ./build/_deps/msquic-src
+      working-directory: ./submodules/msquic
       run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild -InstallTestCertificates
       shell: pwsh
 

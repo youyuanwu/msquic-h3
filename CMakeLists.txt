@@ -47,17 +47,3 @@ endif()
   
 message(STATUS "Using TEST_CERT_HASH ${TEST_CERT_HASH}")
 endif(WIN32)
-
-# add msquic as git deps
-message(STATUS "fetching msquic")
-include(FetchContent)
-FetchContent_Declare(
-  msquic
-  GIT_REPOSITORY https://github.com/youyuanwu/msquic.git
-  GIT_TAG        789b1b5eb25f867b3436547c68220b52bc2c1e4a
-)
-
-FetchContent_GetProperties(msquic)
-if(NOT msquic_POPULATED)
-  FetchContent_Populate(msquic)
-endif()
