@@ -15,6 +15,11 @@ pub use buffer::*;
 mod listener;
 pub use listener::Listener;
 
+/// re-export msquic type
+pub mod msquic {
+    pub use ::msquic::*;
+}
+
 #[derive(Debug)]
 pub struct H3Error {
     status: Status,
@@ -183,9 +188,19 @@ pub struct StreamOpener {
     uni_temp: Option<H3Stream>,
 }
 
+impl Clone for StreamOpener {
+    fn clone(&self) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            bidi_temp: None,
+            uni_temp: None,
+        }
+    }
+}
+
 /// Server accept streams
 impl<B: Buf> h3::quic::Connection<B> for Connection {
-    type RecvStream = H3Stream;
+    type RecvStream = H3RecvStream;
 
     type OpenStreams = StreamOpener;
 
@@ -200,8 +215,8 @@ impl<B: Buf> h3::quic::Connection<B> for Connection {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Option<Self::RecvStream>, Self::AcceptError>> {
         let s = ready!(self.ctx.uni.poll_recv(cx)).unwrap_or(None);
-        // wrap for h3 type
-        std::task::Poll::Ready(Ok(s))
+        // wrap for h3 type. Drop the send stream part
+        std::task::Poll::Ready(Ok(s.map(|s| s.recv)))
     }
 
     #[cfg_attr(
@@ -751,6 +766,7 @@ mod test {
         }
 
         /// Use pwsh to get the test cert hash
+        #[cfg(target_os = "windows")]
         pub fn get_test_cert_hash() -> String {
             let output = std::process::Command::new("pwsh.exe")
                 .args(["-Command", "Get-ChildItem Cert:\\CurrentUser\\My | Where-Object -Property FriendlyName -EQ -Value MsQuicTestServer | Select-Object -ExpandProperty Thumbprint -First 1"]).

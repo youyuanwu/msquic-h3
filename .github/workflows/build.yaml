@@ -47,7 +47,7 @@ jobs:
       run: cargo fmt --all -- --check
     
     - name: Run cargo clippy
-      run: cargo clippy -- -D warnings
+      run: cargo clippy --all-targets -- -D warnings
 
     - name: Run cargo test
       if: runner.os == 'Windows' # ubuntu test skipped
