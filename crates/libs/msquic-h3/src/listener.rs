@@ -5,7 +5,7 @@ use msquic::{BufferRef, ListenerEvent, ListenerRef, Status};
 use tokio::sync::{mpsc, oneshot};
 
 pub struct Listener {
-    _inner: msquic::Listener,
+    inner: msquic::Listener,
     conn: ListenerCtxReceiver,
 }
 
@@ -15,7 +15,8 @@ struct ListenerCtxSender {
 }
 struct ListenerCtxReceiver {
     conn: mpsc::UnboundedReceiver<Option<crate::Connection>>,
-    shutdown: Option<oneshot::Receiver<()>>,
+    /// mutex used to make shutdown immutable
+    shutdown: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 fn listener_ctx_channel() -> (ListenerCtxSender, ListenerCtxReceiver) {
@@ -28,7 +29,7 @@ fn listener_ctx_channel() -> (ListenerCtxSender, ListenerCtxReceiver) {
         },
         ListenerCtxReceiver {
             conn: rx,
-            shutdown: Some(sh_rx),
+            shutdown: std::sync::Mutex::new(Some(sh_rx)),
         },
     )
 }
@@ -84,10 +85,12 @@ impl Listener {
         inner.open(reg, handler)?;
         let addr = local_addr.map(msquic::Addr::from);
         inner.start(alpn, addr.as_ref())?;
-        Ok(Self {
-            _inner: inner,
-            conn: rx,
-        })
+        Ok(Self { inner, conn: rx })
+    }
+
+    /// Get the inner listener ref.
+    pub fn get_ref(&self) -> &msquic::Listener {
+        &self.inner
     }
 
     #[cfg_attr(
@@ -106,9 +109,14 @@ impl Listener {
         std::future::poll_fn(|cx| self.poll_accept(cx)).await
     }
 
-    pub async fn shutdown(&mut self) {
-        if let Some(rx) = self.conn.shutdown.take() {
-            self._inner.stop();
+    /// shutdown is made immutable to enable it to be called from another thread.
+    pub async fn shutdown(&self) {
+        let opt_rx = {
+            let mut lk = self.conn.shutdown.lock().unwrap();
+            lk.take()
+        };
+        if let Some(rx) = opt_rx {
+            self.inner.stop();
             rx.await.expect("cannot receive");
         }
     }

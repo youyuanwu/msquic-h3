@@ -320,7 +320,7 @@ impl StreamOpener {
             let p = Pin::new(rx);
             ready!(std::future::Future::poll(p, cx))
         };
-        // current stream is either ready of error. So ready to be returned or dropped.
+        // current stream is either ready or error. So ready to be returned or dropped.
         let s = stream_holder.take().unwrap();
         let res = res
             .expect("cannot receive")
@@ -669,7 +669,7 @@ impl RecvStream for H3RecvStream {
         // Close the send path.
         let _ = self
             .stream
-            .shutdown(StreamShutdownFlags::GRACEFUL, error_code);
+            .shutdown(StreamShutdownFlags::ABORT_RECEIVE, error_code);
     }
 
     fn recv_id(&self) -> h3::quic::StreamId {
