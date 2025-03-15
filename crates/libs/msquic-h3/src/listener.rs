@@ -89,6 +89,7 @@ impl Listener {
     }
 
     /// Get the inner listener ref.
+    #[allow(clippy::should_implement_trait)]
     pub fn as_ref(&self) -> &msquic::Listener {
         &self.inner
     }
@@ -111,9 +112,10 @@ impl Listener {
 
     /// shutdown is made immutable to enable it to be called from another thread.
     pub async fn shutdown(&self) {
-        let mut lk = self.conn.shutdown.lock().unwrap();
-        let opt_rx = lk.take();
-        drop(lk);
+        let opt_rx = {
+            let mut lk = self.conn.shutdown.lock().unwrap();
+            lk.take()
+        };
         if let Some(rx) = opt_rx {
             self.inner.stop();
             rx.await.expect("cannot receive");
