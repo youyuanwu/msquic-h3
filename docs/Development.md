@@ -26,3 +26,8 @@ git submodule update --init
 # for windows
 git submodule update --init submodules/xdp-for-windows
 ```
+
+## Install msquic in vcpkg
+```
+vcpkg install msquic
+```
