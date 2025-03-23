@@ -756,6 +756,7 @@ mod test {
     use crate::Connection;
 
     pub mod util {
+        use msquic::Credential;
         // used for debugging
         pub const DEVEL_TRACE_LEVEL: tracing::Level = tracing::Level::TRACE;
 
@@ -767,7 +768,9 @@ mod test {
 
         /// Use pwsh to get the test cert hash
         #[cfg(target_os = "windows")]
-        pub fn get_test_cert_hash() -> String {
+        pub fn get_test_cred() -> Credential {
+            use msquic::CertificateHash;
+
             let output = std::process::Command::new("pwsh.exe")
                 .args(["-Command", "Get-ChildItem Cert:\\CurrentUser\\My | Where-Object -Property FriendlyName -EQ -Value MsQuicTestServer | Select-Object -ExpandProperty Thumbprint -First 1"]).
                 output().expect("Failed to execute command");
@@ -779,7 +782,54 @@ mod test {
                     s.pop();
                 }
             };
-            s
+            Credential::CertificateHash(CertificateHash::from_str(&s).unwrap())
+        }
+
+        /// Generate a test cert if not present using openssl cli.
+        #[cfg(not(target_os = "windows"))]
+        pub fn get_test_cred() -> Credential {
+            use msquic::CertificateFile;
+
+            let cert_dir = std::env::temp_dir().join("msquic_h3_test_rs");
+            let key = "key.pem";
+            let cert = "cert.pem";
+            let key_path = cert_dir.join(key);
+            let cert_path = cert_dir.join(cert);
+            if !key_path.exists() || !cert_path.exists() {
+                // remove the dir
+                let _ = std::fs::remove_dir_all(&cert_dir);
+                std::fs::create_dir_all(&cert_dir).expect("cannot create cert dir");
+                // generate test cert using openssl cli
+                let output = std::process::Command::new("openssl")
+                    .args([
+                        "req",
+                        "-x509",
+                        "-newkey",
+                        "rsa:4096",
+                        "-keyout",
+                        "key.pem",
+                        "-out",
+                        "cert.pem",
+                        "-sha256",
+                        "-days",
+                        "3650",
+                        "-nodes",
+                        "-subj",
+                        "/CN=localhost",
+                    ])
+                    .current_dir(cert_dir)
+                    .stderr(std::process::Stdio::inherit())
+                    .stdout(std::process::Stdio::inherit())
+                    .output()
+                    .expect("cannot generate cert");
+                if !output.status.success() {
+                    panic!("generate cert failed");
+                }
+            }
+            Credential::CertificateFile(CertificateFile::new(
+                key_path.display().to_string(),
+                cert_path.display().to_string(),
+            ))
         }
     }
 

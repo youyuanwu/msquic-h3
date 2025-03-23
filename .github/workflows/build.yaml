@@ -50,5 +50,4 @@ jobs:
       run: cargo clippy --all-targets -- -D warnings
 
     - name: Run cargo test
-      if: runner.os == 'Windows' # ubuntu test skipped
       run: cargo test --all -- --nocapture

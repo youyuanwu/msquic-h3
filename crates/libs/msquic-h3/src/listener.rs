@@ -122,7 +122,6 @@ impl Listener {
     }
 }
 
-#[cfg(target_os = "windows")]
 #[cfg(test)]
 mod test {
     use std::{
@@ -131,8 +130,8 @@ mod test {
     };
 
     use msquic::{
-        BufferRef, CertificateHash, Configuration, Credential, CredentialConfig, CredentialFlags,
-        Registration, RegistrationConfig, Settings,
+        BufferRef, Configuration, CredentialConfig, CredentialFlags, Registration,
+        RegistrationConfig, Settings,
     };
     use tracing::info;
 
@@ -142,8 +141,7 @@ mod test {
     fn basic_server_test() {
         crate::test::util::try_setup_tracing();
         info!("Test start");
-        let cert_hash = crate::test::util::get_test_cert_hash();
-        info!("Using cert_hash: [{cert_hash}]");
+        let cred = crate::test::util::get_test_cred();
 
         let reg = Registration::new(&RegistrationConfig::default()).unwrap();
         let alpn = [BufferRef::from("h3")];
@@ -156,9 +154,7 @@ mod test {
 
         let cred_config = CredentialConfig::new()
             .set_credential_flags(CredentialFlags::NO_CERTIFICATE_VALIDATION)
-            .set_credential(Credential::CertificateHash(
-                CertificateHash::from_str(&cert_hash).unwrap(),
-            ));
+            .set_credential(cred);
         config.load_credential(&cred_config).unwrap();
 
         let config = Arc::new(config);
