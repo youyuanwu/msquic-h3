@@ -1,8 +1,11 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use futures_util::ready;
+use futures::ready;
+use futures::{
+    channel::{mpsc, oneshot},
+    StreamExt,
+};
 use msquic::{BufferRef, ListenerEvent, ListenerRef, Status};
-use tokio::sync::{mpsc, oneshot};
 
 pub struct Listener {
     inner: msquic::Listener,
@@ -20,7 +23,7 @@ struct ListenerCtxReceiver {
 }
 
 fn listener_ctx_channel() -> (ListenerCtxSender, ListenerCtxReceiver) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded();
     let (sh_tx, sh_rx) = oneshot::channel();
     (
         ListenerCtxSender {
@@ -54,13 +57,13 @@ fn listener_callback(
             conn.set_configuration(config)?;
             let conn = crate::Connection::attach(conn);
             if let Some(tx) = ctx.conn.as_ref() {
-                tx.send(Some(conn)).expect("cannot send");
+                tx.unbounded_send(Some(conn)).expect("cannot send");
             }
         }
         ListenerEvent::StopComplete { .. } => {
             // none means end of connections
             if let Some(tx) = ctx.conn.as_ref() {
-                tx.send(None).expect("cannot send");
+                tx.unbounded_send(None).expect("cannot send");
             }
             let mut lk = ctx.shutdown.lock().unwrap();
             let tx = lk.take();
@@ -101,7 +104,7 @@ impl Listener {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Option<crate::Connection>, Status>> {
-        let s = ready!(self.conn.conn.poll_recv(cx)).unwrap_or(None);
+        let s = ready!(self.conn.conn.poll_next_unpin(cx)).unwrap_or(None);
         std::task::Poll::Ready(Ok(s))
     }
 

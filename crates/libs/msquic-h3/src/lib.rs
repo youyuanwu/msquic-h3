@@ -1,14 +1,17 @@
 use std::{ffi::c_void, pin::Pin, sync::Arc};
 
 use bytes::{Buf, BufMut, BytesMut};
-use futures_util::ready;
+// use futures_util::ready;
+use futures::{
+    channel::{mpsc, oneshot},
+    ready, StreamExt,
+};
 use h3::quic::{BidiStream, OpenStreams, RecvStream, SendStream};
 use msquic::{
     Configuration, ConnectionEvent, ConnectionRef, ConnectionShutdownFlags, ReceiveFlags,
     Registration, SendFlags, Status, StatusCode, StreamEvent, StreamOpenFlags, StreamRef,
     StreamShutdownFlags, StreamStartFlags,
 };
-use tokio::sync::{mpsc, oneshot};
 
 mod buffer;
 pub use buffer::*;
@@ -81,8 +84,8 @@ struct ConnCtxReceiver {
 
 fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
     let (conn_tx, conn_rx) = oneshot::channel();
-    let (bidi_tx, bidi_rx) = mpsc::unbounded_channel();
-    let (uni_tx, uni_rx) = mpsc::unbounded_channel();
+    let (bidi_tx, bidi_rx) = mpsc::unbounded();
+    let (uni_tx, uni_rx) = mpsc::unbounded();
     (
         ConnCtxSender {
             connected: Some(conn_tx),
@@ -111,11 +114,11 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
             let s = unsafe { msquic::Stream::from_raw(stream.as_raw()) };
             if flags.contains(StreamOpenFlags::UNIDIRECTIONAL) {
                 if let Some(uni) = ctx.uni.as_ref() {
-                    uni.send(Some(crate::H3Stream::attach(s)))
+                    uni.unbounded_send(Some(crate::H3Stream::attach(s)))
                         .expect("cannot send");
                 }
             } else if let Some(bidi) = ctx.bidi.as_ref() {
-                bidi.send(Some(crate::H3Stream::attach(s)))
+                bidi.unbounded_send(Some(crate::H3Stream::attach(s)))
                     .expect("cannot send");
             }
         }
@@ -214,7 +217,7 @@ impl<B: Buf> h3::quic::Connection<B> for Connection {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Option<Self::RecvStream>, Self::AcceptError>> {
-        let s = ready!(self.ctx.uni.poll_recv(cx)).unwrap_or(None);
+        let s = ready!(self.ctx.uni.poll_next_unpin(cx)).unwrap_or(None);
         // wrap for h3 type. Drop the send stream part
         std::task::Poll::Ready(Ok(s.map(|s| s.recv)))
     }
@@ -227,7 +230,7 @@ impl<B: Buf> h3::quic::Connection<B> for Connection {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Option<Self::BidiStream>, Self::AcceptError>> {
-        let s = ready!(self.ctx.bidi.poll_recv(cx)).unwrap_or(None);
+        let s = ready!(self.ctx.bidi.poll_next_unpin(cx)).unwrap_or(None);
         // wrap for h3 type
         std::task::Poll::Ready(Ok(s))
     }
@@ -404,9 +407,9 @@ struct SendStreamReceiveCtx {
 
 fn stream_ctx_channel() -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamReceiveCtx) {
     let (start_tx, start_rx) = oneshot::channel::<Result<(), Status>>();
-    let (send_tx, send_rx) = mpsc::unbounded_channel();
+    let (send_tx, send_rx) = mpsc::unbounded();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let (receive_tx, receive_rx) = mpsc::unbounded_channel();
+    let (receive_tx, receive_rx) = mpsc::unbounded();
     (
         StreamSendCtx {
             start: Some(start_tx),
@@ -445,7 +448,7 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
             client_context,
         } => {
             if let Some(send) = ctx.send.as_ref() {
-                send.send((cancelled, BufPtr(client_context)))
+                send.unbounded_send((cancelled, BufPtr(client_context)))
                     .expect("cannot send");
             } else {
                 debug_assert!(false, "mem leak");
@@ -461,7 +464,7 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
                     }
                 }
                 if !b.is_empty() {
-                    receive.send(b).expect("cannot send");
+                    receive.unbounded_send(b).expect("cannot send");
                 } else {
                     // zero buff can happen. so drop the receiver.
                     ctx.receive.take();
@@ -557,7 +560,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
             // no send is current so ready to get more.
             return std::task::Poll::Ready(Ok(()));
         }
-        match ready!(self.sctx.send.poll_recv(cx)) {
+        match ready!(self.sctx.send.poll_next_unpin(cx)) {
             Some((cancelled, ptr)) => {
                 self.sctx.send_inprogress = false;
                 // reattach buff
@@ -656,7 +659,7 @@ impl RecvStream for H3RecvStream {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Option<Self::Buf>, Self::Error>> {
-        let res = ready!(self.rctx.receive.poll_recv(cx));
+        let res = ready!(self.rctx.receive.poll_next_unpin(cx));
         std::task::Poll::Ready(Ok(res))
     }
 
