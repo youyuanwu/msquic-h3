@@ -1,11 +1,25 @@
-[workspace]
-resolver = "2"
-members = [
-  "crates/libs/msquic-h3"]
+[package]
+name = "msquic-h3"
+version = "0.1.0"
+edition = "2021"
 
-[workspace.dependencies]
-# msquic-h3 = {path = "crates/libs/msquic-h3"}
-msquic = { path = "submodules/msquic" }
+[lib]
+path = "msquic-h3/src/lib.rs"
 
-# git dep will pull all submodules which recursively, which is too big.
-# msquic = { git = "https://github.com/youyuanwu/msquic.git", rev = "789b1b5eb25f867b3436547c68220b52bc2c1e4a"}
+[dependencies]
+msquic = { version = "2.5.0-beta", path = "./submodules/msquic", default-features = false, features = ["find"]}
+tracing = { version = "0.1", optional = true }
+bytes = "1"
+h3 = "0.0.7"
+futures = { version = "0.3", default-features = false, features = ["std"]}
+
+[features]
+# default = ["tracing"]
+tracing = ["dep:tracing"]
+
+
+[dev-dependencies]
+http = "1.3"
+tokio = {version = "1", features = ["full"]}
+tracing-subscriber = "0.3"
+tracing = { version = "0.1", features = ["log"] }
