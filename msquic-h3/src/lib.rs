@@ -1,7 +1,6 @@
 use std::{ffi::c_void, pin::Pin, sync::Arc};
 
-use bytes::{Buf, BufMut, BytesMut};
-// use futures_util::ready;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{
     channel::{mpsc, oneshot},
     ready, StreamExt,
@@ -386,13 +385,13 @@ struct StreamSendCtx {
     // cancelled, client_context
     send: Option<mpsc::UnboundedSender<(bool, BufPtr)>>,
     shutdown: Option<oneshot::Sender<()>>,
-    receive: Option<mpsc::UnboundedSender<BytesMut>>,
+    receive: Option<mpsc::UnboundedSender<Bytes>>,
 }
 
 /// ctx for receiving data on frontend.
 #[derive(Debug)]
 struct RecvStreamReceiveCtx {
-    receive: mpsc::UnboundedReceiver<BytesMut>,
+    receive: mpsc::UnboundedReceiver<Bytes>,
 }
 
 /// ctx for sending data on frontend.
@@ -463,6 +462,7 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
                         b.put_slice(br.as_bytes());
                     }
                 }
+                let b = b.freeze();
                 if !b.is_empty() {
                     receive.unbounded_send(b).expect("cannot send");
                 } else {
@@ -647,7 +647,7 @@ fn get_id(s: &msquic::Stream) -> h3::quic::StreamId {
 }
 
 impl RecvStream for H3RecvStream {
-    type Buf = BytesMut;
+    type Buf = Bytes;
 
     type Error = H3Error;
 
@@ -713,7 +713,7 @@ impl<B: Buf> SendStream<B> for H3Stream {
 }
 
 impl RecvStream for H3Stream {
-    type Buf = BytesMut;
+    type Buf = Bytes;
 
     type Error = H3Error;
 
