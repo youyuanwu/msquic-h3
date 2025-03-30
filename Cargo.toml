@@ -7,7 +7,8 @@ edition = "2021"
 path = "msquic-h3/src/lib.rs"
 
 [dependencies]
-msquic = { version = "2.5.0-beta", path = "./submodules/msquic", default-features = false }
+# Use src
+msquic = { version = "2.5.0-beta", path = "./submodules/msquic" }
 tracing = { version = "0.1", optional = true }
 bytes = "1"
 h3 = "0.0.7"
