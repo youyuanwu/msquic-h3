@@ -21,10 +21,6 @@ jobs:
         toolchain: 1.85.0
         components: rustfmt, clippy
 
-    # init msquic only no recurse.
-    - name: Init submodules
-      run: git submodule update --init
-
     - name: Install msquic from apt (linux)
       if: runner.os == 'Linux'
       run: |

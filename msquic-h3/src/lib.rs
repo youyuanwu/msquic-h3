@@ -143,8 +143,7 @@ impl Connection {
         let (mut ctx, mut crx) = conn_ctx_channel();
         let handler =
             move |_: ConnectionRef, ev: ConnectionEvent| connection_callback(&mut ctx, ev);
-        let mut conn = msquic::Connection::new();
-        conn.open(reg, handler)?;
+        let conn = msquic::Connection::open(reg, handler)?;
         conn.start(config, server_name, server_port)?;
         // wait for connection.
         crx.connected
@@ -526,8 +525,7 @@ impl H3Stream {
             false => StreamOpenFlags::NONE,
         };
 
-        let mut s = msquic::Stream::new();
-        s.open(conn, flag, handler)?;
+        let s = msquic::Stream::open(conn, flag, handler)?;
         s.start(StreamStartFlags::NONE)?;
         let s = Arc::new(s);
         Ok(Self {
@@ -845,7 +843,7 @@ mod test {
         // create an client
         // open client
         let client_settings = Settings::new().set_IdleTimeoutMs(2000);
-        let client_config = Configuration::new(&reg, &[alpn], Some(&client_settings)).unwrap();
+        let client_config = Configuration::open(&reg, &[alpn], Some(&client_settings)).unwrap();
         {
             let cred_config = CredentialConfig::new_client()
                 .set_credential_flags(CredentialFlags::NO_CERTIFICATE_VALIDATION);

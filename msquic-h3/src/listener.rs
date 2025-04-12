@@ -84,8 +84,7 @@ impl Listener {
     ) -> Result<Self, Status> {
         let (tx, rx) = listener_ctx_channel();
         let handler = move |_: ListenerRef, ev: ListenerEvent| listener_callback(&tx, ev, &config);
-        let mut inner = msquic::Listener::new();
-        inner.open(reg, handler)?;
+        let inner = msquic::Listener::open(reg, handler)?;
         let addr = local_addr.map(msquic::Addr::from);
         inner.start(alpn, addr.as_ref())?;
         Ok(Self { inner, conn: rx })
@@ -153,7 +152,7 @@ mod test {
             .set_PeerBidiStreamCount(1)
             .set_IdleTimeoutMs(1000);
 
-        let config = Configuration::new(&reg, &alpn, Some(&settings)).unwrap();
+        let config = Configuration::open(&reg, &alpn, Some(&settings)).unwrap();
 
         let cred_config = CredentialConfig::new()
             .set_credential_flags(CredentialFlags::NO_CERTIFICATE_VALIDATION)

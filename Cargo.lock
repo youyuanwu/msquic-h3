@@ -267,7 +267,9 @@ dependencies = [
 
 [[package]]
 name = "msquic"
-version = "2.5.0-beta"
+version = "2.5.0-beta4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a2f39bfe01531b40e4795f9ed5ef8961a5f75bc321daf8eb547728504c7d23a"
 dependencies = [
  "bitflags",
  "c-types",
