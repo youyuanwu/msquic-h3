@@ -1,7 +1,15 @@
 [package]
 name = "msquic-h3"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
+license = "MIT"
+authors = ["youyuanwu@outlook.com"]
+repository = "https://github.com/youyuanwu/msquic-h3"
+documentation = "https://docs.rs/msquic-h3/latest/msquic-h3/"
+description = "MsQuic with h3"
+categories = ["web-programming", "network-programming"]
+keywords = ["quic", "h3"]
+readme = "./README.md"
 
 [lib]
 path = "msquic-h3/src/lib.rs"
