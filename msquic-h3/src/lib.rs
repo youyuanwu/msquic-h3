@@ -5,7 +5,9 @@ use futures::{
     channel::{mpsc, oneshot},
     ready, StreamExt,
 };
-use h3::quic::{BidiStream, OpenStreams, RecvStream, SendStream};
+use h3::quic::{
+    BidiStream, ConnectionErrorIncoming, OpenStreams, RecvStream, SendStream, StreamErrorIncoming,
+};
 use msquic::{
     Configuration, ConnectionEvent, ConnectionRef, ConnectionShutdownFlags, ReceiveFlags,
     Registration, SendFlags, Status, StatusCode, StreamEvent, StreamOpenFlags, StreamRef,
@@ -22,41 +24,41 @@ pub mod msquic {
     pub use ::msquic::*;
 }
 
-#[derive(Debug)]
-pub struct H3Error {
-    status: Status,
-    error_code: Option<u64>,
-}
+// #[derive(Debug)]
+// pub struct H3Error {
+//     status: Status,
+//     error_code: Option<u64>,
+// }
 
-impl H3Error {
-    pub fn new(status: Status, ec: Option<u64>) -> Self {
-        Self {
-            status,
-            error_code: ec,
-        }
-    }
-}
+// impl H3Error {
+//     pub fn new(status: Status, ec: Option<u64>) -> Self {
+//         Self {
+//             status,
+//             error_code: ec,
+//         }
+//     }
+// }
 
-impl h3::quic::Error for H3Error {
-    fn is_timeout(&self) -> bool {
-        self.status
-            .try_as_status_code()
-            .unwrap_or(StatusCode::QUIC_STATUS_SUCCESS)
-            == StatusCode::QUIC_STATUS_CONNECTION_TIMEOUT
-    }
+// impl h3::quic::Error for H3Error {
+//     fn is_timeout(&self) -> bool {
+//         self.status
+//             .try_as_status_code()
+//             .unwrap_or(StatusCode::QUIC_STATUS_SUCCESS)
+//             == StatusCode::QUIC_STATUS_CONNECTION_TIMEOUT
+//     }
 
-    fn err_code(&self) -> Option<u64> {
-        self.error_code
-    }
-}
+//     fn err_code(&self) -> Option<u64> {
+//         self.error_code
+//     }
+// }
 
-impl std::error::Error for H3Error {}
+// impl std::error::Error for H3Error {}
 
-impl std::fmt::Display for H3Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
+// impl std::fmt::Display for H3Error {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         write!(f, "{:?}", self)
+//     }
+// }
 
 #[derive(Debug)]
 pub struct Connection {
@@ -205,8 +207,6 @@ impl<B: Buf> h3::quic::Connection<B> for Connection {
 
     type OpenStreams = StreamOpener;
 
-    type AcceptError = H3Error;
-
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, level = "trace", ret)
@@ -214,10 +214,13 @@ impl<B: Buf> h3::quic::Connection<B> for Connection {
     fn poll_accept_recv(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Option<Self::RecvStream>, Self::AcceptError>> {
+    ) -> std::task::Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
         let s = ready!(self.ctx.uni.poll_next_unpin(cx)).unwrap_or(None);
         // wrap for h3 type. Drop the send stream part
-        std::task::Poll::Ready(Ok(s.map(|s| s.recv)))
+        std::task::Poll::Ready(
+            s.map(|s| s.recv)
+                .ok_or(ConnectionErrorIncoming::ApplicationClose { error_code: 0 }),
+        )
     }
 
     #[cfg_attr(
@@ -227,10 +230,10 @@ impl<B: Buf> h3::quic::Connection<B> for Connection {
     fn poll_accept_bidi(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Option<Self::BidiStream>, Self::AcceptError>> {
+    ) -> std::task::Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
         let s = ready!(self.ctx.bidi.poll_next_unpin(cx)).unwrap_or(None);
         // wrap for h3 type
-        std::task::Poll::Ready(Ok(s))
+        std::task::Poll::Ready(s.ok_or(ConnectionErrorIncoming::ApplicationClose { error_code: 0 }))
     }
 
     #[cfg_attr(
@@ -248,8 +251,6 @@ impl<B: Buf> OpenStreams<B> for StreamOpener {
 
     type SendStream = H3SendStream;
 
-    type OpenError = H3Error;
-
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, level = "trace", ret)
@@ -257,7 +258,7 @@ impl<B: Buf> OpenStreams<B> for StreamOpener {
     fn poll_open_bidi(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Self::BidiStream, Self::OpenError>> {
+    ) -> std::task::Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
         Self::poll_open_inner(&self.conn, false, &mut self.bidi_temp, cx)
     }
 
@@ -268,7 +269,7 @@ impl<B: Buf> OpenStreams<B> for StreamOpener {
     fn poll_open_send(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Self::SendStream, Self::OpenError>> {
+    ) -> std::task::Poll<Result<Self::SendStream, StreamErrorIncoming>> {
         let res = ready!(Self::poll_open_inner(
             &self.conn,
             true,
@@ -304,12 +305,14 @@ impl StreamOpener {
         uni: bool,
         stream_holder: &mut Option<H3Stream>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<H3Stream, H3Error>> {
+    ) -> std::task::Poll<Result<H3Stream, StreamErrorIncoming>> {
         if stream_holder.is_none() {
             // create new stream
             let s = match H3Stream::open_and_start(conn, uni) {
                 Ok(s) => s,
-                Err(e) => return std::task::Poll::Ready(Err(H3Error::new(e, None))),
+                Err(e) => {
+                    return std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(e.into())))
+                }
             };
             *stream_holder = Some(s);
         }
@@ -326,7 +329,7 @@ impl StreamOpener {
         let res = res
             .expect("cannot receive")
             .map(|_| s)
-            .map_err(|e| H3Error::new(e, None));
+            .map_err(|e| StreamErrorIncoming::Unknown(e.into()));
         std::task::Poll::Ready(res)
     }
 }
@@ -337,19 +340,17 @@ impl<B: Buf> OpenStreams<B> for Connection {
 
     type SendStream = H3SendStream;
 
-    type OpenError = H3Error;
-
     fn poll_open_bidi(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Self::BidiStream, Self::OpenError>> {
+    ) -> std::task::Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
         OpenStreams::<B>::poll_open_bidi(&mut self.opener, cx)
     }
 
     fn poll_open_send(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Self::SendStream, Self::OpenError>> {
+    ) -> std::task::Poll<Result<Self::SendStream, StreamErrorIncoming>> {
         OpenStreams::<B>::poll_open_send(&mut self.opener, cx)
     }
 
@@ -542,8 +543,6 @@ impl H3Stream {
 }
 
 impl<B: Buf> SendStream<B> for H3SendStream {
-    type Error = H3Error;
-
     // Seems like poll_ready is called after send_data is called.
     // To ensure data is sent.
     #[cfg_attr(
@@ -553,7 +552,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
     fn poll_ready(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+    ) -> std::task::Poll<Result<(), StreamErrorIncoming>> {
         if !self.sctx.send_inprogress {
             // no send is current so ready to get more.
             return std::task::Poll::Ready(Ok(()));
@@ -565,17 +564,15 @@ impl<B: Buf> SendStream<B> for H3SendStream {
                 let _: H3Buff<h3::quic::WriteBuf<B>> =
                     unsafe { H3Buff::from_raw(ptr.0 as *mut c_void) };
                 match cancelled {
-                    true => std::task::Poll::Ready(Err(H3Error::new(
-                        Status::from(StatusCode::QUIC_STATUS_ABORTED),
-                        None,
+                    true => std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(
+                        Status::from(StatusCode::QUIC_STATUS_ABORTED).into(),
                     ))),
                     false => std::task::Poll::Ready(Ok(())),
                 }
             }
             // closed.
-            None => std::task::Poll::Ready(Err(H3Error::new(
-                Status::from(StatusCode::QUIC_STATUS_ABORTED),
-                None,
+            None => std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(
+                Status::from(StatusCode::QUIC_STATUS_ABORTED).into(),
             ))),
         }
     }
@@ -584,7 +581,10 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         feature = "tracing",
         tracing::instrument(skip_all, level = "trace", ret, err)
     )]
-    fn send_data<T: Into<h3::quic::WriteBuf<B>>>(&mut self, data: T) -> Result<(), Self::Error> {
+    fn send_data<T: Into<h3::quic::WriteBuf<B>>>(
+        &mut self,
+        data: T,
+    ) -> Result<(), StreamErrorIncoming> {
         if self.sctx.send_inprogress {
             panic!("send while send is in progress.");
         }
@@ -596,7 +596,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
                 // reattach buff
                 let _: H3Buff<h3::quic::WriteBuf<B>> = unsafe { H3Buff::from_raw(ptr) };
             })
-            .map_err(|e| H3Error::new(e, None))?;
+            .map_err(|e| StreamErrorIncoming::Unknown(e.into()))?;
         self.sctx.send_inprogress = true;
         Ok(())
     }
@@ -609,17 +609,18 @@ impl<B: Buf> SendStream<B> for H3SendStream {
     fn poll_finish(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+    ) -> std::task::Poll<Result<(), StreamErrorIncoming>> {
         // Graceful sends a Fin to peer.
         if let Err(e) = self.stream.shutdown(StreamShutdownFlags::GRACEFUL, 0) {
-            return std::task::Poll::Ready(Err(H3Error::new(e, None)));
+            return std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(e.into())));
         }
         // poll the ctx
         let rx = &mut self.sctx.shutdown;
         let p = Pin::new(rx);
         // if backend is closed return error.
-        let res = ready!(std::future::Future::poll(p, cx))
-            .map_err(|_| H3Error::new(Status::from(StatusCode::QUIC_STATUS_ABORTED), None));
+        let res = ready!(std::future::Future::poll(p, cx)).map_err(|_| {
+            StreamErrorIncoming::Unknown(Status::from(StatusCode::QUIC_STATUS_ABORTED).into())
+        });
         std::task::Poll::Ready(res)
     }
 
@@ -647,8 +648,6 @@ fn get_id(s: &msquic::Stream) -> h3::quic::StreamId {
 impl RecvStream for H3RecvStream {
     type Buf = Bytes;
 
-    type Error = H3Error;
-
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, level = "trace", ret)
@@ -656,7 +655,7 @@ impl RecvStream for H3RecvStream {
     fn poll_data(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Option<Self::Buf>, Self::Error>> {
+    ) -> std::task::Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
         let res = ready!(self.rctx.receive.poll_next_unpin(cx));
         std::task::Poll::Ready(Ok(res))
     }
@@ -681,23 +680,24 @@ impl RecvStream for H3RecvStream {
 // bidi stream
 
 impl<B: Buf> SendStream<B> for H3Stream {
-    type Error = H3Error;
-
     fn poll_ready(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+    ) -> std::task::Poll<Result<(), StreamErrorIncoming>> {
         SendStream::<B>::poll_ready(&mut self.send, cx)
     }
 
-    fn send_data<T: Into<h3::quic::WriteBuf<B>>>(&mut self, data: T) -> Result<(), Self::Error> {
+    fn send_data<T: Into<h3::quic::WriteBuf<B>>>(
+        &mut self,
+        data: T,
+    ) -> Result<(), StreamErrorIncoming> {
         SendStream::<B>::send_data(&mut self.send, data)
     }
 
     fn poll_finish(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+    ) -> std::task::Poll<Result<(), StreamErrorIncoming>> {
         SendStream::<B>::poll_finish(&mut self.send, cx)
     }
 
@@ -713,12 +713,10 @@ impl<B: Buf> SendStream<B> for H3Stream {
 impl RecvStream for H3Stream {
     type Buf = Bytes;
 
-    type Error = H3Error;
-
     fn poll_data(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Option<Self::Buf>, Self::Error>> {
+    ) -> std::task::Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
         RecvStream::poll_data(&mut self.recv, cx)
     }
 
@@ -748,6 +746,7 @@ impl<B: Buf> BidiStream<B> for H3Stream {
 #[cfg(test)]
 mod test {
     use bytes::Buf;
+    use h3::error::ConnectionError;
     use http::Uri;
     use msquic::{
         BufferRef, Configuration, CredentialConfig, CredentialFlags, Registration,
@@ -865,8 +864,7 @@ mod test {
 
         tracing::info!("client start driver");
         let drive = async move {
-            std::future::poll_fn(|cx| driver.poll_close(cx)).await?;
-            Ok::<(), Box<dyn std::error::Error>>(())
+            Err::<(), ConnectionError>(futures::future::poll_fn(|cx| driver.poll_close(cx)).await)
         };
 
         // tokio::time::sleep(std::time::Duration::from_millis(3)).await;

@@ -205,8 +205,16 @@ mod test {
                             h3::server::Connection::new(conn).await.unwrap();
                         loop {
                             match h3_conn.accept().await {
-                                Ok(Some((req, mut stream))) => {
+                                Ok(Some(resolver)) => {
                                     tokio::spawn(async move {
+                                        let (req, mut stream) =
+                                            match resolver.resolve_request().await {
+                                                Ok(req) => req,
+                                                Err(e) => {
+                                                    info!("fail resolve request {e:#?}");
+                                                    return;
+                                                }
+                                            };
                                         info!("new request: {:#?}", req);
                                         drop(req);
                                         let resp =
@@ -253,10 +261,7 @@ mod test {
 
                                 Err(err) => {
                                     tracing::error!("error on accept {}", err);
-                                    match err.get_error_level() {
-                                        h3::error::ErrorLevel::ConnectionError => break,
-                                        h3::error::ErrorLevel::StreamError => continue,
-                                    }
+                                    break;
                                 }
                             }
                         }

@@ -18,7 +18,7 @@ path = "msquic-h3/src/lib.rs"
 msquic = { version = "2.5.0-beta4", default-features = false }
 tracing = { version = "0.1", optional = true }
 bytes = "1"
-h3 = "0.0.7"
+h3 = "0.0.8"
 futures = { version = "0.3", default-features = false, features = ["std"]}
 
 [features]
