@@ -2,8 +2,9 @@ use std::{ffi::c_void, pin::Pin, sync::Arc};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{
+    StreamExt,
     channel::{mpsc, oneshot},
-    ready, StreamExt,
+    ready,
 };
 use h3::quic::{
     BidiStream, ConnectionErrorIncoming, OpenStreams, RecvStream, SendStream, StreamErrorIncoming,
@@ -311,7 +312,7 @@ impl StreamOpener {
             let s = match H3Stream::open_and_start(conn, uni) {
                 Ok(s) => s,
                 Err(e) => {
-                    return std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(e.into())))
+                    return std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(e.into())));
                 }
             };
             *stream_holder = Some(s);

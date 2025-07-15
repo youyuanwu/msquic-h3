@@ -2,8 +2,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use futures::ready;
 use futures::{
-    channel::{mpsc, oneshot},
     StreamExt,
+    channel::{mpsc, oneshot},
 };
 use msquic::{BufferRef, ListenerEvent, ListenerRef, Status};
 

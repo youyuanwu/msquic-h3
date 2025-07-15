@@ -41,14 +41,14 @@ impl<B: Buf> H3Buff<B> {
     /// # Safety
     /// ptr must from into_raw
     pub unsafe fn from_raw(ptr: *mut c_void) -> Self {
-        let inner = Box::from_raw(ptr as *mut (Vec<BufferRef>, B));
+        let inner = unsafe { Box::from_raw(ptr as *mut (Vec<BufferRef>, B)) };
         Self { inner }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use bytes::{buf::Chain, Buf, Bytes};
+    use bytes::{Buf, Bytes, buf::Chain};
 
     use super::H3Buff;
 
