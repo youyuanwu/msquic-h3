@@ -26,44 +26,10 @@ pub mod msquic {
 }
 
 // #[derive(Debug)]
-// pub struct H3Error {
-//     status: Status,
-//     error_code: Option<u64>,
-// }
-
-// impl H3Error {
-//     pub fn new(status: Status, ec: Option<u64>) -> Self {
-//         Self {
-//             status,
-//             error_code: ec,
-//         }
-//     }
-// }
-
-// impl h3::quic::Error for H3Error {
-//     fn is_timeout(&self) -> bool {
-//         self.status
-//             .try_as_status_code()
-//             .unwrap_or(StatusCode::QUIC_STATUS_SUCCESS)
-//             == StatusCode::QUIC_STATUS_CONNECTION_TIMEOUT
-//     }
-
-//     fn err_code(&self) -> Option<u64> {
-//         self.error_code
-//     }
-// }
-
-// impl std::error::Error for H3Error {}
-
-// impl std::fmt::Display for H3Error {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         write!(f, "{:?}", self)
-//     }
-// }
-
-#[derive(Debug)]
 pub struct Connection {
     conn: Arc<msquic::Connection>,
+    // Only for tracking purposes.
+    _reg: Option<Arc<msquic::Registration>>,
     ctx: ConnCtxReceiver,
     opener: StreamOpener,
 }
@@ -137,8 +103,13 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
 
 impl Connection {
     /// Connects to the server
+    /// Note: Registration must be kept outside of connection
+    /// and must wait for all connections to finish before closing,
+    /// else registration close will wait on system lock, and block
+    /// rust runtime.
+    /// The arc of the registration is to track if all connection are closed.
     pub async fn connect(
-        reg: &Registration,
+        reg: Arc<Registration>,
         config: &Configuration,
         server_name: &str,
         server_port: u16,
@@ -146,7 +117,7 @@ impl Connection {
         let (mut ctx, mut crx) = conn_ctx_channel();
         let handler =
             move |_: ConnectionRef, ev: ConnectionEvent| connection_callback(&mut ctx, ev);
-        let conn = msquic::Connection::open(reg, handler)?;
+        let conn = msquic::Connection::open(&reg, handler)?;
         conn.start(config, server_name, server_port)?;
         // wait for connection.
         crx.connected
@@ -157,12 +128,13 @@ impl Connection {
 
         let conn = Arc::new(conn);
 
-        let opener = StreamOpener::new(conn.clone());
+        let opener = StreamOpener::new(conn.clone(), Some(reg.clone()));
 
         Ok(Self {
             conn,
             ctx: crx,
             opener,
+            _reg: Some(reg),
         })
     }
 
@@ -174,20 +146,23 @@ impl Connection {
         inner.set_callback_handler(handler);
         let conn = Arc::new(inner);
 
-        let opener = StreamOpener::new(conn.clone());
+        let opener = StreamOpener::new(conn.clone(), None);
 
         Self {
             conn,
             ctx: crx,
             opener,
+            _reg: None,
         }
     }
 }
 
 /// responsible for open streams on a connection.
-#[derive(Debug)]
+// #[derive(Debug)]
 pub struct StreamOpener {
     conn: Arc<msquic::Connection>,
+    // Only for tracking purposes.
+    _reg: Option<Arc<msquic::Registration>>,
     bidi_temp: Option<H3Stream>,
     uni_temp: Option<H3Stream>,
 }
@@ -198,6 +173,7 @@ impl Clone for StreamOpener {
             conn: self.conn.clone(),
             bidi_temp: None,
             uni_temp: None,
+            _reg: self._reg.clone(),
         }
     }
 }
@@ -242,7 +218,7 @@ impl<B: Buf> h3::quic::Connection<B> for Connection {
         tracing::instrument(skip_all, level = "trace", ret)
     )]
     fn opener(&self) -> Self::OpenStreams {
-        StreamOpener::new(self.conn.clone())
+        StreamOpener::new(self.conn.clone(), self._reg.clone())
     }
 }
 
@@ -292,9 +268,10 @@ impl<B: Buf> OpenStreams<B> for StreamOpener {
 }
 
 impl StreamOpener {
-    fn new(conn: Arc<msquic::Connection>) -> Self {
+    fn new(conn: Arc<msquic::Connection>, reg: Option<Arc<msquic::Registration>>) -> Self {
         Self {
             conn,
+            _reg: reg,
             bidi_temp: None,
             uni_temp: None,
         }
@@ -746,6 +723,8 @@ impl<B: Buf> BidiStream<B> for H3Stream {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use bytes::Buf;
     use h3::error::ConnectionError;
     use http::Uri;
@@ -837,7 +816,7 @@ mod test {
     pub(crate) async fn send_get_request(uri: Uri) {
         let app_name = String::from("testapp");
         let config = RegistrationConfig::new().set_app_name(app_name);
-        let reg = Registration::new(&config).unwrap();
+        let reg = Arc::new(Registration::new(&config).unwrap());
 
         let alpn = BufferRef::from("h3");
         // create an client
@@ -852,7 +831,7 @@ mod test {
 
         tracing::info!("client conn open and start");
         let conn = Connection::connect(
-            &reg,
+            reg.clone(),
             &client_config,
             uri.host().unwrap(),
             uri.port_u16().unwrap(),
