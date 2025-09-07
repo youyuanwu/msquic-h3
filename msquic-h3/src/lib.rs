@@ -125,7 +125,7 @@ impl Connection {
         let (mut ctx, mut crx) = conn_ctx_channel();
         let handler =
             move |_: ConnectionRef, ev: ConnectionEvent| connection_callback(&mut ctx, ev);
-        let conn = msquic::Connection::open(&reg, handler)?;
+        let conn = msquic::Connection::open(reg, handler)?;
         conn.start(config, server_name, server_port)?;
         // wait for connection.
         crx.connected
