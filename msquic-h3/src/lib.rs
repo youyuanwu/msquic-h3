@@ -25,11 +25,11 @@ pub mod msquic {
     pub use ::msquic::*;
 }
 
-// #[derive(Debug)]
+#[derive(Debug)]
 pub struct Connection {
     conn: Arc<msquic::Connection>,
     // Only for tracking purposes.
-    _reg: Option<Arc<msquic::Registration>>,
+    // _reg: Option<Arc<msquic::Registration>>,
     ctx: ConnCtxReceiver,
     opener: StreamOpener,
 }
@@ -38,6 +38,7 @@ pub struct Connection {
 #[derive(Debug)]
 struct ConnCtxSender {
     connected: Option<oneshot::Sender<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
     bidi: Option<mpsc::UnboundedSender<Option<crate::H3Stream>>>,
     uni: Option<mpsc::UnboundedSender<Option<crate::H3Stream>>>,
 }
@@ -46,22 +47,26 @@ struct ConnCtxSender {
 #[derive(Debug)]
 struct ConnCtxReceiver {
     connected: Option<oneshot::Receiver<()>>,
+    shutdown: Option<oneshot::Receiver<()>>,
     bidi: mpsc::UnboundedReceiver<Option<crate::H3Stream>>,
     uni: mpsc::UnboundedReceiver<Option<crate::H3Stream>>,
 }
 
 fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
     let (conn_tx, conn_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (bidi_tx, bidi_rx) = mpsc::unbounded();
     let (uni_tx, uni_rx) = mpsc::unbounded();
     (
         ConnCtxSender {
             connected: Some(conn_tx),
+            shutdown: Some(shutdown_tx),
             bidi: Some(bidi_tx),
             uni: Some(uni_tx),
         },
         ConnCtxReceiver {
             connected: Some(conn_rx),
+            shutdown: Some(shutdown_rx),
             bidi: bidi_rx,
             uni: uni_rx,
         },
@@ -95,6 +100,9 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
             ctx.connected.take();
             ctx.uni.take();
             ctx.bidi.take();
+            if let Some(shutdown) = ctx.shutdown.take() {
+                let _ = shutdown.send(());
+            }
         }
         _ => {}
     }
@@ -109,7 +117,7 @@ impl Connection {
     /// rust runtime.
     /// The arc of the registration is to track if all connection are closed.
     pub async fn connect(
-        reg: Arc<Registration>,
+        reg: &Registration,
         config: &Configuration,
         server_name: &str,
         server_port: u16,
@@ -128,13 +136,12 @@ impl Connection {
 
         let conn = Arc::new(conn);
 
-        let opener = StreamOpener::new(conn.clone(), Some(reg.clone()));
+        let opener = StreamOpener::new(conn.clone());
 
         Ok(Self {
             conn,
             ctx: crx,
             opener,
-            _reg: Some(reg),
         })
     }
 
@@ -146,23 +153,39 @@ impl Connection {
         inner.set_callback_handler(handler);
         let conn = Arc::new(inner);
 
-        let opener = StreamOpener::new(conn.clone(), None);
+        let opener = StreamOpener::new(conn.clone());
 
         Self {
             conn,
             ctx: crx,
             opener,
-            _reg: None,
+        }
+    }
+
+    /// Can only be called once after construction.
+    pub fn get_waiter(&mut self) -> ConnectionShutdownWaiter {
+        ConnectionShutdownWaiter {
+            rx: self.ctx.shutdown.take().unwrap(),
         }
     }
 }
 
+pub struct ConnectionShutdownWaiter {
+    rx: oneshot::Receiver<()>,
+}
+impl ConnectionShutdownWaiter {
+    /// wait for connection to be fully shutdown.
+    pub async fn wait(self) {
+        self.rx.await.unwrap();
+    }
+}
+
 /// responsible for open streams on a connection.
-// #[derive(Debug)]
+#[derive(Debug)]
 pub struct StreamOpener {
     conn: Arc<msquic::Connection>,
     // Only for tracking purposes.
-    _reg: Option<Arc<msquic::Registration>>,
+    // _reg: Option<Arc<msquic::Registration>>,
     bidi_temp: Option<H3Stream>,
     uni_temp: Option<H3Stream>,
 }
@@ -173,7 +196,7 @@ impl Clone for StreamOpener {
             conn: self.conn.clone(),
             bidi_temp: None,
             uni_temp: None,
-            _reg: self._reg.clone(),
+            // _reg: self._reg.clone(),
         }
     }
 }
@@ -218,7 +241,7 @@ impl<B: Buf> h3::quic::Connection<B> for Connection {
         tracing::instrument(skip_all, level = "trace", ret)
     )]
     fn opener(&self) -> Self::OpenStreams {
-        StreamOpener::new(self.conn.clone(), self._reg.clone())
+        StreamOpener::new(self.conn.clone())
     }
 }
 
@@ -268,10 +291,13 @@ impl<B: Buf> OpenStreams<B> for StreamOpener {
 }
 
 impl StreamOpener {
-    fn new(conn: Arc<msquic::Connection>, reg: Option<Arc<msquic::Registration>>) -> Self {
+    fn new(
+        conn: Arc<msquic::Connection>,
+        //reg: Option<Arc<msquic::Registration>>
+    ) -> Self {
         Self {
             conn,
-            _reg: reg,
+            //_reg: reg,
             bidi_temp: None,
             uni_temp: None,
         }
@@ -831,7 +857,7 @@ mod test {
 
         tracing::info!("client conn open and start");
         let conn = Connection::connect(
-            reg.clone(),
+            &reg,
             &client_config,
             uri.host().unwrap(),
             uri.port_u16().unwrap(),
