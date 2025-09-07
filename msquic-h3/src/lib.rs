@@ -28,8 +28,6 @@ pub mod msquic {
 #[derive(Debug)]
 pub struct Connection {
     conn: Arc<msquic::Connection>,
-    // Only for tracking purposes.
-    // _reg: Option<Arc<msquic::Registration>>,
     ctx: ConnCtxReceiver,
     opener: StreamOpener,
 }
@@ -115,7 +113,6 @@ impl Connection {
     /// and must wait for all connections to finish before closing,
     /// else registration close will wait on system lock, and block
     /// rust runtime.
-    /// The arc of the registration is to track if all connection are closed.
     pub async fn connect(
         reg: &Registration,
         config: &Configuration,
@@ -163,20 +160,23 @@ impl Connection {
     }
 
     /// Can only be called once after construction.
-    pub fn get_waiter(&mut self) -> ConnectionShutdownWaiter {
+    pub fn get_shutdown_waiter(&mut self) -> ConnectionShutdownWaiter {
         ConnectionShutdownWaiter {
             rx: self.ctx.shutdown.take().unwrap(),
         }
     }
 }
 
+/// wait for connection to be fully shutdown.
 pub struct ConnectionShutdownWaiter {
     rx: oneshot::Receiver<()>,
 }
 impl ConnectionShutdownWaiter {
     /// wait for connection to be fully shutdown.
     pub async fn wait(self) {
-        self.rx.await.unwrap();
+        self.rx
+            .await
+            .expect("failed to wait for connection shutdown");
     }
 }
 
@@ -184,8 +184,6 @@ impl ConnectionShutdownWaiter {
 #[derive(Debug)]
 pub struct StreamOpener {
     conn: Arc<msquic::Connection>,
-    // Only for tracking purposes.
-    // _reg: Option<Arc<msquic::Registration>>,
     bidi_temp: Option<H3Stream>,
     uni_temp: Option<H3Stream>,
 }
@@ -196,7 +194,6 @@ impl Clone for StreamOpener {
             conn: self.conn.clone(),
             bidi_temp: None,
             uni_temp: None,
-            // _reg: self._reg.clone(),
         }
     }
 }
@@ -291,13 +288,9 @@ impl<B: Buf> OpenStreams<B> for StreamOpener {
 }
 
 impl StreamOpener {
-    fn new(
-        conn: Arc<msquic::Connection>,
-        //reg: Option<Arc<msquic::Registration>>
-    ) -> Self {
+    fn new(conn: Arc<msquic::Connection>) -> Self {
         Self {
             conn,
-            //_reg: reg,
             bidi_temp: None,
             uni_temp: None,
         }
