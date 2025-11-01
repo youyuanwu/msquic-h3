@@ -1,27 +1,16 @@
 cmake_minimum_required(VERSION 3.16)
 
+if(WIN32)
+  # configure vcpkg
+  if ("$ENV{VCPKG_ROOT}" STREQUAL "")
+  message(FATAL_ERROR "VCPKG_ROOT not found")
+  endif()
+  set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+endif(WIN32)
+
 project(msquic-asio LANGUAGES)
 
-set(_msquic_version "v2.4.5")
-set(_win_pkg_url "https://github.com/microsoft/msquic/releases/download/${_msquic_version}/msquic_windows_x64_Release_schannel.zip")
-set(_linux_pkg_url "https://github.com/microsoft/msquic/releases/download/${_msquic_version}/msquic_linux_x64_Release_openssl.zip")
 if(WIN32)
-  # windows downloads release for winmd generation. And for sys2 import lib link.
-  set(release_url ${_win_pkg_url})
-message(STATUS "fetching msquic_release " ${release_url})
-include(FetchContent)
-FetchContent_Declare(
-  msquic_release
-  DOWNLOAD_EXTRACT_TIMESTAMP true
-  URL ${release_url}
-)
-FetchContent_MakeAvailable(msquic_release)
-
-find_program(cargo_exe
-  NAMES cargo
-  REQUIRED
-)
-
 # generate cert on windows:
 find_program(pwsh_exe
   NAMES pwsh.exe

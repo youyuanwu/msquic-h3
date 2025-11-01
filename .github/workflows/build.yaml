@@ -6,6 +6,7 @@ jobs:
   build:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         BUILD_TYPE: ["Debug"]
         os: [ windows-latest, ubuntu-latest ]
@@ -18,32 +19,46 @@ jobs:
     - name: Install rust stable
       uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: 1.88.0
+        toolchain: 1.90.0
         components: rustfmt, clippy
 
+    # choose a older version to avoid apt error
     - name: Install msquic from apt (linux)
       if: runner.os == 'Linux'
       run: |
         wget -q https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb;
         sudo dpkg -i packages-microsoft-prod.deb;
         sudo apt-get update;
-        sudo apt-get install libmsquic;
+        sudo apt-get install libmsquic=2.4.8;
         dpkg -L libmsquic;
 
     - name: Run Vcpkg (windows)
       if: runner.os == 'Windows'
       uses: lukka/run-vcpkg@v11
       with:
-        vcpkgGitCommitId: 7354f1c8a0a276072e8d73d7eb6df6ca0ce8ccb1
+        vcpkgGitCommitId: e3ed41868d5034bc608eaaa58383cd6ecdbb5ffb
+      env:
+        VCPKG_BINARY_SOURCES: default,rw
 
-    - name: vcpkg install msquic (windows)
+    - name: Set up binary cache
       if: runner.os == 'Windows'
-      run: vcpkg install msquic
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+        key: ${{ runner.os }}-vcpkg-binary-cache-${{ hashFiles('vcpkg*.json') }}
+        restore-keys: |
+          ${{ runner.os }}-vcpkg-binary-cache-
 
-    # generate cert.
     - name: run cmake
       run: > 
         cmake . -DCMAKE_BUILD_TYPE=${{ matrix.BUILD_TYPE }} -B build
+
+    # hack: copy msquic installed by vcpkg to system so that rust crate can find it.
+    - name: Copy msquic to system (windows)
+      if: runner.os == 'Windows'
+      run: |
+        New-Item -Path ${env:VCPKG_ROOT}/installed -ItemType Directory -Force
+        Copy-Item -Recurse -Force ./build/vcpkg_installed/* ${env:VCPKG_ROOT}/installed
 
     - name: run build
       run: cmake --build build --config ${{ matrix.BUILD_TYPE }}
