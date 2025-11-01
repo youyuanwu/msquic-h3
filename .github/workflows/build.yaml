@@ -49,16 +49,14 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-vcpkg-binary-cache-
 
+    - name: install msquic from vcpkg (windows)
+      if: runner.os == 'Windows'
+      run: |
+        vcpkg install msquic
+
     - name: run cmake
       run: > 
         cmake . -DCMAKE_BUILD_TYPE=${{ matrix.BUILD_TYPE }} -B build
-
-    # hack: copy msquic installed by vcpkg to system so that rust crate can find it.
-    - name: Copy msquic to system (windows)
-      if: runner.os == 'Windows'
-      run: |
-        New-Item -Path ${env:VCPKG_ROOT}/installed -ItemType Directory -Force
-        Copy-Item -Recurse -Force ./build/vcpkg_installed/* ${env:VCPKG_ROOT}/installed
 
     - name: run build
       run: cmake --build build --config ${{ matrix.BUILD_TYPE }}

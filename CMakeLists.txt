@@ -1,13 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
 
-if(WIN32)
-  # configure vcpkg
-  if ("$ENV{VCPKG_ROOT}" STREQUAL "")
-  message(FATAL_ERROR "VCPKG_ROOT not found")
-  endif()
-  set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
-endif(WIN32)
-
 project(msquic-asio LANGUAGES)
 
 if(WIN32)
