@@ -8,8 +8,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        BUILD_TYPE: ["Debug"]
         os: [ windows-latest, ubuntu-latest ]
+        rust: [ 1.90.0, 1.92.0 ]
     steps:
     - uses: actions/checkout@v4
 
@@ -19,7 +19,7 @@ jobs:
     - name: Install rust stable
       uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: 1.90.0
+        toolchain: ${{ matrix.rust }}
         components: rustfmt, clippy
 
     # choose a older version to avoid apt error
@@ -29,14 +29,14 @@ jobs:
         wget -q https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb;
         sudo dpkg -i packages-microsoft-prod.deb;
         sudo apt-get update;
-        sudo apt-get install libmsquic=2.4.8;
+        sudo apt-get install libmsquic=2.5.6;
         dpkg -L libmsquic;
 
     - name: Run Vcpkg (windows)
       if: runner.os == 'Windows'
       uses: lukka/run-vcpkg@v11
       with:
-        vcpkgGitCommitId: e3ed41868d5034bc608eaaa58383cd6ecdbb5ffb
+        vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35 # 2025.12.12
       env:
         VCPKG_BINARY_SOURCES: default,rw
 
@@ -56,19 +56,19 @@ jobs:
 
     - name: run cmake
       run: > 
-        cmake . -DCMAKE_BUILD_TYPE=${{ matrix.BUILD_TYPE }} -B build
+        cmake . -B build
 
     - name: run build
-      run: cmake --build build --config ${{ matrix.BUILD_TYPE }}
+      run: cmake --build build
     
     - name: Run cargo check
-      run: cargo check --all-targets --all-features
+      run: cargo +${{ matrix.rust }} check --all-targets --all-features
 
     - name: Run cargo fmt
-      run: cargo fmt --all -- --check
+      run: cargo +${{ matrix.rust }} fmt --all -- --check
     
     - name: Run cargo clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      run: cargo +${{ matrix.rust }} clippy --all-targets --all-features -- -D warnings
 
     - name: Run cargo test
-      run: cargo test --all -- --nocapture
+      run: cargo +${{ matrix.rust }} test --all -- --nocapture
