@@ -29,14 +29,14 @@ jobs:
         wget -q https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb;
         sudo dpkg -i packages-microsoft-prod.deb;
         sudo apt-get update;
-        sudo apt-get install libmsquic=2.5.6;
+        sudo apt-get install libmsquic=2.5.8;
         dpkg -L libmsquic;
 
     - name: Run Vcpkg (windows)
       if: runner.os == 'Windows'
       uses: lukka/run-vcpkg@v11
       with:
-        vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35 # 2025.12.12
+        vcpkgGitCommitId: 52c9e08cdf8580d2d9762f547d22b96fd81e82f2 # 2026.06.24
       env:
         VCPKG_BINARY_SOURCES: default,rw
 
