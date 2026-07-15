@@ -11,7 +11,7 @@ jobs:
         os: [ windows-latest, ubuntu-latest ]
         rust: [ 1.90.0, 1.97.0 ]
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Get latest version of CMake
       uses: lukka/get-cmake@latest
