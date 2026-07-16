@@ -11,23 +11,55 @@ use h3::quic::{
 };
 use msquic::{
     Configuration, ConnectionEvent, ConnectionRef, ConnectionShutdownFlags, ReceiveFlags,
-    Registration, SendFlags, Status, StatusCode, StreamEvent, StreamOpenFlags, StreamRef,
-    StreamShutdownFlags, StreamStartFlags,
+    SendFlags, Status, StatusCode, StreamEvent, StreamOpenFlags, StreamRef, StreamShutdownFlags,
+    StreamStartFlags,
 };
 
 mod buffer;
 pub use buffer::*;
 mod listener;
 pub use listener::Listener;
+mod registration;
+use registration::RundownGuard;
+pub use registration::{Registration, WaitIdle};
 
 /// re-export msquic type
 pub mod msquic {
     pub use ::msquic::*;
 }
 
+/// Owns the raw msquic connection handle together with its [`RundownGuard`].
+///
+/// Field order is load-bearing: `inner` is declared before `_guard`, so on drop
+/// `ConnectionClose` (which releases the registration rundown ref) runs before
+/// the guard decrements and wakes `wait_idle` waiters. The handle is shared
+/// behind an `Arc`, so this drop only happens once the last `Arc<ConnHandle>`
+/// (including `StreamOpener` clones) is gone.
+#[derive(Debug)]
+pub(crate) struct ConnHandle {
+    inner: msquic::Connection,
+    _guard: RundownGuard,
+}
+
+impl ConnHandle {
+    pub(crate) fn new(inner: msquic::Connection, guard: RundownGuard) -> Self {
+        Self {
+            inner,
+            _guard: guard,
+        }
+    }
+}
+
+impl std::ops::Deref for ConnHandle {
+    type Target = msquic::Connection;
+    fn deref(&self) -> &msquic::Connection {
+        &self.inner
+    }
+}
+
 #[derive(Debug)]
 pub struct Connection {
-    conn: Arc<msquic::Connection>,
+    conn: Arc<ConnHandle>,
     ctx: ConnCtxReceiver,
     opener: StreamOpener,
 }
@@ -108,47 +140,56 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
 }
 
 impl Connection {
-    /// Connects to the server
-    /// Note: Registration must be kept outside of connection
-    /// and must wait for all connections to finish before closing,
-    /// else registration close will wait on system lock, and block
-    /// rust runtime.
-    pub async fn connect(
-        reg: &Registration,
-        config: &Configuration,
-        server_name: &str,
+    /// Connects to the server.
+    ///
+    /// The rundown count is reserved synchronously when this is called (before
+    /// the returned future is polled), so even a queued/unpolled connect is
+    /// tracked by [`Registration::wait_idle`]. The registration must outlive all
+    /// its connections; `wait_idle` then `drop(reg)` is the safe teardown order.
+    pub fn connect<'a>(
+        reg: &'a Registration,
+        config: &'a Configuration,
+        server_name: &'a str,
         server_port: u16,
-    ) -> Result<Self, Status> {
-        let (mut ctx, mut crx) = conn_ctx_channel();
-        let handler =
-            move |_: ConnectionRef, ev: ConnectionEvent| connection_callback(&mut ctx, ev);
-        let conn = msquic::Connection::open(reg, handler)?;
-        conn.start(config, server_name, server_port)?;
-        // wait for connection.
-        crx.connected
-            .take()
-            .unwrap()
-            .await
-            .map_err(|_| Status::new(StatusCode::QUIC_STATUS_ABORTED))?;
+    ) -> impl std::future::Future<Output = Result<Self, Status>> + 'a {
+        // Reserved now, before the caller ever polls. If the future is dropped
+        // without completing, the guard drops and decrements.
+        let guard = RundownGuard::new(reg.state().clone());
+        async move {
+            let (mut ctx, mut crx) = conn_ctx_channel();
+            let handler =
+                move |_: ConnectionRef, ev: ConnectionEvent| connection_callback(&mut ctx, ev);
+            // Build the ordered handle immediately after `open`, before `start`
+            // and before the first await, so every success/error/cancellation
+            // path uses ConnHandle's proven ConnectionClose-then-guard drop
+            // order rather than the async future's unspecified capture layout.
+            let inner = msquic::Connection::open(reg.raw(), handler)?;
+            let conn = Arc::new(ConnHandle::new(inner, guard));
+            conn.start(config, server_name, server_port)?;
+            // wait for connection.
+            crx.connected
+                .take()
+                .unwrap()
+                .await
+                .map_err(|_| Status::new(StatusCode::QUIC_STATUS_ABORTED))?;
 
-        let conn = Arc::new(conn);
+            let opener = StreamOpener::new(conn.clone());
 
-        let opener = StreamOpener::new(conn.clone());
-
-        Ok(Self {
-            conn,
-            ctx: crx,
-            opener,
-        })
+            Ok(Self {
+                conn,
+                ctx: crx,
+                opener,
+            })
+        }
     }
 
     /// attach to an accepted connection
-    pub(crate) fn attach(inner: msquic::Connection) -> Self {
+    pub(crate) fn attach(inner: msquic::Connection, guard: RundownGuard) -> Self {
         let (mut ctx, crx) = conn_ctx_channel();
         let handler =
             move |_: ConnectionRef, ev: ConnectionEvent| connection_callback(&mut ctx, ev);
         inner.set_callback_handler(handler);
-        let conn = Arc::new(inner);
+        let conn = Arc::new(ConnHandle::new(inner, guard));
 
         let opener = StreamOpener::new(conn.clone());
 
@@ -183,7 +224,7 @@ impl ConnectionShutdownWaiter {
 /// responsible for open streams on a connection.
 #[derive(Debug)]
 pub struct StreamOpener {
-    conn: Arc<msquic::Connection>,
+    conn: Arc<ConnHandle>,
     bidi_temp: Option<H3Stream>,
     uni_temp: Option<H3Stream>,
 }
@@ -288,7 +329,7 @@ impl<B: Buf> OpenStreams<B> for StreamOpener {
 }
 
 impl StreamOpener {
-    fn new(conn: Arc<msquic::Connection>) -> Self {
+    fn new(conn: Arc<ConnHandle>) -> Self {
         Self {
             conn,
             bidi_temp: None,
@@ -298,7 +339,7 @@ impl StreamOpener {
 
     /// open a stream and poll it in the holder.
     fn poll_open_inner(
-        conn: &Arc<msquic::Connection>,
+        conn: &Arc<ConnHandle>,
         uni: bool,
         stream_holder: &mut Option<H3Stream>,
         cx: &mut std::task::Context<'_>,
@@ -747,10 +788,7 @@ mod test {
     use bytes::Buf;
     use h3::error::ConnectionError;
     use http::Uri;
-    use msquic::{
-        BufferRef, Configuration, CredentialConfig, CredentialFlags, Registration,
-        RegistrationConfig, Settings,
-    };
+    use msquic::{BufferRef, CredentialConfig, CredentialFlags, RegistrationConfig, Settings};
 
     use crate::Connection;
 
@@ -835,13 +873,15 @@ mod test {
     pub(crate) async fn send_get_request(uri: Uri) {
         let app_name = String::from("testapp");
         let config = RegistrationConfig::new().set_app_name(app_name);
-        let reg = Arc::new(Registration::new(&config).unwrap());
+        let reg = Arc::new(crate::Registration::new(&config).unwrap());
 
         let alpn = BufferRef::from("h3");
         // create an client
         // open client
         let client_settings = Settings::new().set_IdleTimeoutMs(2000);
-        let client_config = Configuration::open(&reg, &[alpn], Some(&client_settings)).unwrap();
+        let client_config = reg
+            .open_configuration(&[alpn], Some(&client_settings))
+            .unwrap();
         {
             let cred_config = CredentialConfig::new_client()
                 .set_credential_flags(CredentialFlags::NO_CERTIFICATE_VALIDATION);
@@ -917,6 +957,15 @@ mod test {
             tracing::error!("drive_res {e:?}");
         }
         tracing::info!("client ended success");
+
+        // Exercise the teardown contract: after the driver ended and the h3
+        // client (owning the Connection) was dropped, shutdown + wait_idle must
+        // resolve once every connection handle has closed. A timeout here would
+        // signal the RegistrationClose-blocking hang this feature prevents.
+        reg.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(5), reg.wait_idle())
+            .await
+            .expect("wait_idle should resolve after the connection closed");
     }
 
     #[test]

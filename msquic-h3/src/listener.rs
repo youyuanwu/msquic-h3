@@ -7,9 +7,14 @@ use futures::{
 };
 use msquic::{BufferRef, ListenerEvent, ListenerRef, Status};
 
+use crate::registration::{RundownGuard, RundownState};
+
 pub struct Listener {
     inner: msquic::Listener,
     conn: ListenerCtxReceiver,
+    // Dropped last: `inner`'s ListenerClose releases the native rundown ref
+    // before this guard decrements and wakes `wait_idle` waiters.
+    _guard: RundownGuard,
 }
 
 struct ListenerCtxSender {
@@ -39,23 +44,31 @@ fn listener_ctx_channel() -> (ListenerCtxSender, ListenerCtxReceiver) {
 
 #[cfg_attr(
     feature = "tracing",
-    tracing::instrument(skip(ctx, config), level = "trace", ret, err)
+    tracing::instrument(skip(ctx, config, state), level = "trace", ret, err)
 )]
 fn listener_callback(
     ctx: &ListenerCtxSender,
     ev: ListenerEvent,
     config: &Arc<msquic::Configuration>,
+    state: &Arc<RundownState>,
 ) -> Result<(), Status> {
     match ev {
         ListenerEvent::NewConnection {
             info: _,
             connection,
         } => {
-            let conn = unsafe { msquic::Connection::from_raw(connection.as_raw()) };
-            // TODO: need to set callback.
+            let inner = unsafe { msquic::Connection::from_raw(connection.as_raw()) };
+            // The native handle already holds a registration rundown ref here;
+            // reserve our count immediately.
+            let guard = RundownGuard::new(state.clone());
             // set the config
-            conn.set_configuration(config)?;
-            let conn = crate::Connection::attach(conn);
+            if let Err(e) = inner.set_configuration(config) {
+                // Close the handle first (releases the rundown ref), then the
+                // guard decrements.
+                drop(crate::ConnHandle::new(inner, guard));
+                return Err(e);
+            }
+            let conn = crate::Connection::attach(inner, guard);
             if let Some(tx) = ctx.conn.as_ref() {
                 tx.unbounded_send(Some(conn)).expect("cannot send");
             }
@@ -77,17 +90,31 @@ fn listener_callback(
 
 impl Listener {
     pub fn new(
-        reg: &msquic::Registration,
+        reg: &crate::Registration,
         config: Arc<msquic::Configuration>,
         alpn: &[BufferRef],
         local_addr: Option<SocketAddr>,
     ) -> Result<Self, Status> {
         let (tx, rx) = listener_ctx_channel();
-        let handler = move |_: ListenerRef, ev: ListenerEvent| listener_callback(&tx, ev, &config);
-        let inner = msquic::Listener::open(reg, handler)?;
+        let state = reg.state().clone();
+        let handler =
+            move |_: ListenerRef, ev: ListenerEvent| listener_callback(&tx, ev, &config, &state);
+        // Reserve the listener's guard BEFORE opening the native handle:
+        // `ListenerOpen` acquires the registration rundown before it returns, so
+        // reserving first ensures an in-flight construction is always counted.
+        // If `open` fails, this local guard drops and releases the reservation.
+        let guard = RundownGuard::new(reg.state().clone());
+        let inner = msquic::Listener::open(reg.raw(), handler)?;
         let addr = local_addr.map(msquic::Addr::from);
-        inner.start(alpn, addr.as_ref())?;
-        Ok(Self { inner, conn: rx })
+        // Build the struct before `start` so a start failure drops fields in
+        // declaration order (ListenerClose before the guard decrement).
+        let listener = Self {
+            inner,
+            conn: rx,
+            _guard: guard,
+        };
+        listener.inner.start(alpn, addr.as_ref())?;
+        Ok(listener)
     }
 
     /// Get the inner listener ref.
@@ -131,10 +158,7 @@ mod test {
         sync::Arc,
     };
 
-    use msquic::{
-        BufferRef, Configuration, CredentialConfig, CredentialFlags, Registration,
-        RegistrationConfig, Settings,
-    };
+    use msquic::{BufferRef, CredentialConfig, CredentialFlags, RegistrationConfig, Settings};
     use tracing::info;
 
     use crate::Listener;
@@ -145,14 +169,14 @@ mod test {
         info!("Test start");
         let cred = crate::test::util::get_test_cred();
 
-        let reg = Registration::new(&RegistrationConfig::default()).unwrap();
+        let reg = crate::Registration::new(&RegistrationConfig::default()).unwrap();
         let alpn = [BufferRef::from("h3")];
         let settings = Settings::new()
             .set_ServerResumptionLevel(msquic::ServerResumptionLevel::ResumeAndZerortt)
             .set_PeerBidiStreamCount(1)
             .set_IdleTimeoutMs(1000);
 
-        let config = Configuration::open(&reg, &alpn, Some(&settings)).unwrap();
+        let config = reg.open_configuration(&alpn, Some(&settings)).unwrap();
 
         let cred_config = CredentialConfig::new()
             .set_credential_flags(CredentialFlags::NO_CERTIFICATE_VALIDATION)
@@ -285,5 +309,57 @@ mod test {
         //std::thread::sleep(Duration::from_secs(1));
         sht_tx.send(()).unwrap();
         th.join().unwrap();
+    }
+
+    /// A live listener holds a rundown guard, so `wait_idle` must stay pending
+    /// until the listener is dropped (no client involved). Guards against the
+    /// listener-rundown hang and the reserve-before-open race.
+    #[test]
+    fn listener_keeps_wait_idle_pending() {
+        use std::time::Duration;
+
+        crate::test::util::try_setup_tracing();
+        let cred = crate::test::util::get_test_cred();
+
+        let reg = crate::Registration::new(&RegistrationConfig::default()).unwrap();
+        let alpn = [BufferRef::from("h3")];
+        let settings = Settings::new().set_IdleTimeoutMs(1000);
+        let config = reg.open_configuration(&alpn, Some(&settings)).unwrap();
+        let cred_config = CredentialConfig::new()
+            .set_credential_flags(CredentialFlags::NO_CERTIFICATE_VALIDATION)
+            .set_credential(cred);
+        config.load_credential(&cred_config).unwrap();
+        let config = Arc::new(config);
+
+        let l = Listener::new(
+            &reg,
+            config,
+            &alpn,
+            Some(SocketAddr::new(
+                std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                0, // ephemeral port; no client connects here
+            )),
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // While the listener is alive, wait_idle must not resolve.
+            let pending = tokio::time::timeout(Duration::from_millis(100), reg.wait_idle()).await;
+            assert!(
+                pending.is_err(),
+                "wait_idle resolved while a listener was still alive"
+            );
+
+            // Dropping the listener runs ListenerClose then decrements the guard.
+            drop(l);
+
+            tokio::time::timeout(Duration::from_secs(2), reg.wait_idle())
+                .await
+                .expect("wait_idle should resolve after the listener is dropped");
+        });
     }
 }
