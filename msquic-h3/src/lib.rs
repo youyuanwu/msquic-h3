@@ -827,6 +827,13 @@ mod test {
         pub fn get_test_cred() -> Credential {
             use msquic::CertificateFile;
 
+            // Serialize cert generation across parallel tests in the same
+            // process. Without this, two tests racing on the shared cert dir
+            // can delete/recreate it out from under each other's `openssl`
+            // invocation, which then fails to spawn with NotFound.
+            static CERT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _lock = CERT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
             let cert_dir = std::env::temp_dir().join("msquic_h3_test_rs");
             let key = "key.pem";
             let cert = "cert.pem";
@@ -854,7 +861,7 @@ mod test {
                         "-subj",
                         "/CN=localhost",
                     ])
-                    .current_dir(cert_dir)
+                    .current_dir(&cert_dir)
                     .stderr(std::process::Stdio::inherit())
                     .stdout(std::process::Stdio::inherit())
                     .output()
