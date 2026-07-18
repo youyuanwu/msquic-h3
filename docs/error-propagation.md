@@ -284,7 +284,7 @@ measurements (per MF-5/T2), then either ratify the value, lower the cap, or adop
 internal chunking (a separate future design that would make the reducer track
 multiple native sends per `send_data`). Until those measurements are in, 16 MiB
 is a provisional working value, not a decided ceiling; see MF-5/T2 for the
-decision table and the appendix constant note. The allocation crossing FFI
+decision table and the as-built `MAX_ADAPTER_SEND` constant. The allocation crossing FFI
 contains only owned `Bytes` plus pointer metadata, and the callback knows its
 concrete destructor. The old generic `H3Buff` can be deleted after its remaining
 uses are removed.
@@ -303,7 +303,7 @@ cancelled without any published connection reason, it should map to the nested
 recorded reason" classification used at lines 296-297 and by the required
 mapping), never `Unknown` and never a panic. (Resolves review C-1: the earlier
 "should be `Unknown`" wording is superseded by `InternalError` so the prose,
-the mapping table, and the appendix agree.)
+the mapping table, and the as-built code agree.)
 
 `poll_open_inner` checks the shared connection terminal before creating a
 native stream and again before polling an existing `OpeningStream`. A published
@@ -397,8 +397,8 @@ against the **borrowed** handle:
    query is `Api::get_param_auto::<u64>(handle, QUIC_PARAM_STREAM_ID)` internally,
    whose failure surfaces as `Err(Status)`. Do not use the raw parameter API and
    do not fork on adding a borrowed query; the deref query is the single chosen
-   implementation. See the [Accepted-stream ID query](#accepted-stream-id-query)
-   appendix for the exact signature and safety contract.
+   implementation. See the accepted-stream ID query in `msquic-h3/src/lib.rs`
+   for the exact signature and safety contract.
 2. `u64::try_into::<h3::quic::StreamId>() -> Result<_, h3::quic::InvalidStreamId>`
    — MsQuic IDs are 62-bit so this is impossible by contract, but still handled.
 
@@ -814,7 +814,7 @@ v2.5.1 native `QuicStreamClose` source and the binding's uniform
 inline-drain-on-close contract** (both below) — *not* from an adapter unit test,
 because the public API cannot deterministically hold a real native send
 outstanding across a drop-triggered `StreamClose` (see
-[Native-test mechanisms](#native-test-mechanisms)). What the adapter *does*
+[As-built implementation](#as-built-implementation)). What the adapter *does*
 unit-test is its own exactly-once `Box<SendBuffer>` reclamation on the production
 `SendComplete` callback path (the `CountingExec` seam test); the native
 inline-drain-on-close behavior that makes the drain safe is a *documented
@@ -889,7 +889,7 @@ expectation** on whatever library is linked — argued from the v2.5.1
 `QuicStreamClose` source above and the binding's uniform `close_inner` contract,
 **not** asserted by an adapter unit test: the public API cannot deterministically
 hold a native send outstanding across `StreamClose` (per
-[Native-test mechanisms](#native-test-mechanisms)), so no such native teardown
+[As-built implementation](#as-built-implementation)), so no such native teardown
 test exists. The release-gate loopback conformance suite still exercises the
 accepted-send `SendComplete`/reclaim-once ordering, and the `CountingExec` seam
 test proves the adapter's own exactly-once reclamation bookkeeping — but neither
@@ -932,7 +932,7 @@ Two smaller points from those reviews are retained but deferred, not blocking:
    from an adapter drop-triggered `StreamClose` teardown test — no such test
    exists, because the public API cannot deterministically hold a native send
    outstanding across the close (see
-   [Native-test mechanisms](#native-test-mechanisms)). The available send
+   [As-built implementation](#as-built-implementation)). The available send
    conformance tests — the `CountingExec` seam tests
    (`accepted_send_reclaims_via_callback_exactly_once`,
    `immediate_send_failure_reclaims_without_completion`) and the loopback
@@ -1516,7 +1516,7 @@ Required loopback tests:
 The observably-outstanding retain/reclaim transition and the exactly-once
 `SendComplete` ownership contract are therefore proven by **seam tests, not
 loopback tests** — the deterministic `CountingExec` send seam described in the
-[Native-test mechanisms](#native-test-mechanisms) appendix:
+[As-built implementation](#as-built-implementation) section:
 
 - outstanding-send retain/reclaim: the seam retains the submitted
   `Box<SendBuffer>` in a test-held `client_context` slot, so the reclamation
@@ -1525,7 +1525,7 @@ loopback tests** — the deterministic `CountingExec` send seam described in the
   no `[patch.crates.io]` entry, and no raw `set_param` helper**; the earlier
   "extend the binding with a `set_SendBufferingEnabled(bool)` setter" and
   "test-only raw-settings fallback" requirements are withdrawn in favor of the
-  appendix's public-API decision. The seam test proves four distinct facts, in
+  as-built public-API decision. The seam test proves four distinct facts, in
   order: (1) the deterministic blocking condition was established (the seam
   retained the buffer without a `SendComplete`); (2) exactly one adapter
   allocation remained outstanding after the submit call returned; (3) feeding the
@@ -1547,14 +1547,15 @@ forcing that drop path — so close-time / inline-drain compatibility is **not**
 asserted by any test here. It rests on native-source review (`QuicStreamClose`
 inline `SendComplete` drain) plus the binding's uniform `close_inner` close
 contract (per ~793–805/~862–881 and the
-[Native-test mechanisms](#native-test-mechanisms) appendix, ~3092–3099).
+[As-built implementation](#as-built-implementation) section).
 
 ## Society-of-thought review resolutions (round 13)
 
 This section is the stable, authoritative record of how the round-13
 society-of-thought review (7 Must-Fix, 10 Should-Fix, 5 Trade-offs, 9 Consider)
-is resolved. It supersedes the appendix below wherever they differ (see the
-appendix banner). Trade-offs are decided with the fixed priority hierarchy
+is resolved. It is the authoritative design of record; the pre-implementation
+scaffold that formerly followed it has been removed (see the
+[As-built implementation](#as-built-implementation) section). Trade-offs are decided with the fixed priority hierarchy
 **Correctness > Security > Reliability > Performance > Maintainability >
 Developer Experience**. Code-level claims below were re-verified against the real
 repo (`Cargo.toml`, `msquic-h3/src/*`, `.github/workflows/build.yaml`) and the
@@ -1565,7 +1566,8 @@ h3-quinn-0.0.10}`).
 
 **Problem.** The narrative makes chronological enqueue order the tiebreaker
 between graceful `FinishComplete` and a later `TerminalWake` ("Send-side
-transitions" and the send transition table), but the appendix routes
+transitions" and the send transition table), but an earlier pre-implementation
+draft routed
 `FinishComplete` through a separate `shutdown` one-shot (`StreamSendCtx.shutdown`
 / `SendStreamReceiveCtx.shutdown`) while `TerminalWake` and data `Complete` ride
 the `send` mpsc, and `poll_send_channel` always drains the mpsc first. A
@@ -1634,7 +1636,9 @@ without a network).
 
 **Problem.** The unsafe close-time reclamation premise depends on the *actual
 loaded* binary's inline-drain / exactly-once behavior, but the preflight only
-compares `QUIC_PARAM_GLOBAL_LIBRARY_VERSION` to `[2,5,1]`; provenance is a
+compares `QUIC_PARAM_GLOBAL_LIBRARY_VERSION` to a single hard-coded version for
+every provenance row (wrong once the rows resolve to different patch versions —
+see the per-row gate in the decision below); provenance is a
 `find`↔`src` edit inside `[dev-dependencies]` (an uncommitted manifest change,
 not a committed CI dimension); and the `teardown` substring test filter may match
 none of the named seam tests.
@@ -1677,8 +1681,10 @@ none of the named seam tests.
    the `static` feature is set, which these jobs do not set). The preflight
    attests the **loaded** binary two ways:
    - **Live-handle identity (primary).** Query, through the live MsQuic handle the
-     test process is using, `QUIC_PARAM_GLOBAL_LIBRARY_VERSION` (must equal
-     `[2,5,1]`) **and** `QUIC_PARAM_GLOBAL_LIBRARY_GIT_HASH` (param id `8`,
+     test process is using, `QUIC_PARAM_GLOBAL_LIBRARY_VERSION` (must equal the
+     row's pinned version — **`[2,5,8]` for `native-find`**, **`[2,5,1]` for
+     `native-src`**; the as-built gate is per row, see the Phase 9 attestation
+     policy) **and** `QUIC_PARAM_GLOBAL_LIBRARY_GIT_HASH` (param id `8`,
      `char[64]` null-terminated). Both values are produced by code inside the
      actually-loaded image, so they attest the running library regardless of file
      path (verified: `msquic-2.5.1-beta/src/core/library.c`
@@ -1837,7 +1843,7 @@ multi-stream measurements before a value is committed:
 Measurements to add before committing: multi-stream latency (concurrent large
 sends) and aggregate retained bytes, not only the single 16 MiB copy. Until the
 table is filled and a value chosen, `MAX_ADAPTER_SEND` is documented as
-provisional (see the finding-5 text and the appendix constant note).
+provisional (see the finding-5 text and the as-built `MAX_ADAPTER_SEND` constant).
 
 ### MF-6 — release, versioning, migration, and rollback
 
@@ -1872,14 +1878,18 @@ blocking).**
 
 ### MF-7 / T5 — the appendix is a temporary scaffold, not a second source of truth
 
-**Decision (Maintainability, once code exists).** The ~1,800-line appendix
-(lines 1536–end) is demoted from "normative / takes precedence" to a **temporary
-pre-implementation scaffold** with an explicit expiry banner and cleanup
-checklist (added at the head of the appendix) and a release-gate item
-(implementation-order item 10). The living design of record is the narrative
-above plus this resolutions section — invariants, interfaces, mappings, and
-rationale. No depended-on invariant is deleted: the cleanup checklist requires
-promoting any such invariant into the narrative before the appendix is removed.
+**Decision (Maintainability, once code exists).** The ~1,800-line appendix was
+demoted from "normative / takes precedence" to a **temporary pre-implementation
+scaffold** and, now that the implementation has landed (Phases 1–9 in
+`msquic-h3/src/`), **has been removed per its expiry condition** (Phase 10 /
+implementation-order item 10). The living design of record is this narrative plus
+the resolutions section — invariants, interfaces, mappings, and rationale — and
+the as-built reference in `.paw/work/error-propagation/Docs.md`. No depended-on
+invariant was deleted: the load-bearing rules (the send transition table below,
+the single-ordered send-event queue of MF-1, the exactly-once reclamation
+contract of SF-3, and the per-row native-version gate of MF-3) all live in the
+narrative and are realized in the checked production code and tests. See the
+"As-built implementation" section where the scaffold formerly stood.
 
 ### SF-1 — name `StreamExecutor` as the send-half owner
 
@@ -2083,1962 +2093,75 @@ bumped, so they are updated opportunistically, not en masse.
   source review of the exact inline-drain path.
 - **C-9 — consolidated into T3** (proof obligations for removing `SendBuffer`).
 
-## Implementation-ready definitions (round 6)
-
-> **⚠ TEMPORARY IMPLEMENTATION SCAFFOLD — remove or replace when implementation
-> lands (resolves MF-7 / T5).** Everything from this banner to the end of the
-> document (the ~1,800-line Rust appendix that follows) is a *generated,
-> pre-implementation scaffold*, not living design. It is **no longer normative
-> and no longer takes precedence** over the narrative above: where the appendix
-> and the stable design (the sections above plus "Society-of-thought review
-> resolutions (round 13)") disagree, **the narrative and the resolutions section
-> win**, and the appendix is presumed stale. The stable, long-lived design of
-> record is: the review findings, the required mapping, "Proposed adapter
-> state", the send/receive/terminal transition rules, and the round-13
-> resolutions — i.e. invariants, interfaces, and rationale, not full method
-> bodies.
->
-> **Expiry condition / cleanup checklist (owner: implementer of the send
-> redesign):**
-> 1. When the production code lands in `msquic-h3/src/`, delete this appendix
->    (or move it to a throwaway branch / `docs/archive/`), leaving only links to
->    the checked production modules and tests.
-> 2. Replace any invariant that the design genuinely depends on (e.g. the send
->    transition table, the single-ordered-send-event-queue rule, the exactly-once
->    reclamation contract) with a short prose statement in the narrative above,
->    so no design dependency is silently lost.
-> 3. Do not fix bugs by editing this appendix once code exists; fix the code and
->    update the narrative invariants. CI already checks the real code
->    (`cargo check --all-targets --all-features` + `clippy -D warnings`, see
->    `.github/workflows/build.yaml`), so this appendix must not become a second
->    maintained source of truth.
-> 4. Implementation-order item 10 (below) enforces this cleanup as a release
->    gate.
-
-This appendix gives concrete Rust definitions, exact signatures, one committed
-choice at every former decision point, and precise per-site callback outcomes,
-to reduce implementation-time ambiguity. It is a scaffold only (see banner
-above). All constants keep their earlier values: `MAX_ADAPTER_SEND: u64 = 16 *
-1024 * 1024` (16 MiB, **provisional** per MF-5/T2), `MAX_QUIC_VARINT: u64 = (1 <<
-62) - 1`, and the native per-send `u32::MAX` protocol maximum. Where any listing
-below still shows a `FinishComplete` one-shot separate from the send mpsc, an
-`Unknown` no-reason cancellation, or an unqualified 16 MiB default, it is
-superseded by the round-13 resolutions.
-
-### Revised adapter structs and constructors
-
-All new fields carry the shared terminal state and cached IDs described above.
-`ConnectionState`/`StreamState` are the exact types from
-[Proposed adapter state](#proposed-adapter-state); the `Arc` ownership below is
-the load-bearing addition.
-
-```rust
-// ── Connection handle: unchanged fields, no terminal here (it lives in the
-//    Arc<ConnectionState> that ConnHandle also carries so callback + frontend
-//    share one slot). Field order (inner before _guard before state) is kept.
-#[derive(Debug)]
-pub(crate) struct ConnHandle {
-    inner: msquic::Connection,
-    state: Arc<ConnectionState>,   // NEW: shared, cloned into callback + streams
-    _guard: RundownGuard,
-}
-
-impl ConnHandle {
-    pub(crate) fn new(
-        inner: msquic::Connection,
-        state: Arc<ConnectionState>,
-        guard: RundownGuard,
-    ) -> Self {
-        Self { inner, state, _guard: guard }
-    }
-    pub(crate) fn state(&self) -> &Arc<ConnectionState> { &self.state }
-    pub(crate) fn inner(&self) -> &msquic::Connection { &self.inner }
-}
-
-#[derive(Debug)]
-pub struct Connection {
-    conn: Arc<ConnHandle>,
-    ctx: ConnCtxReceiver,
-    opener: StreamOpener,
-}
-
-// ── Callback → frontend. `bidi`/`uni` now carry IncomingStream<H3Stream>
-//    (stream OR terminal), not Option<H3Stream>. The callback clones the shared
-//    ConnectionState to derive/publish terminals and to seed accepted streams.
-#[derive(Debug)]
-struct ConnCtxSender {
-    state: Arc<ConnectionState>,            // NEW: publish/read shared terminal
-    connected: Option<oneshot::Sender<Result<(), Status>>>,  // was Sender<()>
-    shutdown: Option<oneshot::Sender<()>>,
-    bidi: Option<mpsc::UnboundedSender<IncomingStream<H3Stream>>>,
-    uni: Option<mpsc::UnboundedSender<IncomingStream<H3Stream>>>,
-}
-
-#[derive(Debug)]
-struct ConnCtxReceiver {
-    connected: Option<oneshot::Receiver<Result<(), Status>>>, // was Receiver<()>
-    shutdown: Option<oneshot::Receiver<()>>,
-    // Sticky accept-side terminal: first Terminal seen is stored and replayed by
-    // every later poll_accept_* on that side without re-polling the channel.
-    bidi: mpsc::UnboundedReceiver<IncomingStream<H3Stream>>,
-    uni: mpsc::UnboundedReceiver<IncomingStream<H3Stream>>,
-    bidi_terminal: Option<ConnectionTerminal>,  // NEW sticky accept state
-    uni_terminal: Option<ConnectionTerminal>,   // NEW sticky accept state
-}
-
-// Constructor now seeds both halves with the shared state clone.
-fn conn_ctx_channel(state: Arc<ConnectionState>) -> (ConnCtxSender, ConnCtxReceiver) {
-    let (conn_tx, conn_rx) = oneshot::channel::<Result<(), Status>>();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let (bidi_tx, bidi_rx) = mpsc::unbounded();
-    let (uni_tx, uni_rx) = mpsc::unbounded();
-    (
-        ConnCtxSender {
-            state,
-            connected: Some(conn_tx),
-            shutdown: Some(shutdown_tx),
-            bidi: Some(bidi_tx),
-            uni: Some(uni_tx),
-        },
-        ConnCtxReceiver {
-            connected: Some(conn_rx),
-            shutdown: Some(shutdown_rx),
-            bidi: bidi_rx,
-            uni: uni_rx,
-            bidi_terminal: None,
-            uni_terminal: None,
-        },
-    )
-}
-```
-
-```rust
-// ── Stream side. StreamSendCtx (callback-owned) publishes terminals and events;
-//    both receive contexts cache the resolved StreamId and sticky terminals.
-struct StreamSendCtx {
-    state: Arc<StreamState>,                         // NEW: shared send terminal
-    start: Option<oneshot::Sender<Result<u64, Status>>>,   // was Result<(), Status>; now carries id
-    // Explicit send events (buffer reclaimed by callback before enqueue).
-    send: Option<mpsc::UnboundedSender<SendEvent>>,  // was (bool, BufPtr)
-    // Explicit receive events replace channel-closure signalling.
-    receive: Option<mpsc::UnboundedSender<ReceiveEvent>>,  // was Bytes
-    receive_terminal_sent: bool,                     // NEW: first Fin/Reset/Conn wins
-    shutdown: Option<oneshot::Sender<SendEvent>>,    // finish completion channel
-}
-
-// Frontend receive half.
-#[derive(Debug)]
-struct RecvStreamReceiveCtx {
-    id: h3::quic::StreamId,                           // NEW cached id
-    receive: mpsc::UnboundedReceiver<ReceiveEvent>,
-    terminal: Option<ReceiveTerminal>,               // NEW sticky recv terminal
-    // SF-6: local, sticky end-of-stream flag set by OUR OWN stop_sending. Distinct
-    // from `terminal` (which holds a peer/connection-caused reason); `terminal` is
-    // left untouched when this is set. When true, poll_data returns
-    // Ready(Ok(None)) and NO receive terminal is injected.
-    receive_closed: bool,                            // NEW SF-6 sticky local flag
-}
-
-// Frontend send half. `state` is the shared Arc; the reducer's own bookkeeping
-// is SendState (see below); the sticky winner is StreamState::send_terminal.
-#[derive(Debug)]
-struct SendStreamReceiveCtx {
-    id: h3::quic::StreamId,                           // NEW cached id
-    state: Arc<StreamState>,                          // NEW shared send terminal
-    send: mpsc::UnboundedReceiver<SendEvent>,
-    reducer: SendState,                               // was `send_inprogress: bool`
-    // Finish completion channel; the reducer treats it as a SendEvent source.
-    shutdown: oneshot::Receiver<SendEvent>,
-}
-
-#[derive(Debug)]
-pub struct H3SendStream {
-    // No `stream` field: every native send-side verb goes through `exec`, and the
-    // production `StreamExecutor` (held by `exec`) owns the `Arc<msquic::Stream>`
-    // that keeps the send half's native handle alive. This ownership is
-    // independent of the recv half: `H3RecvStream` holds its own `Arc` clone, so
-    // dropping the recv half first does NOT invalidate the send side (see the
-    // recv-drop-then-send test required by the resolutions section). This is also
-    // what lets `with_exec` build a send half with no live connection.
-    sctx: SendStreamReceiveCtx,   // carries cached id + Arc<StreamState>
-    exec: Box<dyn SendExec>,      // replaceable send-side seam (below); prod =
-                                  // StreamExecutor, tests = CountingExec
-}
-
-#[derive(Debug)]
-pub struct H3RecvStream {
-    stream: Arc<msquic::Stream>,
-    rctx: RecvStreamReceiveCtx,   // carries cached id
-}
-
-#[derive(Debug)]
-pub struct H3Stream {
-    send: H3SendStream,
-    recv: H3RecvStream,
-}
-
-// Constructor returns the callback-owned sender plus the two frontend halves.
-// It takes the shared per-stream state so the callback and both halves agree.
-fn stream_ctx_channel(
-    state: Arc<StreamState>,
-    id: h3::quic::StreamId,
-) -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamReceiveCtx) {
-    let (start_tx, start_rx) = oneshot::channel::<Result<u64, Status>>();
-    let (send_tx, send_rx) = mpsc::unbounded::<SendEvent>();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<SendEvent>();
-    let (receive_tx, receive_rx) = mpsc::unbounded::<ReceiveEvent>();
-    (
-        StreamSendCtx {
-            state: state.clone(),
-            start: Some(start_tx),
-            send: Some(send_tx),
-            receive: Some(receive_tx),
-            receive_terminal_sent: false,
-            shutdown: Some(shutdown_tx),
-        },
-        SendStreamReceiveCtx {
-            id, state, send: send_rx,
-            reducer: SendState::new(),   // all-false; see reducer section
-            shutdown: shutdown_rx,
-        },
-        RecvStreamReceiveCtx { id, receive: receive_rx, terminal: None, receive_closed: false },
-    )
-}
-```
-
-The retained receive half implements the SF-6 post-`stop_sending` contract with the
-new `receive_closed` flag: our own `stop_sending` submits `ABORT_RECEIVE` (no receive
-terminal injected) and sets the sticky flag, so every subsequent `poll_data` is a
-defined `Poll::Ready(Ok(None))` end-of-stream rather than `Pending` — and the
-`terminal` slot is left untouched. `h3::quic::RecvStream::poll_data` returns
-`Poll<Result<Option<Self::Buf>, StreamErrorIncoming>>` and `stop_sending(&mut self,
-error_code: u64)` (verified in `h3-0.0.8/src/quic.rs`):
-
-```rust
-// SF-6: post-`stop_sending` polling contract on the retained recv half.
-impl h3::quic::RecvStream for H3RecvStream {
-    type Buf = bytes::Bytes;
-
-    fn poll_data(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-        use std::task::Poll;
-        // SF-6: our OWN stop_sending already ended the receive half locally. This is a
-        // clean end-of-stream, NOT a terminal: `terminal` stays whatever it was
-        // (normally None) and no receive terminal is injected.
-        if self.rctx.receive_closed {
-            return Poll::Ready(Ok(None));
-        }
-        // Normal path: drain one ReceiveEvent. Data -> Ok(Some(bytes)); a sticky
-        // terminal (Fin/Reset/Connection/Internal) is stored in `self.rctx.terminal`
-        // and mapped by `convert_recv` (Fin -> Ok(None), else Err(..)); no event yet
-        // and channel open -> Pending. (Full drain logic elided; see convert_recv.)
-        drain_one_receive_event(&mut self.rctx, cx)
-    }
-
-    fn stop_sending(&mut self, error_code: u64) {
-        // Submit ABORT_RECEIVE with the clamped code (per the stop_sending(code) rule
-        // above, inject NO receive terminal), then set the sticky local flag so every
-        // subsequent poll_data is a defined Ready(Ok(None)) rather than Pending.
-        self.stream
-            .shutdown(msquic::StreamShutdownFlags::ABORT_RECEIVE, clamp_application_code(error_code));
-        self.rctx.receive_closed = true;              // sticky; `terminal` untouched
-    }
-
-    fn recv_id(&self) -> h3::quic::StreamId {
-        self.rctx.id
-    }
-}
-
-#[test]
-fn poll_data_after_local_stop_sending_is_ok_none() {
-    use std::task::Poll;
-    // Open connection, no peer FIN/reset, empty terminal slot.
-    let mut recv = test_recv_stream_open_no_terminal();
-    recv.stop_sending(0);
-    let mut cx = noop_context();
-    // Defined clean end-of-stream: not Pending, not Err.
-    assert!(matches!(recv.poll_data(&mut cx), Poll::Ready(Ok(None))));
-    // No terminal was injected: the sticky recv terminal slot remains empty.
-    assert!(recv.rctx.terminal.is_none());
-    assert!(recv.rctx.receive_closed);
-}
-```
-
-Accepted streams already have a validated `StreamId` (queried from the borrowed
-`StreamRef`, see below), so they call `stream_ctx_channel` above, which builds
-both id-bearing frontend halves immediately. Locally opened streams have **no
-id** until `StartComplete`, so they *cannot* call `stream_ctx_channel`. They use
-a distinct **pre-ID constructor** that builds only the callback-owned
-`StreamSendCtx` (the senders) plus a bundle of the four matching receiver ends.
-The id-bearing frontend halves are built later, by `OpeningStream::finalize`,
-once `StartComplete` yields the id:
-
-```rust
-// Frontend receiver ends held by an OpeningStream until the id is known. These
-// are the *receiver* halves whose *sender* halves live in the callback-owned
-// StreamSendCtx. Holding them keeps every channel open (so callback sends never
-// fail) and lets finalize move them into the H3Stream halves unchanged.
-#[derive(Debug)]
-struct PreIdReceivers {
-    start: oneshot::Receiver<Result<u64, Status>>,
-    send: mpsc::UnboundedReceiver<SendEvent>,
-    receive: mpsc::UnboundedReceiver<ReceiveEvent>,
-    shutdown: oneshot::Receiver<SendEvent>,
-}
-
-/// Pre-ID variant of stream_ctx_channel: no StreamId is required or produced.
-/// Used only by locally opened streams. It builds the callback-owned
-/// StreamSendCtx (senders) and returns the matching receiver ends bundled, so
-/// an OpeningStream can hold them until StartComplete yields the id.
-fn stream_ctx_channel_pre_id(state: Arc<StreamState>) -> (StreamSendCtx, PreIdReceivers) {
-    let (start_tx, start_rx) = oneshot::channel::<Result<u64, Status>>();
-    let (send_tx, send_rx) = mpsc::unbounded::<SendEvent>();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<SendEvent>();
-    let (receive_tx, receive_rx) = mpsc::unbounded::<ReceiveEvent>();
-    (
-        StreamSendCtx {
-            state,
-            start: Some(start_tx),
-            send: Some(send_tx),
-            receive: Some(receive_tx),
-            receive_terminal_sent: false,
-            shutdown: Some(shutdown_tx),
-        },
-        PreIdReceivers {
-            start: start_rx,
-            send: send_rx,
-            receive: receive_rx,
-            shutdown: shutdown_rx,
-        },
-    )
-}
-```
-
-```rust
-// ── StreamOpener: same shape; its temp holders are OpeningStream, and it owns
-//    the connection-scoped open seam (OpenExec, executor section) so tests can
-//    substitute the native open/start.
-#[derive(Debug)]
-pub struct StreamOpener {
-    conn: Arc<ConnHandle>,
-    bidi_temp: Option<OpeningStream>,   // was Option<H3Stream>
-    uni_temp: Option<OpeningStream>,    // was Option<H3Stream>
-    open_exec: Box<dyn OpenExec>,       // prod = StreamOpenExecutor (see below)
-}
-// Clone (used by Connection::opener) resets both temps and installs a fresh
-// production StreamOpenExecutor, since an in-flight OpeningStream is not shared.
-
-/// A locally opened stream whose native handle is started but whose h3 StreamId
-/// is not yet known. Private to StreamOpener; the only stream form allowed to
-/// exist without a cached id. On a successful StartComplete it is consumed into
-/// an H3Stream with concrete id fields in both halves.
-#[derive(Debug)]
-struct OpeningStream {
-    stream: Arc<msquic::Stream>,
-    state: Arc<StreamState>,
-    // Frontend *receiver* ends (senders live in the callback's StreamSendCtx),
-    // held until finalize so callback sends keep working and the ends can be
-    // moved into the H3Stream halves unchanged.
-    recv: PreIdReceivers,
-}
-
-impl OpeningStream {
-    /// Consume into an H3Stream once StartComplete has yielded a validated id.
-    /// `start` has already been polled to completion by poll_open_inner and is
-    /// dropped here; the remaining three receivers move into the two halves.
-    fn finalize(self, id: h3::quic::StreamId) -> H3Stream {
-        let OpeningStream { stream, state, recv } = self;
-        let PreIdReceivers { start: _done, send, receive, shutdown } = recv;
-        H3Stream {
-            send: H3SendStream {
-                exec: Box::new(StreamExecutor { stream: stream.clone() }),
-                sctx: SendStreamReceiveCtx {
-                    id,
-                    state,
-                    send,
-                    reducer: SendState::new(),   // all-false; see reducer section
-                    shutdown,
-                },
-            },
-            recv: H3RecvStream {
-                stream,
-                rctx: RecvStreamReceiveCtx { id, receive, terminal: None, receive_closed: false },
-            },
-        }
-    }
-}
-```
-
-Exact constructor/finalizer **bodies** (accepted-connection state creation, the
-`OpeningStream` finalizer, and the pre-ID open path threaded through `attach`):
-
-```rust
-impl Connection {
-    // Accepted connection: the *caller path is the listener callback*, but the
-    // shared ConnectionState is created here (not by the caller), then cloned
-    // into the callback and into ConnHandle — exactly like connect(). This is
-    // the single place accepted-connection state is created and threaded.
-    pub(crate) fn attach(inner: msquic::Connection, guard: RundownGuard) -> Self {
-        // 1. Shared connection terminal slot, created before the callback runs.
-        let state = Arc::new(ConnectionState {
-            terminal: std::sync::Mutex::new(None),
-        });
-        // 2. Ctx channel is seeded with a clone (conn_ctx_channel takes state).
-        let (mut ctx, rx) = conn_ctx_channel(state.clone());
-        // 3. Install the callback BEFORE returning from the listener callback;
-        //    the closure owns `ctx`, which owns the second state clone and is the
-        //    clone PeerStreamStarted uses to seed accepted streams.
-        let handler =
-            move |_: msquic::ConnectionRef, ev: msquic::ConnectionEvent| connection_callback(&mut ctx, ev);
-        inner.set_callback_handler(handler);
-        // 4. ConnHandle owns the third clone alongside the native handle + guard.
-        let conn = Arc::new(ConnHandle::new(inner, state, guard));
-        Connection { conn: conn.clone(), ctx: rx, opener: StreamOpener::new(conn) }
-    }
-    // connect() is unchanged in shape but likewise builds ConnectionState before
-    // msquic::Connection::open, passes state.clone() to conn_ctx_channel, and to
-    // ConnHandle::new; its `connected` await now yields Result<(), Status>.
-}
-
-impl H3Stream {
-    // Accepted stream: id already validated from the borrowed StreamRef (below),
-    // and the shared connection terminal is threaded into the new StreamState.
-    pub(crate) fn attach(
-        stream: msquic::Stream,
-        conn_state: Arc<ConnectionState>,
-        id: h3::quic::StreamId,
-    ) -> Self {
-        let state = Arc::new(StreamState {
-            connection: conn_state,
-            send_terminal: std::sync::Mutex::new(None),
-        });
-        // id is known, so build both id-bearing halves directly.
-        let (mut ctx, sctx, rctx) = stream_ctx_channel(state, id);
-        let handler =
-            move |_: StreamRef, ev: StreamEvent| stream_callback(&mut ctx, ev);
-        stream.set_callback_handler(handler);
-        let s = Arc::new(stream);
-        H3Stream {
-            send: H3SendStream {
-                exec: Box::new(StreamExecutor { stream: s.clone() }),
-                sctx,
-            },
-            recv: H3RecvStream { stream: s, rctx },
-        }
-    }
-
-    // Locally opened: takes &ConnHandle (not &msquic::Connection) so it can copy
-    // the shared ConnectionState into the new StreamState, and returns the
-    // pre-id OpeningStream rather than a temporary H3Stream. The native open+start
-    // are the production body of OpenExec::submit_open_start.
-    fn open_and_start(conn: &ConnHandle, uni: bool) -> Result<OpeningStream, Status> {
-        let state = Arc::new(StreamState {
-            connection: conn.state().clone(),   // copy the shared connection terminal
-            send_terminal: std::sync::Mutex::new(None),
-        });
-        let (mut ctx, recv) = stream_ctx_channel_pre_id(state.clone());
-        let handler =
-            move |_: StreamRef, ev: StreamEvent| stream_callback(&mut ctx, ev);
-        let flag = if uni { StreamOpenFlags::UNIDIRECTIONAL } else { StreamOpenFlags::NONE };
-        let stream = msquic::Stream::open(conn.inner(), flag, handler)?;
-        stream.start(StreamStartFlags::NONE)?;   // id arrives later via StartComplete
-        Ok(OpeningStream { stream: Arc::new(stream), state, recv })
-    }
-}
-
-impl StreamOpener {
-    fn new(conn: Arc<ConnHandle>) -> Self {
-        Self { conn, bidi_temp: None, uni_temp: None, open_exec: Box::new(StreamOpenExecutor) }
-    }
-
-    // Check shared connection terminal first; create the OpeningStream via the
-    // open seam; await StartComplete; on Ok(id) validate and finalize.
-    fn poll_open_inner(
-        conn: &Arc<ConnHandle>,
-        open_exec: &dyn OpenExec,
-        uni: bool,
-        holder: &mut Option<OpeningStream>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<H3Stream, StreamErrorIncoming>> {
-        use std::task::Poll;
-        // 1. Fail fast if the connection already published a terminal.
-        if let Some(reason) = conn.state().load_terminal() {
-            *holder = None;   // drop any in-flight OpeningStream
-            return Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
-                connection_error: convert_conn(reason),
-            }));
-        }
-        // 2. Create + start the native stream if none is in flight.
-        if holder.is_none() {
-            match open_exec.submit_open_start(conn, uni) {
-                Ok(opening) => *holder = Some(opening),
-                Err(status) => {
-                    // A shutdown may have raced the open; prefer the conn terminal.
-                    return Poll::Ready(Err(match conn.state().load_terminal() {
-                        Some(reason) => StreamErrorIncoming::ConnectionErrorIncoming {
-                            connection_error: convert_conn(reason),
-                        },
-                        None => StreamErrorIncoming::Unknown(Box::new(status)),
-                    }));
-                }
-            }
-        }
-        // 3. Await StartComplete on the OpeningStream's `start` receiver.
-        let opening = holder.as_mut().expect("holder populated in step 2");
-        let raw = match Pin::new(&mut opening.recv.start).poll(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Ok(raw)) => raw,   // Result<u64, Status> from StartComplete
-            Poll::Ready(Err(oneshot::Canceled)) => {
-                // Sender dropped by ShutdownComplete without a StartComplete.
-                *holder = None;
-                let connection_error = match conn.state().load_terminal() {
-                    Some(reason) => convert_conn(reason),
-                    None => ConnectionErrorIncoming::InternalError(
-                        "stream start cancelled without a terminal reason".into()),
-                };
-                return Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }));
-            }
-        };
-        // 4. StartComplete carried a status; classify it.
-        let opening = holder.take().expect("holder populated in step 2");
-        match raw {
-            Err(status) => Poll::Ready(Err(match conn.state().load_terminal() {
-                Some(reason) => StreamErrorIncoming::ConnectionErrorIncoming {
-                    connection_error: convert_conn(reason),
-                },
-                None => StreamErrorIncoming::Unknown(Box::new(status)),
-            })),
-            Ok(raw_id) => match validate_stream_id(raw_id) {   // (below)
-                Ok(id) => Poll::Ready(Ok(opening.finalize(id))),
-                Err(_) => Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
-                    connection_error: ConnectionErrorIncoming::InternalError(
-                        "local stream ID is invalid".into()),
-                })),
-            },
-        }
-    }
-}
-```
-
-The lone `expect("holder populated in step 2")` calls are internal invariants on
-a value this function set on the immediately preceding lines, not FFI-reachable
-callback code; they can equally be written as `let Some(..) = .. else { return
-Poll::Pending }`. No `expect` touches a channel result, a native handle, or a
-lock, so no callback path can unwind through FFI. `poll_open_bidi`/`poll_open_send`
-call `Self::poll_open_inner(&self.conn, &*self.open_exec, uni, &mut self.bidi_temp
-/ self.uni_temp, cx)`.
-
-### Adapter-owned error types
-
-Compilable definitions with derives, `Display`, and `From` conversions. `Status`,
-`u64` codes, and `&'static str` messages are the only stored data. All four are
-`Send + Sync` because `QUIC_STATUS` (an integer alias) and the primitives are.
-
-```rust
-use std::fmt;
-use crate::msquic::Status;
-
-/// send_data payload above MAX_ADAPTER_SEND. One-shot; never stored in the
-/// shared send-terminal slot (see SendOperationError below).
-#[derive(Debug)]
-pub struct OversizedSend {
-    /// Requested payload length in bytes (the `remaining()` that was rejected).
-    pub len: usize,
-}
-impl fmt::Display for OversizedSend {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "send_data payload of {} bytes exceeds MAX_ADAPTER_SEND ({} bytes)",
-            self.len, MAX_ADAPTER_SEND
-        )
-    }
-}
-impl std::error::Error for OversizedSend {}
-
-/// Non-application transport shutdown. Both the QUIC status and the wire
-/// transport error code are retained for diagnostics.
-#[derive(Debug)]
-pub struct MsQuicTransportError {
-    pub status: Status,
-    pub error_code: u64,
-}
-impl fmt::Display for MsQuicTransportError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "QUIC transport shutdown: status {} (transport error_code {})",
-            self.status, self.error_code
-        )
-    }
-}
-impl std::error::Error for MsQuicTransportError {}
-
-/// Local (application-initiated) connection close. Carries no peer code — see
-/// the mapping table row: "do not invent a peer code".
-#[derive(Debug)]
-pub struct LocalConnectionClose;
-impl fmt::Display for LocalConnectionClose {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("connection closed locally by the application")
-    }
-}
-impl std::error::Error for LocalConnectionClose {}
-
-/// Local reset via SendStream::reset(code). Distinct from a peer
-/// StreamTerminated: h3 should not poll a reset send stream.
-#[derive(Debug)]
-pub struct LocalStreamReset {
-    pub code: u64,
-}
-impl fmt::Display for LocalStreamReset {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "send stream reset locally with code {}", self.code)
-    }
-}
-impl std::error::Error for LocalStreamReset {}
-```
-
-`From` conversions used at the polling boundary (these are the *only* places that
-mint h3 errors, keeping the two similarly named `OversizedSend` uses consistent):
-
-```rust
-// ConnectionTerminal -> ConnectionErrorIncoming
-fn convert_conn(t: ConnectionTerminal) -> ConnectionErrorIncoming {
-    use ConnectionTerminal as C;
-    match t {
-        C::PeerApplication(code) => ConnectionErrorIncoming::ApplicationClose { error_code: code },
-        C::Timeout => ConnectionErrorIncoming::Timeout,
-        C::Transport { status, error_code } =>
-            ConnectionErrorIncoming::Undefined(std::sync::Arc::new(
-                MsQuicTransportError { status, error_code })),
-        C::LocalClose =>
-            ConnectionErrorIncoming::Undefined(std::sync::Arc::new(LocalConnectionClose)),
-        C::Internal(msg) => ConnectionErrorIncoming::InternalError(msg.to_string()),
-    }
-}
-
-// SendTerminal -> StreamErrorIncoming
-fn convert_send(t: SendTerminal) -> StreamErrorIncoming {
-    use SendTerminal as S;
-    match t {
-        S::Stopped(code) => StreamErrorIncoming::StreamTerminated { error_code: code },
-        S::Connection(reason) =>
-            StreamErrorIncoming::ConnectionErrorIncoming { connection_error: convert_conn(reason) },
-        S::LocalReset(code) =>
-            StreamErrorIncoming::Unknown(Box::new(LocalStreamReset { code })),
-        S::Failed(status) => StreamErrorIncoming::Unknown(Box::new(status)),
-        S::Internal(msg) => StreamErrorIncoming::ConnectionErrorIncoming {
-            connection_error: ConnectionErrorIncoming::InternalError(msg.to_string()),
-        },
-    }
-}
-
-// ReceiveTerminal -> Result<Option<Bytes>, StreamErrorIncoming>
-fn convert_recv(t: ReceiveTerminal) -> Result<Option<bytes::Bytes>, StreamErrorIncoming> {
-    use ReceiveTerminal as R;
-    match t {
-        R::Fin => Ok(None),
-        R::Reset(code) => Err(StreamErrorIncoming::StreamTerminated { error_code: code }),
-        R::Connection(reason) => Err(StreamErrorIncoming::ConnectionErrorIncoming {
-            connection_error: convert_conn(reason) }),
-        R::Internal(msg) => Err(StreamErrorIncoming::ConnectionErrorIncoming {
-            connection_error: ConnectionErrorIncoming::InternalError(msg.to_string()) }),
-    }
-}
-```
-
-`SendOperationError` → h3 error mapping is the disambiguation the reviewer asked
-for. `SendOperationError` is the **one-shot** `send_data` result and is *never*
-stored in `StreamState::send_terminal`; the sticky `SendTerminal` path
-(`convert_send`) is separate:
-
-```rust
-// send_data's ReturnImmediateError(SendOperationError) is converted here, and
-// nowhere else, so `SendOperationError::OversizedSend { len }` and the final
-// boxed `OversizedSend` cannot diverge:
-fn convert_send_op(e: SendOperationError) -> StreamErrorIncoming {
-    match e {
-        SendOperationError::OversizedSend { len } =>
-            StreamErrorIncoming::Unknown(Box::new(OversizedSend { len })),
-        SendOperationError::Misuse(_msg) =>
-            StreamErrorIncoming::ConnectionErrorIncoming {
-                connection_error: ConnectionErrorIncoming::InternalError(
-                    "send_data called while a send is in progress or after finish".into()),
-            },
-    }
-}
-```
-
-Thus `SendOperationError::OversizedSend { len }` maps 1:1 to the boxed
-`OversizedSend { len }` (`StreamErrorIncoming::Unknown`), and
-`SendOperationError::Misuse` maps to nested `InternalError` — the same class the
-reference adapters use for send-while-busy. No other site constructs these
-errors.
-
-### Accepted-stream ID query
-
-Committed, no `msquic` dependency change:
-
-```rust
-/// Pure, unit-testable id validation. MsQuic ids are 62-bit so this never fails
-/// for a live peer, but the InvalidStreamId branch is still handled.
-fn validate_stream_id(raw: u64) -> Result<h3::quic::StreamId, h3::quic::InvalidStreamId> {
-    h3::quic::StreamId::try_from(raw)   // impl TryFrom<u64>, h3-0.0.8 proto/stream.rs:147
-}
-```
-
-Accepted-stream attachment in `connection_callback`, `PeerStreamStarted { stream:
-StreamRef, flags }`:
-
-```rust
-// stream: &StreamRef (borrowed; Drop nulls the handle so it never closes it).
-// StreamRef: Deref<Target = Stream>, so this calls Stream::get_stream_id via
-// auto-deref against the BORROWED handle. No owning Stream is created here.
-// Safety: get_stream_id issues Api::get_param_auto::<u64>(handle,
-// QUIC_PARAM_STREAM_ID) on the still-native-owned handle; we hold only a
-// borrow, take no ownership, and never StreamClose it on this failure path.
-let raw_id: u64 = match stream.get_stream_id() {   // Result<u64, Status>
-    Ok(id) => id,
-    Err(status) => {
-        // pre-ownership failure: publish Internal terminal, wake acceptors,
-        // return `status` so MsQuic closes the rejected stream itself.
-        publish_conn_internal(&ctx.state, "accepted stream ID query failed");
-        wake_acceptors(ctx);
-        return Err(status);
-    }
-};
-let id = match validate_stream_id(raw_id) {
-    Ok(id) => id,
-    Err(_) => {
-        publish_conn_internal(&ctx.state, "accepted stream ID is invalid");
-        wake_acceptors(ctx);
-        return Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR));
-    }
-};
-// Success: only now take ownership and attach.
-let owned = unsafe { msquic::Stream::from_raw(stream.as_raw()) };
-let h3 = H3Stream::attach(owned, ctx.state.clone(), id);
-// post-ownership delivery failure -> drop/close via Rust, return Ok (below).
-```
-
-`get_stream_id` lives on `msquic::Stream` (`lib.rs:1230`) and is reached through
-`StreamRef: Deref<Target = Stream>` (`lib.rs:1236`). No borrowed-query helper is
-added to the binding, no raw `Api::get_param` call is written in the adapter, and
-no dependency patch/version bump is required.
-
-### Reducer: exhaustive `match` form
-
-`SendState::new()` is all-false:
-
-```rust
-impl SendState {
-    fn new() -> Self {
-        SendState {
-            send_submitting: false,
-            send_inprogress: false,
-            finish_submitting: false,
-            finish_started: false,
-            finish_complete: false,
-            reset_submitting: false,
-        }
-    }
-}
-```
-
-Named predicates (exact boolean expressions the transition arms use):
-
-```rust
-impl SendState {
-    /// A native submission is reserved but its *Submitted result has not arrived.
-    fn submission_reserved(&self) -> bool {
-        self.send_submitting || self.finish_submitting || self.reset_submitting
-    }
-    /// "idle": accepting a new send_data — nothing in flight, not finishing,
-    /// no reservation outstanding.
-    fn idle(&self) -> bool {
-        !self.send_inprogress && !self.finish_started && !self.finish_complete
-            && !self.submission_reserved()
-    }
-    /// "send pending": a data send is committed and awaiting its SendComplete.
-    fn send_pending(&self) -> bool { self.send_inprogress }
-    /// "finishing": graceful finish reserved or committed, not yet complete.
-    fn finishing(&self) -> bool {
-        (self.finish_submitting || self.finish_started) && !self.finish_complete
-    }
-}
-```
-
-Guard-set membership by frontend method (which reservation flags each checks):
-
-| Guard | Flags it inspects | Meaning |
-| --- | --- | --- |
-| `send_data` misuse | `send_inprogress \|\| send_submitting \|\| finish_submitting \|\| finish_started \|\| finish_complete` | any in-flight/finishing state rejects a new `send_data` |
-| `poll_ready` reservation block | `submission_reserved()` (all three) | a method arriving mid-submission is `Internal` |
-| `poll_ready`-after-finish misuse | `finish_started` (regardless of `finish_complete`) | non-sticky nested `InternalError` |
-| `poll_finish` reservation block | `submission_reserved()` (all three) | same as above |
-| `reset` no-op | `finish_complete \|\| terminal_present` | infallible `NoOp` |
-| `reset` impossible | `submission_reserved()` | `PublishTerminal{Internal, Reset}` |
-
-`TerminalPublished` arms (previously implicit) are now enumerated: after the
-first-writer helper returns the `winner`, the reducer emits exactly one command
-per `continuation`, and mutates no state (the winner is already in the shared
-slot):
-
-| `TerminalPublished { winner, continuation }` | Command |
-| --- | --- |
-| `continuation = SendData` | `ReturnError(winner)` → `Err(convert_send(winner))` from `send_data` |
-| `continuation = PollReady` | `ReturnError(winner)` → `Poll::Ready(Err(convert_send(winner)))` |
-| `continuation = PollFinish` | `ReturnError(winner)` → `Poll::Ready(Err(convert_send(winner)))` |
-| `continuation = Reset` | `NoOp` (infallible method; winner stored for a later poll) |
-
-The "impossible combination" is no longer a prose wildcard: because every
-`SendInput` variant and every inner `SendPoll`/`SendPayload`/`SendEvent` case is
-matched, the reducer is one exhaustive `match` with no outer `_` arm. Each
-formerly-implicit "impossible" pairing is encoded as an explicit
-`PublishTerminal { candidate: SendTerminal::Internal(..), continuation }` arm
-that mutates no committed flag and never panics. The complete body, directly
-translatable:
-
-```rust
-fn transition(state: &mut SendState, input: SendInput) -> SendCommand {
-    use SendCommand::*;
-    use SendInput::*;
-    use TerminalContinuation as K;
-    let aborted = || SendTerminal::Failed(Status::new(StatusCode::QUIC_STATUS_ABORTED));
-
-    match input {
-        // ── Precedence 1: *Submitted bookkeeping. Always clears its reservation
-        //    before any winner is applied; a missing reservation is internal.
-        SendSubmitted { result, terminal } => {
-            if !state.send_submitting {
-                return PublishTerminal {
-                    candidate: SendTerminal::Internal("SendSubmitted without reservation"),
-                    continuation: K::SendData,
-                };
-            }
-            state.send_submitting = false;
-            match result {
-                Ok(()) => {
-                    state.send_inprogress = true;
-                    match terminal {
-                        Some(w) => ReturnError(w),   // a winner raced in
-                        None => ReturnSent,          // send_data's Ok(())
-                    }
-                }
-                // Buffer already reclaimed by the caller on the Err path.
-                Err(status) => PublishTerminal {
-                    candidate: terminal.unwrap_or(SendTerminal::Failed(status)),
-                    continuation: K::SendData,
-                },
-            }
-        }
-        GracefulSubmitted { result, terminal } => {
-            if !state.finish_submitting {
-                return PublishTerminal {
-                    candidate: SendTerminal::Internal("GracefulSubmitted without reservation"),
-                    continuation: K::PollFinish,
-                };
-            }
-            state.finish_submitting = false;
-            match result {
-                Ok(()) => { state.finish_started = true; RepollFinish }  // never Pending directly
-                Err(status) => PublishTerminal {
-                    candidate: terminal.unwrap_or(SendTerminal::Failed(status)),
-                    continuation: K::PollFinish,
-                },
-            }
-        }
-        ResetSubmitted { code, result, terminal } => {
-            if !state.reset_submitting {
-                return PublishTerminal {
-                    candidate: SendTerminal::Internal("ResetSubmitted without reservation"),
-                    continuation: K::Reset,
-                };
-            }
-            state.reset_submitting = false;
-            let candidate = match result {
-                Ok(()) => terminal.unwrap_or(SendTerminal::LocalReset(code)),
-                Err(status) => terminal.unwrap_or(SendTerminal::Failed(status)),
-            };
-            PublishTerminal { candidate, continuation: K::Reset }
-        }
-
-        // ── Consume the resolved winner (no state mutation).
-        TerminalPublished { winner, continuation } => match continuation {
-            K::SendData | K::PollReady | K::PollFinish => ReturnError(winner),
-            K::Reset => NoOp,   // infallible method; winner stored for a later poll
-        },
-
-        // ── send_data request. Terminal wins; else misuse if busy/finishing.
-        SendRequested { payload, terminal } => {
-            if let Some(w) = terminal { return ReturnError(w); }
-            if state.send_inprogress || state.send_submitting
-                || state.finish_submitting || state.finish_started || state.finish_complete {
-                return ReturnImmediateError(SendOperationError::Misuse("send_data while busy/finishing"));
-            }
-            match payload {                                              // idle, no winner
-                SendPayload::Empty => ReturnSent,                        // no-op, no reservation
-                SendPayload::Oversized { len } =>
-                    ReturnImmediateError(SendOperationError::OversizedSend { len }),  // state unchanged
-                SendPayload::NonEmpty { .. } => { state.send_submitting = true; SubmitSend }
-            }
-        }
-
-        // ── reset request (infallible; at most one native SubmitReset).
-        Reset { code, terminal } => {
-            if state.finish_complete || terminal.is_some() {
-                return NoOp;   // already terminal; nothing to submit
-            }
-            if state.submission_reserved() {
-                return PublishTerminal {   // impossible under serialized callers
-                    candidate: SendTerminal::Internal("reset during submission reservation"),
-                    continuation: K::Reset,
-                };
-            }
-            state.reset_submitting = true;   // otherwise, incl. incomplete finish
-            SubmitReset(code)
-        }
-
-        // ── poll_ready request. A present shared terminal is surfaced first.
-        PollReady { poll, terminal } => {
-            if state.submission_reserved() {
-                return PublishTerminal {
-                    candidate: SendTerminal::Internal("poll_ready during submission reservation"),
-                    continuation: K::PollReady,
-                };
-            }
-            // Method-terminal step: a winner already in the shared slot is returned
-            // before ordinary event handling, so a `Pending` poll can never linger
-            // past a terminal.
-            if let Some(w) = terminal {
-                state.send_inprogress = false;
-                return ReturnError(w);
-            }
-            if state.finish_started {   // h3 misuse; no native call, non-sticky
-                return ReturnError(SendTerminal::Internal("poll_ready after finish"));
-            }
-            match poll {
-                // Terminal handled above, so a closed channel here has no winner.
-                SendPoll::Closed => PublishTerminal {
-                    candidate: SendTerminal::Internal("send channel closed without a terminal"),
-                    continuation: K::PollReady,
-                },
-                SendPoll::Event(SendEvent::Complete { cancelled: false }) => {
-                    if !state.send_inprogress {
-                        return PublishTerminal {   // impossible idle-state completion
-                            candidate: SendTerminal::Internal("SendComplete without an outstanding send"),
-                            continuation: K::PollReady,
-                        };
-                    }
-                    state.send_inprogress = false; ReturnReady
-                }
-                SendPoll::Event(SendEvent::Complete { cancelled: true }) => {
-                    if !state.send_inprogress {
-                        return PublishTerminal {   // impossible idle-state completion
-                            candidate: SendTerminal::Internal("cancelled SendComplete without an outstanding send"),
-                            continuation: K::PollReady,
-                        };
-                    }
-                    state.send_inprogress = false;
-                    // No shared winner (handled above): synthesize the abort terminal.
-                    PublishTerminal { candidate: aborted(), continuation: K::PollReady }
-                }
-                SendPoll::Event(SendEvent::TerminalWake) => PublishTerminal {
-                    candidate: SendTerminal::Internal("terminal wake without a terminal"),
-                    continuation: K::PollReady,
-                },
-                SendPoll::Event(SendEvent::FinishComplete { .. }) => PublishTerminal {
-                    candidate: SendTerminal::Internal("finish event observed on poll_ready"),
-                    continuation: K::PollReady,
-                },
-                SendPoll::Pending => if state.send_inprogress { Pending } else { ReturnReady },
-            }
-        }
-
-        // ── poll_finish request. Absorbing finish and a completed graceful finish
-        //    both precede the method-terminal step and ordinary event handling.
-        PollFinish { poll, terminal } => {
-            if state.finish_complete { return ReturnFinished; }   // absorbing
-            if state.submission_reserved() {
-                return PublishTerminal {
-                    candidate: SendTerminal::Internal("poll_finish during submission reservation"),
-                    continuation: K::PollFinish,
-                };
-            }
-            // Documented successful-finish exception: a graceful finish that
-            // actually completed wins even over a present terminal.
-            if let SendPoll::Event(SendEvent::FinishComplete { graceful }) = poll {
-                if !state.finish_started {
-                    return PublishTerminal {
-                        candidate: SendTerminal::Internal("finish complete without a started finish"),
-                        continuation: K::PollFinish,
-                    };
-                }
-                if graceful {
-                    state.finish_complete = true;
-                    return ReturnFinished;
-                }
-                // graceful == false while finishing: abort (winner wins if present).
-                return PublishTerminal {
-                    candidate: terminal.unwrap_or_else(aborted),
-                    continuation: K::PollFinish,
-                };
-            }
-            // Method-terminal step: after the finish exceptions, a present winner is
-            // surfaced before any Pending/SubmitGraceful, so PollFinish(Pending) can
-            // never submit graceful shutdown once a terminal has won.
-            if let Some(w) = terminal {
-                state.send_inprogress = false;
-                return ReturnError(w);
-            }
-            match poll {
-                SendPoll::Closed => PublishTerminal {
-                    candidate: SendTerminal::Internal("send channel closed without a terminal"),
-                    continuation: K::PollFinish,
-                },
-                SendPoll::Event(SendEvent::Complete { cancelled: false }) if !state.finish_started => {
-                    if !state.send_inprogress {
-                        return PublishTerminal {   // impossible idle-state completion
-                            candidate: SendTerminal::Internal("SendComplete without an outstanding send"),
-                            continuation: K::PollFinish,
-                        };
-                    }
-                    state.send_inprogress = false; state.finish_submitting = true; SubmitGraceful
-                }
-                SendPoll::Event(SendEvent::Complete { cancelled: true }) if !state.finish_started => {
-                    if !state.send_inprogress {
-                        return PublishTerminal {   // impossible idle-state completion
-                            candidate: SendTerminal::Internal("cancelled SendComplete without an outstanding send"),
-                            continuation: K::PollFinish,
-                        };
-                    }
-                    state.send_inprogress = false;
-                    PublishTerminal { candidate: aborted(), continuation: K::PollFinish }
-                }
-                SendPoll::Event(SendEvent::TerminalWake) => PublishTerminal {
-                    candidate: SendTerminal::Internal("terminal wake without a terminal"),
-                    continuation: K::PollFinish,
-                },
-                SendPoll::Pending if state.finish_started => Pending,
-                SendPoll::Pending if state.send_inprogress => Pending,     // wait for in-flight data send
-                SendPoll::Pending => { state.finish_submitting = true; SubmitGraceful }  // idle, not finishing
-                // Any remaining event/state pair (e.g. a data completion while
-                // finishing) is adapter-internal, never a panic.
-                SendPoll::Event(_) => PublishTerminal {
-                    candidate: SendTerminal::Internal("impossible poll_finish event/state"),
-                    continuation: K::PollFinish,
-                },
-            }
-        }
-    }
-}
-```
-
-The guard order inside each arm follows the precedence stated earlier
-(submitted-result bookkeeping is discharged by the outer variant match itself;
-absorbing `finish_complete` precedes reservation/method handling in `PollFinish`;
-`submission_reserved()` precedes method-specific handling in `PollReady`). Reducer
-tests are table-driven from the rows above and need no executor or native handle.
-
-### Command-executor boundary and per-method loops
-
-The reducer touches MsQuic only through two seams, split by lifetime because one
-*acts on* an existing stream and the other *creates* one:
-
-```rust
-/// Send-side seam: acts on an already-open stream. Stored behind a trait object
-/// in H3SendStream so a test double replaces it without a live connection. The
-/// reducer never names it.
-trait SendExec: std::fmt::Debug + Send {
-    /// Materialize the already-validated non-zero payload's SendBuffer,
-    /// Box::into_raw it as client_context, and call Stream::send. On an immediate
-    /// Err the box is reconstructed and dropped here, before returning.
-    fn submit_send(&mut self, buf: SendBuffer) -> Result<(), Status>;
-    fn submit_graceful(&mut self) -> Result<(), Status>;   // Stream::shutdown(GRACEFUL)
-    fn submit_reset(&mut self, code: u64) -> Result<(), Status>;  // shutdown(ABORT_SEND)
-}
-
-#[derive(Debug)]
-struct StreamExecutor { stream: Arc<msquic::Stream> }   // production send seam
-impl SendExec for StreamExecutor {
-    fn submit_send(&mut self, buf: SendBuffer) -> Result<(), Status> {
-        // Box the self-referential SendBuffer and hand its raw pointer to native as
-        // client_context. `buf.buffers` (a [BufferRef; 1]) points into `buf._bytes`
-        // and stays valid because the box is never moved again until SendComplete.
-        let cc: *mut SendBuffer = Box::into_raw(Box::new(buf));
-        // SAFETY: buffers memory is valid until the SendComplete callback
-        // reconstructs+drops the box (Stream::send's contract). FIN is not set on a
-        // data send; graceful finish is a separate shutdown call.
-        let res = unsafe {
-            self.stream.send(&(*cc).buffers, msquic::SendFlags::NONE, cc as *const std::ffi::c_void)
-        };
-        if let Err(status) = res {
-            // Immediate failure: MsQuic took no ownership, so reclaim the box here
-            // (mirroring the SendComplete drop) before returning.
-            drop(unsafe { Box::from_raw(cc) });
-            return Err(status);
-        }
-        Ok(())
-    }
-    fn submit_graceful(&mut self) -> Result<(), Status> {
-        // GRACEFUL FIN; error_code is ignored for a graceful shutdown.
-        self.stream.shutdown(msquic::StreamShutdownFlags::GRACEFUL, 0)
-    }
-    fn submit_reset(&mut self, code: u64) -> Result<(), Status> {
-        // ABORT_SEND with the already-clamped application code (<= MAX_QUIC_VARINT).
-        self.stream.shutdown(msquic::StreamShutdownFlags::ABORT_SEND, code)
-    }
-}
-
-/// Open seam: *creates and starts* the native stream, returning the OpeningStream
-/// (which carries the start receiver). Separate from SendExec because it cannot
-/// act on an Arc<Stream> that does not exist yet. Stored in StreamOpener.
-trait OpenExec: std::fmt::Debug {
-    fn submit_open_start(&self, conn: &ConnHandle, uni: bool) -> Result<OpeningStream, Status>;
-}
-
-#[derive(Debug)]
-struct StreamOpenExecutor;   // production open seam
-impl OpenExec for StreamOpenExecutor {
-    fn submit_open_start(&self, conn: &ConnHandle, uni: bool) -> Result<OpeningStream, Status> {
-        H3Stream::open_and_start(conn, uni)   // real Stream::open + Stream::start
-    }
-}
-```
-
-This resolves the earlier contradiction: `submit_open_start` now creates the
-stream and returns it (not `Result<(), Status>`), and `H3SendStream` stores
-`Box<dyn SendExec>` (not a concrete `StreamExecutor`), so a `CountingExec` is
-injectable in wiring tests.
-
-**Construction interface.** Production builds `H3SendStream` via
-`OpeningStream::finalize` / `H3Stream::attach` (which install
-`Box::new(StreamExecutor { stream })`). Tests use an internal constructor that
-takes only the injected seam and the send-side context — **no `Arc<msquic::Stream>`**,
-because the send half has no `stream` field and the production stream lives inside
-`StreamExecutor`:
-
-```rust
-impl H3SendStream {
-    /// Test/internal constructor: inject any SendExec (incl. CountingExec) plus the
-    /// send-side context whose channel senders the test retains. No live connection
-    /// or native stream is required — the reducer and loops touch only `exec` and
-    /// `sctx`.
-    fn with_exec(exec: Box<dyn SendExec>, sctx: SendStreamReceiveCtx) -> Self {
-        H3SendStream { exec, sctx }
-    }
-}
-```
-
-For a pure wiring test the caller builds `sctx` with `stream_ctx_channel(state, id)`
-(keeping the `StreamSendCtx` senders so it can feed `SendEvent`s and the finish
-one-shot by hand) and passes `Box::new(CountingExec::new(handle.clone(), script))`.
-
-`CountingExec` must stay inspectable **after** it is moved behind
-`Box<dyn SendExec>`, and it must actually **retain** the submitted buffer while the
-send is outstanding (so the test can later replay the production reclamation). Both
-are achieved with a cloneable, shared handle the test keeps, plus a real
-`Box::into_raw` `client_context` slot the test feeds back through the real
-`stream_callback`:
-
-```rust
-use std::collections::VecDeque;
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, PoisonError};
-
-/// Shared, inspectable counters + client_context slots. The test keeps a clone of
-/// this handle, so every counter is readable AFTER the CountingExec is moved into
-/// H3SendStream behind Box<dyn SendExec>.
-#[derive(Clone, Debug, Default)]
-struct CountingHandle {
-    sends: Arc<AtomicUsize>,
-    gracefuls: Arc<AtomicUsize>,
-    resets: Arc<AtomicUsize>,
-    allocs: Arc<AtomicUsize>,                  // total Box<SendBuffer> created (Box::into_raw)
-    reclaims: Arc<AtomicUsize>,                // in-exec reclamations (immediate-failure arm only)
-    client_ctx: Arc<Mutex<VecDeque<usize>>>,   // raw ptrs "native" holds; the test replays each
-                                               // through stream_callback (the production reclaim path)
-}
-
-#[derive(Debug)]
-struct CountingExec {
-    h: CountingHandle,
-    script: VecDeque<Result<(), Status>>,      // scripted submit_send results
-}
-impl CountingExec {
-    fn new(h: CountingHandle, script: VecDeque<Result<(), Status>>) -> Self { Self { h, script } }
-}
-impl SendExec for CountingExec {
-    fn submit_send(&mut self, buf: SendBuffer) -> Result<(), Status> {
-        self.h.sends.fetch_add(1, Relaxed);
-        // Mirror StreamExecutor EXACTLY: box the buffer and produce its raw
-        // client_context pointer BEFORE inspecting the scripted result, so both arms
-        // model the real allocation.
-        let cc = Box::into_raw(Box::new(buf));
-        self.h.allocs.fetch_add(1, Relaxed);
-        match self.script.pop_front().unwrap_or(Ok(())) {
-            Ok(()) => {
-                // Native accepted ownership: retain the pointer so the test can replay
-                // the native SendComplete through stream_callback. The box is NOT
-                // dropped here; it is outstanding until that callback reclaims it.
-                self.h.client_ctx.lock().unwrap_or_else(PoisonError::into_inner).push_back(cc as usize);
-                Ok(())
-            }
-            Err(status) => {
-                // Immediate failure: MsQuic takes no ownership and delivers no
-                // SendComplete, so the caller reclaims here and now — exactly as
-                // StreamExecutor's immediate-Err arm does (`Box::from_raw` + drop).
-                drop(unsafe { Box::from_raw(cc) });
-                self.h.reclaims.fetch_add(1, Relaxed);
-                Err(status)
-            }
-        }
-    }
-    fn submit_graceful(&mut self) -> Result<(), Status> { self.h.gracefuls.fetch_add(1, Relaxed); Ok(()) }
-    fn submit_reset(&mut self, _c: u64) -> Result<(), Status> { self.h.resets.fetch_add(1, Relaxed); Ok(()) }
-}
-// Reclamation of an accepted send's `Box<SendBuffer>` is NOT a test-only helper: the
-// test replays the retained `client_context` through the production `stream_callback`
-// as a synthesized `StreamEvent::SendComplete`, which is the exact reconstruct+drop
-// path the binding invokes. There is deliberately no separate `reclaim_client_context`
-// shim, so the seam test verifies the real callback code and its exactly-once event.
-```
-
-`test_send_ctx` builds a send-side context with **no live connection**: a fresh
-`StreamState`, an arbitrary cached id, and the id-bearing halves from
-`stream_ctx_channel`. It returns the frontend `SendStreamReceiveCtx` together with
-the callback-owned `StreamSendCtx`; the test keeps the latter so it can both drive
-`stream_callback` and observe the `SendEvent`s it emits. Constructing a non-empty
-`WriteBuf<Bytes>` uses h3's real `From<Frame<B>>` impl (`h3` `stream.rs:181`) — the
-only public way to build a data-carrying `WriteBuf`, since `WriteBuf`'s fields are
-private and its `From` sources (`Frame`, `StreamType`, `UniStreamHeader`) are h3
-internals. h3 exposes them to backend implementers behind the
-`i-implement-a-third-party-backend-and-opt-into-breaking-changes` feature, enabled
-in `[dev-dependencies]` (see the release-gate wiring) so these tests can write
-`WriteBuf::<Bytes>::from(Frame::Data(..))` exactly as h3's own frontend does:
-
-```rust
-use bytes::Bytes;
-use std::ffi::c_void;
-use h3::proto::frame::Frame;            // gated by the backend dev-feature (see wiring)
-use h3::quic::SendStream;
-
-/// No live connection or native stream: fresh shared state + id-bearing halves.
-/// Returns (frontend send ctx, callback-owned senders). The recv half is unused.
-fn test_send_ctx() -> (SendStreamReceiveCtx, StreamSendCtx) {
-    let state = Arc::new(StreamState {
-        connection: Arc::new(ConnectionState { terminal: std::sync::Mutex::new(None) }),
-        send_terminal: std::sync::Mutex::new(None),
-    });
-    let id: h3::quic::StreamId = 0u64.try_into().expect("valid StreamId");
-    let (ctx, sctx, _rctx) = stream_ctx_channel(state, id);
-    (sctx, ctx)
-}
-
-#[test]
-fn accepted_send_reclaims_via_callback_exactly_once() {
-    let h = CountingHandle::default();
-    let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new())); // all-Ok script
-    let (sctx, mut ctx) = test_send_ctx();                              // ctx keeps the senders
-    let mut s = H3SendStream::with_exec(exec, sctx);
-
-    // Valid WriteBuf<Bytes>: an h3 DATA frame carrying the payload, built via the
-    // real From<Frame<B>> impl. send_data classifies it NonEmpty and submits.
-    SendStream::<Bytes>::send_data(&mut s, Frame::Data(Bytes::from_static(b"hello world"))).unwrap();
-    assert_eq!(h.sends.load(Relaxed), 1);
-    assert_eq!(h.allocs.load(Relaxed), 1);              // one Box<SendBuffer> created
-    assert_eq!(h.reclaims.load(Relaxed), 0);            // not the immediate-failure arm
-    assert_eq!(h.client_ctx.lock().unwrap().len(), 1);  // outstanding: "native" holds the box
-
-    // Replay the native SendComplete through the PRODUCTION callback path: the exact
-    // stream_callback the binding invokes, fed the retained client_context pointer.
-    let cc = h.client_ctx.lock().unwrap().pop_front().unwrap();
-    stream_callback(&mut ctx, StreamEvent::SendComplete {
-        cancelled: false,
-        client_context: cc as *const c_void,
-    }).unwrap();
-
-    // The callback reconstructed+dropped the Box<SendBuffer> once and enqueued
-    // exactly one Complete; a second poll is empty -> exactly-once callback count.
-    assert!(matches!(s.sctx.send.try_next(), Ok(Some(SendEvent::Complete { cancelled: false }))));
-    assert!(s.sctx.send.try_next().is_err());           // no second event
-    assert_eq!(h.reclaims.load(Relaxed), 0);            // reclaim happened in the callback
-}
-
-#[test]
-fn immediate_send_failure_reclaims_without_completion() {
-    let h = CountingHandle::default();
-    let mut script = VecDeque::new();
-    script.push_back(Err(Status::from(StatusCode::QUIC_STATUS_INVALID_PARAMETER)));
-    let exec = Box::new(CountingExec::new(h.clone(), script));
-    let (sctx, _ctx) = test_send_ctx();
-    let mut s = H3SendStream::with_exec(exec, sctx);
-
-    // submit_send returns Err; send_data surfaces the error.
-    assert!(SendStream::<Bytes>::send_data(
-        &mut s, Frame::Data(Bytes::from_static(b"hello world"))).is_err());
-
-    // One allocation, one immediate in-exec reclamation, nothing left outstanding,
-    // and ZERO SendComplete callbacks (native took no ownership, emitted no event).
-    assert_eq!(h.sends.load(Relaxed), 1);
-    assert_eq!(h.allocs.load(Relaxed), 1);
-    assert_eq!(h.reclaims.load(Relaxed), 1);
-    assert!(h.client_ctx.lock().unwrap().is_empty());   // no outstanding box
-    assert!(s.sctx.send.try_next().is_err());           // no Complete event ever enqueued
-}
-```
-
-The reducer and its inputs reference neither trait nor either impl, so reducer
-unit tests need no executor at all; executor-wiring tests read the `CountingHandle`
-counters directly. Open-count coverage uses a `CountingOpenExec` that delegates to
-`StreamOpenExecutor` while incrementing a counter, exercised by the loopback
-conformance test (an `OpeningStream` requires a real `HQUIC`, so it cannot be
-fabricated in a pure unit test).
-
-Ownership of bytes during immediate feedback. `SendInput::SendRequested` carries
-only the payload *classification* (`SendPayload`), never `B`. The original
-generic `WriteBuf<B>` is **not** moved into the reducer; the frontend keeps it on
-its own stack. When the reducer returns `SubmitSend`, the frontend — still on the
-caller thread, still owning `WriteBuf<B>` — runs `wb.copy_to_bytes(n)` (which
-takes `&mut wb`) into `Bytes`, builds `SendBuffer`, and hands it to
-`exec.submit_send(buf)`. The `Box<SendBuffer>` (which owns the `Bytes`) is
-`Box::into_raw`'d as `client_context` inside `submit_send`. On an immediate
-`Err(status)`, `submit_send` reconstructs and drops that box before returning, so
-exactly one owner exists at all times and the reducer's `SendSubmitted(Err)`
-bookkeeping runs with the buffer already reclaimed. On `Ok`, ownership is with
-MsQuic until `SendComplete`. Thus `Bytes`/`Box<SendBuffer>` lives on the frontend
-stack until `submit_send`, then in native `client_context`; it is never inside
-`SendState` or `SendInput`.
-
-Every loop below is driven by a single mutable `input` value; `feed(x)` means
-`input = x`, so each `transition` result is fed straight back within the same
-call. `wb` is `mut` because `Buf::copy_to_bytes(&mut self, ..)` consumes it.
-
-Normative `send_data` loop:
-
-```rust
-fn send_data<T: Into<WriteBuf<B>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
-    use SendCommand::*;
-    let mut wb: WriteBuf<B> = data.into();               // owned on the frontend stack
-    let payload = classify(wb.remaining());              // Empty | NonEmpty{len} | Oversized{len}
-    let mut input = SendInput::SendRequested {
-        payload, terminal: load_winner(&self.sctx.state),
-    };
-    loop {
-        match transition(&mut self.sctx.reducer, input) {
-            ReturnSent              => return Ok(()),                       // Ok(()) / empty no-op
-            ReturnImmediateError(e) => return Err(convert_send_op(e)),      // oversized / misuse
-            ReturnError(t)          => return Err(convert_send(t)),         // sticky winner
-            SubmitSend => {
-                // The ONE production copy path, shared verbatim with the benchmark:
-                // `&mut wb` is a `Buf`, so this runs the identical `copy_to_bytes`.
-                let buf = buffer::copy_into_send_buffer(&mut wb);         // consumes wb's bytes
-                let res = self.exec.submit_send(buf);                     // reclaims box on Err
-                input = SendInput::SendSubmitted { result: res, terminal: load_winner(&self.sctx.state) };
-            }
-            PublishTerminal { candidate, continuation } => {
-                let winner = publish(&self.sctx.state, candidate);         // first-writer helper
-                input = SendInput::TerminalPublished { winner, continuation };
-            }
-            // The reducer never returns these for a send_data-rooted input.
-            NoOp | ReturnReady | ReturnFinished | Pending
-            | SubmitGraceful | SubmitReset(_) | RepollFinish =>
-                return Err(convert_send(SendTerminal::Internal("unexpected send_data command"))),
-        }
-    }
-}
-```
-
-`poll_ready` loop:
-
-```rust
-fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-    use SendCommand::*;
-    // First input polls the channel; subsequent inputs are fed results.
-    let mut input = SendInput::PollReady {
-        poll: self.poll_send_channel(cx), terminal: load_winner(&self.sctx.state),
-    };
-    loop {
-        match transition(&mut self.sctx.reducer, input) {
-            Pending        => return Poll::Pending,                        // waker already registered
-            ReturnReady    => return Poll::Ready(Ok(())),
-            ReturnError(t) => return Poll::Ready(Err(convert_send(t))),
-            PublishTerminal { candidate, continuation } => {
-                let winner = publish(&self.sctx.state, candidate);
-                input = SendInput::TerminalPublished { winner, continuation };
-            }
-            NoOp | ReturnSent | ReturnFinished | ReturnImmediateError(_)
-            | SubmitSend | SubmitGraceful | SubmitReset(_) | RepollFinish =>
-                return Poll::Ready(Err(convert_send(SendTerminal::Internal("unexpected poll_ready command")))),
-        }
-    }
-}
-```
-
-`reset` loop (infallible; stores the terminal, never returns to h3):
-
-```rust
-fn reset(&mut self, code: u64) {
-    use SendCommand::*;
-    let mut input = SendInput::Reset {
-        code: clamp_application_code(code), terminal: load_winner(&self.sctx.state),
-    };
-    loop {
-        match transition(&mut self.sctx.reducer, input) {
-            NoOp => return,                                                // already terminal
-            SubmitReset(c) => {
-                let res = self.exec.submit_reset(c);
-                input = SendInput::ResetSubmitted { code: c, result: res, terminal: load_winner(&self.sctx.state) };
-            }
-            PublishTerminal { candidate, continuation } => {
-                let winner = publish(&self.sctx.state, candidate);        // stored for a later poll
-                input = SendInput::TerminalPublished { winner, continuation };
-            }
-            // reset consumes any terminal; there is nothing to surface to h3 now.
-            ReturnError(_) | ReturnReady | ReturnFinished | ReturnSent
-            | ReturnImmediateError(_) | Pending | SubmitSend | SubmitGraceful | RepollFinish => return,
-        }
-    }
-}
-```
-
-The undefined `publish_result` from the earlier sketch is gone: the first-writer
-`publish(..)` return value is bound to `_winner` and fed straight back as
-`TerminalPublished { winner: _winner, .. }`.
-
-`poll_finish` loop (complete, with `RepollFinish` re-polling in the same call):
-
-```rust
-fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-    use SendCommand::*;
-    let mut input = SendInput::PollFinish {
-        poll: self.poll_send_channel(cx), terminal: load_winner(&self.sctx.state),
-    };
-    loop {
-        match transition(&mut self.sctx.reducer, input) {
-            Pending        => return Poll::Pending,
-            ReturnFinished => return Poll::Ready(Ok(())),
-            ReturnError(t) => return Poll::Ready(Err(convert_send(t))),
-            SubmitGraceful => {
-                let res = self.exec.submit_graceful();
-                input = SendInput::GracefulSubmitted { result: res, terminal: load_winner(&self.sctx.state) };
-            }
-            RepollFinish => {
-                // Re-poll the channel in THIS call so a synchronously-queued
-                // FinishComplete is drained (or the waker re-armed) — never defer.
-                input = SendInput::PollFinish {
-                    poll: self.poll_send_channel(cx), terminal: load_winner(&self.sctx.state),
-                };
-            }
-            PublishTerminal { candidate, continuation } => {
-                let winner = publish(&self.sctx.state, candidate);
-                input = SendInput::TerminalPublished { winner, continuation };
-            }
-            NoOp | ReturnReady | ReturnSent | ReturnImmediateError(_)
-            | SubmitSend | SubmitReset(_) =>
-                return Poll::Ready(Err(convert_send(SendTerminal::Internal("unexpected poll_finish command")))),
-        }
-    }
-}
-```
-
-**Load-bearing helper bodies.** The loops above call six helpers; their exact
-bodies (so callback/channel ordering is not left to the implementer):
-
-```rust
-/// send_data length classification, against MAX_ADAPTER_SEND (not native u32::MAX).
-fn classify(remaining: usize) -> SendPayload {
-    if remaining == 0 {
-        SendPayload::Empty
-    } else if remaining as u64 > MAX_ADAPTER_SEND {
-        SendPayload::Oversized { len: remaining }
-    } else {
-        // 0 < remaining <= 16 MiB, so the u32 cast never truncates.
-        SendPayload::NonEmpty { len: remaining as u32 }
-    }
-}
-
-/// Read the current sticky send winner (poison-safe clone; None if unset).
-fn load_winner(state: &StreamState) -> Option<SendTerminal> {
-    state.send_terminal.lock().unwrap_or_else(PoisonError::into_inner).clone()
-}
-
-/// First-writer publish: install `candidate` only if the slot is empty, and return
-/// whichever value now owns the slot. Poison-safe; never overwrites an earlier
-/// winner (the callback and the frontend race into the same slot).
-fn publish(state: &StreamState, candidate: SendTerminal) -> SendTerminal {
-    let mut slot = state.send_terminal.lock().unwrap_or_else(PoisonError::into_inner);
-    slot.get_or_insert(candidate).clone()
-}
-
-/// Construct the self-referential SendBuffer from already-validated non-empty owned
-/// bytes. `BufferRef::from(&bytes[..])` casts the (<= 16 MiB) length to u32 without
-/// truncation; moving `Bytes` into the struct does not move its heap storage, so
-/// the BufferRef pointer stays valid for the box's lifetime.
-impl SendBuffer {
-    fn new(bytes: Bytes) -> SendBuffer {
-        let bref = BufferRef::from(&bytes[..]);   // points into `bytes`'s heap storage
-        SendBuffer { buffers: [bref], _bytes: bytes }
-    }
-}
-
-/// Clamp an outgoing application error code to the QUIC 62-bit varint maximum.
-/// Matches the clamp used for connection close and stop_sending: (1<<62)-1 passes
-/// unchanged, 1<<62 clamps down.
-fn clamp_application_code(code: u64) -> u64 {
-    code.min(MAX_QUIC_VARINT)   // MAX_QUIC_VARINT = (1 << 62) - 1
-}
-
-impl H3SendStream {
-    /// Poll the two send-side event sources into a single SendPoll, with a defined
-    /// priority: the send-event mpsc (data `Complete`, `TerminalWake`) is polled
-    /// FIRST, because a data completion must be observed before the graceful-finish
-    /// completion that follows it; the finish one-shot is polled only when the mpsc
-    /// yields nothing. Both wakers are registered on a `Pending` result, so no
-    /// wakeup is lost, and the priority is deterministic (no `select!` fairness).
-    fn poll_send_channel(&mut self, cx: &mut Context<'_>) -> SendPoll {
-        use futures::StreamExt;                 // poll_next_unpin (Receiver: Unpin)
-        use std::future::Future;                // oneshot::Receiver: Future + Unpin
-        match self.sctx.send.poll_next_unpin(cx) {
-            // (1) A send event is always taken ahead of the finish one-shot.
-            Poll::Ready(Some(ev)) => SendPoll::Event(ev),
-            // mpsc closed: no further send events. A finish may still be
-            // deliverable, so consult the one-shot before declaring the channel
-            // closed (a closed channel with no terminal is an adapter-internal error).
-            Poll::Ready(None) => match Pin::new(&mut self.sctx.shutdown).poll(cx) {
-                Poll::Ready(Ok(ev)) => SendPoll::Event(ev),
-                Poll::Ready(Err(_canceled)) => SendPoll::Closed,
-                Poll::Pending => SendPoll::Pending,
-            },
-            // (2) No send event yet; poll the finish one-shot.
-            Poll::Pending => match Pin::new(&mut self.sctx.shutdown).poll(cx) {
-                Poll::Ready(Ok(ev)) => SendPoll::Event(ev),     // FinishComplete
-                // No finish yet; the mpsc waker is armed, so keep waiting.
-                Poll::Ready(Err(_canceled)) | Poll::Pending => SendPoll::Pending,
-            },
-        }
-    }
-}
-```
-
-**Routing `open` through the seam.** Stream *open/start* is outside the send
-reducer (it has no `SendState`); it goes through `OpenExec::submit_open_start`,
-whose production body is `Stream::open` + `Stream::start` and whose result — the
-`OpeningStream` carrying the start receiver — is finalized by `poll_open_inner`.
-This keeps all four native verbs (`open` / `send` / `shutdown(GRACEFUL)` /
-`shutdown(ABORT_SEND)`) behind the two seams whose test doubles count them,
-replacing the earlier "private call table or small test-only probe suffices"
-language.
-
-### Callback-safety: exact per-site outcomes
-
-Every site below becomes fallible/non-panicking. "Outcome" is what the callback
-does; none may unwind through FFI.
-
-| Site (`lib.rs`/`listener.rs`/`registration.rs`) | Current | Exact outcome |
-| --- | --- | --- |
-| `connection_callback` `Connected` sender (`lib.rs:113`) | `take().unwrap().send().unwrap()` | `if let Some(tx) = ctx.connected.take() { let _ = tx.send(Ok(())); }` — a **duplicate** `Connected` (slot already `None`) is ignored; a **missing** receiver (send `Err`) is dropped silently |
-| `connection_callback` `ShutdownInitiatedByTransport { status, .. }` / `ShutdownInitiatedByPeer { error_code }` (new arms, currently `_ => {}` at `lib.rs:137`) | none (pending `connected` only resolved by `Connected` or dropped at `ShutdownComplete`) | resolve the pending connect one-shot as a failure **before** `ShutdownComplete`: `if let Some(tx) = ctx.connected.take() { let _ = tx.send(Err(status)); }` for transport (carries a real `Status`), and `Err(Status::new(StatusCode::QUIC_STATUS_ABORTED))` for peer (only an `error_code`). Also publish the connection terminal via the first-writer helper. Absent/duplicate → no-op |
-| `connection_callback` `PeerStreamStarted` delivery (`lib.rs:120,124`) | `.expect("cannot send")` | on `unbounded_send` `Err` after taking native ownership: drop/close the owned `H3Stream` through Rust and **return `Ok`** from the callback (post-ownership delivery failure path), so MsQuic's `HandleClosed` branch does not double-close |
-| `connection_callback` `ShutdownComplete` shutdown one-shot (`lib.rs:133`) | already `let _ =`; but pending `connected` is dropped via `ctx.connected.take()` at `lib.rs:130` | keep the waiter send as a no-op-safe `let _ =`. For `connected`: if it is *still* pending here (neither `Connected` nor a `ShutdownInitiated*` arm resolved it — e.g. a bare local close), resolve it as failure instead of a bare drop: `if let Some(tx) = ctx.connected.take() { let _ = tx.send(Err(Status::new(StatusCode::QUIC_STATUS_ABORTED))); }`, so `connect()`'s await returns `Err` deterministically rather than mapping a `Canceled` drop |
-| `stream_callback` `StartComplete` sender (`lib.rs:476-481`) | `take().unwrap()...expect` | `if let Some(tx) = ctx.start.take() { let _ = tx.send(result); }` — duplicate `StartComplete` ignored, dropped `OpeningStream` receiver ignored |
-| `stream_callback` `Receive` delivery (`lib.rs:505`) | `.expect("cannot send")` (split-receive drop panic) | this is one of the split-receive-drop panics the design removes. On a non-empty buffer, deliver `ReceiveEvent::Data(bytes)`: `if let Some(tx) = ctx.receive.as_ref() { if tx.unbounded_send(ReceiveEvent::Data(b)).is_err() { ctx.receive.take(); } }` — a **failed** delivery (frontend `H3RecvStream` dropped) drops the receiver sender so no further receive events are attempted, and **returns `Ok`**. FIN handling is gated on `flags.contains(ReceiveFlags::FIN)` (`msquic types.rs:544`): only when FIN is set does the callback publish the sticky `ReceiveEvent::Fin` (after any same-notification `Data`) and then `ctx.receive.take()`, so the reader observes the terminal rather than a bare channel close. An **empty, non-FIN** notification (zero-length buffer, `!flags.contains(FIN)`) is **non-terminal**: it publishes no event and does not take the sender, consistent with the approved rule ("Empty non-FIN receive notifications produce no event", ~line 675) |
-| `stream_callback` `SendComplete` (`lib.rs:487-492`) | `.expect("cannot send")` / `debug_assert!(false,"mem leak")` | reconstruct+drop `Box<SendBuffer>` **first** (buffer reclaimed even if receiver gone), then `if let Some(tx) = ctx.send.as_ref() { let _ = tx.unbounded_send(SendEvent::Complete{..}); }` |
-| `stream_callback` `SendShutdownComplete` (`lib.rs:518-519`) | `.expect` | `if let Some(tx) = ctx.shutdown.take() { let _ = tx.send(SendEvent::FinishComplete{graceful}); }` |
-| `listener_callback` `NewConnection` config validation (`listener.rs:65-69`) | `from_raw` → `set_configuration` → on `Err`, `drop(ConnHandle::new(inner, guard))` (closes) **and** `return Err(e)` — a **close-then-reject** that trips native `listener.c:676-680` `CXPLAT_FRE_ASSERTMSG(!HandleClosed, "App MUST not close and reject connection!")` | do `set_configuration` through the **borrowed** `ConnectionRef` *before* `from_raw`: `if let Err(e) = connection.set_configuration(config) { return Err(e); }` (the `ConnectionRef` derefs to `Connection`, `lib.rs:944`, and its `Drop` only nulls the handle — it never closes). Because ownership was **not** taken, the callback returns `Err` without any close, and native `listener.c` performs the single close via `QuicConnTransportError`. Only **after** `set_configuration` succeeds is ownership taken: `let inner = unsafe { Connection::from_raw(connection.as_raw()) };` then `Connection::attach(inner, guard)` |
-| `listener_callback` `NewConnection` delivery (`listener.rs:73`) | `.expect("cannot send")` | on `unbounded_send` `Err` **after** ownership was taken (`Connection::attach` owns the handle): drop the owned `Connection` (its `ConnHandle`/`ConnectionClose` runs — a single close) and **return `Ok`**, so the callback does not *also* return `Err` (which combined with the close would trip the same `listener.c:676-680` assert) |
-| `listener_callback` `StopComplete` end marker (`listener.rs:79`) | `.expect` | `let _ = tx.unbounded_send(None);` |
-| `listener_callback` shutdown lock+send (`listener.rs:81-85`) | `.lock().unwrap()` + `.expect` | poison-safe lock (`into_inner`), then `if let Some(tx) = lk.take() { let _ = tx.send(()); }` |
-| `Listener::shutdown` frontend (`listener.rs:144,148`) | `.lock().unwrap()` + `rx.await.expect` | poison-safe lock; on cancellation `rx.await` `Err` → treat as already-shutdown and **return** (no panic). Calling `shutdown` twice is a no-op because the receiver was taken |
-| `ConnectionShutdownWaiter::wait` (`lib.rs:217-221`) | `.expect("failed to wait...")` | `let _ = self.rx.await;` — a dropped sender (connection torn down without a clean `ShutdownComplete`) resolves the wait rather than panicking |
-| listener frontend `poll_accept` (`listener.rs:133`) | `unwrap_or(None)` | keep (already non-panicking) |
-| test-harness `sht_tx.send(()).unwrap()` (`listener.rs:310`) | `.unwrap()` | test-only; change to `let _ = sht_tx.send(());` for consistency, not FFI-reachable |
-
-Corrected `NewConnection` body (single close/accept outcome, guard preserved):
-
-```rust
-ListenerEvent::NewConnection { info: _, connection } => {
-    // `connection` is the borrowed ConnectionRef; the native handle already
-    // holds a registration rundown ref, so reserve our count now.
-    let guard = RundownGuard::new(state.clone());
-    // Validate/configure through the BORROWED ref, before taking ownership.
-    if let Err(e) = connection.set_configuration(config) {
-        // No from_raw, no close: native listener.c closes on our Err (single close).
-        drop(guard);            // release our reserved rundown count
-        return Err(e);
-    }
-    // set_configuration succeeded: NOW take ownership.
-    let inner = unsafe { msquic::Connection::from_raw(connection.as_raw()) };
-    let conn = crate::Connection::attach(inner, guard);
-    if let Some(tx) = ctx.conn.as_ref() {
-        if let Err(send_err) = tx.unbounded_send(Some(conn)) {
-            // Delivery failed after ownership: drop (single close) and return Ok,
-            // never Err — returning Err here while owned would trip the assert.
-            drop(send_err.into_inner());   // drops the owned Connection
-        }
-    }
-    Ok(())
-}
-```
-
-**`RundownState::waiters` poisonable locks (`registration.rs:62,142,159`).** The
-reviewer is correct that these remain FFI-reachable even after phase one, because
-`RundownGuard::drop` runs *inside* a native `*Close` call, and a native close can
-run while a listener/connection callback is dropping an undeliverable handle
-(the post-ownership-delivery-failure paths above call `drop(ConnHandle)` /
-`drop(Connection)` from within the callback, which triggers `ConnectionClose` →
-`RundownGuard::drop`). A poisoned `waiters` mutex would then unwind
-`self.state.waiters.lock().unwrap()` at `registration.rs:62` through FFI. All
-three sites must therefore recover poison:
-
-```rust
-// registration.rs:62  (RundownGuard::drop)
-let woken: Vec<Waker> = {
-    let mut w = self.state.waiters.lock().unwrap_or_else(PoisonError::into_inner);
-    w.map.drain().map(|(_, waker)| waker).collect()
-};
-// registration.rs:142 (WaitIdle::deregister) and :159 (WaitIdle::poll) identically:
-let mut w = this.state.waiters.lock().unwrap_or_else(PoisonError::into_inner);
-```
-
-`Waiters` holds only a `u64` and a `HashMap<u64, Waker>`; recovering the inner
-value after a poisoned poll is always safe (no torn invariant). This is added in
-implementation phase one alongside the other callback-safety edits, and a test
-poisons `waiters` (panic while holding it) then drops a `RundownGuard` to prove
-no unwind. `WaitIdle::poll`/`deregister` run on the frontend, not in a callback,
-but are converted too so a poisoned mutex never turns `wait_idle` into a panic.
-
-### Native-test mechanisms
-
-Both mechanisms below use only the **already-published `msquic 2.5.1-beta`
-public API** (the counting `SendExec` seam). They
-require **no binding change, no `[patch.crates.io]` entry, and no git-pinned
-revision** — resolving the earlier dev/test-only-vs-global-replacement
-contradiction by removing the dependency change entirely. The workspace
-`Cargo.toml` is unchanged; the only test-side additions are `#[cfg(test)]` code
-and the dev-dependencies listed in the release-gate section.
-
-**(a) Keeping a send observably outstanding.** A **real** loopback send cannot be
-held observably outstanding through the public API. Send buffering is on by default
-and cannot be disabled through the safe `Settings` builder
-(`set_SendBufferingEnabled` is enable-only, `settings.rs:133`), and MsQuic copies a
-*buffered* send into an internal buffer and immediately indicates `SEND_COMPLETE` —
-**before the submit call returns** and irrespective of peer flow-control
-backpressure (`msquic-2.5.1-beta/src/core/stream_send.c:478-534`:
-`QuicStreamSendBufferRequest` allocates an internal buffer, `CxPlatCopyMemory`s the
-payload, sets `QUIC_SEND_FLAG_BUFFERED`, and calls
-`QuicStreamIndicateEvent(SEND_COMPLETE)` synchronously). A small stream receive
-window therefore does **not** keep a buffered send outstanding. The design commits
-to a single, fully deterministic mechanism that depends on neither buffering nor
-timing:
-
-*The deterministic `CountingExec` seam (required, no native).* Drive the send-side
-seam with the `CountingExec` defined in the executor section. On an `Ok` script
-entry its `submit_send` `Box::into_raw`s the `SendBuffer` (incrementing
-`CountingHandle::allocs`) into a **retained** `client_context` slot (the shared
-`CountingHandle::client_ctx` queue) and does **not** drop the box — modelling native
-taking ownership. Because no native stream exists, no `SendComplete` ever fires on
-its own, so the slot holds **exactly one** outstanding pointer the instant the submit
-call returns and keeps it. The test then takes that retained pointer and feeds it
-back **through the production `stream_callback`, as a synthesized
-`StreamEvent::SendComplete { cancelled: false, client_context }`** — the exact
-reclamation path the binding invokes (`NonNull` check → reconstruct+drop
-`Box<SendBuffer>` → enqueue one `SendEvent::Complete`). The callback reclaims the box
-once and emits exactly one `Complete`; a second channel poll is empty, proving
-exactly-once. The outstanding→reclaimed transition is caused solely by the test's own
-step ordering; there is no loopback, no ACK, and no race. Test body:
-`accepted_send_reclaims_via_callback_exactly_once` in the executor section.
-
-*Why no loopback variant.* Because the public API cannot suppress the immediate
-buffered `SendComplete`, there is no public-API loopback configuration that keeps a
-real send outstanding at the moment the count is read. The previous "flow-control
-backpressure with a small recv window" variant is **withdrawn**: it left buffering
-enabled and would complete synchronously. The loopback conformance suite still
-covers end-to-end reclamation *ordering* (an accepted send yields exactly one
-`SendComplete`, box reclaimed once), but the *observably-outstanding* guarantee is
-proven only by the seam test.
-
-*Expected counts.* The seam test proves, in order: (1) after the submit call
-returns, `allocs` reads **1** and `client_ctx` holds exactly **one** outstanding
-pointer (one `SendBuffer` outstanding; in-exec `reclaims` still **0**); (2) feeding
-the retained `client_context` through `stream_callback` drives exactly **one**
-callback reclamation and **one** `SendEvent::Complete`; (3) a second channel poll is
-empty afterward (exactly once). If step (1) cannot read one outstanding pointer, the
-test **fails** with a setup-specific message — it is never skipped or `#[ignore]`d.
-
-**(b) Controlled immediate `Stream::send` failure.** The earlier "single
-`BufferRef` reporting `Length = u32::MAX` over a small backing allocation" idea is
-**removed**: it violates the `BufferRef` validity contract (the pointer must be
-valid for the reported length) and is UB. The async `ABORT_SEND`-then-send race is
-**removed** too, because `Stream::shutdown(ABORT_SEND)` is queued asynchronously,
-so an immediately following `Stream::send` can still succeed. The design commits to
-one safe mechanism per half:
-
-*Reducer/ownership half (required, deterministic — no native).* Script the
-`CountingExec` to return `Err(Status::from(StatusCode::QUIC_STATUS_INVALID_PARAMETER))`
-from `submit_send`. Mirroring `StreamExecutor`, `submit_send` still boxes the buffer
-(`allocs` → **1**) and then, on the scripted `Err`, reclaims it in place via
-`Box::from_raw` + drop (`reclaims` → **1**) before returning, so no pointer is ever
-retained (`client_ctx` stays empty) and **zero** `SendComplete` callbacks fire
-(native took no ownership, so no `SendEvent::Complete` is ever enqueued). `send_data`
-surfaces the error and the reducer records `SendSubmitted(Err)` with the buffer
-already reclaimed. Test body: `immediate_send_failure_reclaims_without_completion`
-in the executor section (`allocs == 1`, `reclaims == 1`, `client_ctx` empty, and the
-send-event channel yields nothing).
-
-*Loopback half (deterministic via synchronized shutdown, not a race).* Fully shut
-the connection down and **await `ShutdownComplete`** on the connection's shutdown
-one-shot, *then* call `Stream::send` on the now-dead stream. `MsQuicStreamSend`
-rejects synchronously with `QUIC_STATUS_INVALID_STATE`/`QUIC_STATUS_ABORTED`
-(connection gone), takes no ownership, and produces no `SendComplete`. Because the
-send happens strictly after the observed `ShutdownComplete`, there is no timing
-window. With the production `StreamExecutor`, `submit_send` `Box::into_raw`s the
-box, `Stream::send` returns `Err`, and `submit_send` reconstructs+drops it before
-returning: net reclamation **0** at return, **zero** `SendComplete`.
-
-Exact counts summary: accepted send → `allocs` **1**, exactly **one** `SendComplete`
-reclaiming the box once via `stream_callback`; rejected send (either half) → `allocs`
-**1**, **zero** `SendComplete`, box reclaimed in place by the immediate-failure path
-(`reclaims` **1**) within the call.
-
-### Release-gate resolution
-
-**Supported native matrix and its provenance/command coupling.** *Superseded by
-the MF-3 narrative resolution above ("MF-3 — a stronger native-version attestation
-gate"); that resolution is authoritative.* Provenance is selected by the committed
-CI matrix dimension `provenance: [native-find, native-src]`, where `native-find`
-(`= ["msquic/find"]`) and `native-src` (`= ["msquic/src"]`) are **msquic-h3**
-features and **every** build/test step runs
-`--no-default-features --features ${{ matrix.provenance }}`, so exactly one
-provenance is chosen by committed config rather than by an uncommitted
-`[dev-dependencies]`/`Cargo.toml` edit. Both provenance rows pin the **same** exact
-native version, **2.5.1** (major.minor.patch), so the `native_version_preflight`
-expected value is a single constant `[2, 5, 1]` for both. The runtime preflight
-below queries `QUIC_PARAM_GLOBAL_LIBRARY_VERSION` (`= 16777220`, `0x01000004`,
-`ffi/linux_bindings.rs:169`) into `[u32; 4]` (`[major, minor, patch, build]`) and
-**fails** the conformance job if the loaded library's first three components differ
-from the pin (the build-id component is ignored):
-
-```rust
-// tests/native_version_preflight.rs — fails the conformance job on version drift.
-const EXPECTED_MSQUIC_VERSION: [u32; 3] = [2, 5, 1];   // major, minor, patch (matrix pin)
-
-#[test]
-fn native_version_preflight() {
-    // Open a registration so the library is loaded and Api::ffi_ref() is ready.
-    let _reg = msquic::Registration::new(&msquic::RegistrationConfig::new())
-        .expect("open msquic registration");
-    // Global param; null handle. Buffer is [major, minor, patch, build].
-    let v: [u32; 4] = unsafe {
-        msquic::Api::get_param_auto::<[u32; 4]>(
-            std::ptr::null_mut(),
-            msquic::ffi::QUIC_PARAM_GLOBAL_LIBRARY_VERSION,   // 16777220
-        )
-    }
-    .expect("query GLOBAL_LIBRARY_VERSION");
-    assert_eq!(
-        [v[0], v[1], v[2]],
-        EXPECTED_MSQUIC_VERSION,
-        "linked libmsquic {:?} != pinned matrix version {:?} (build id v[3]={} ignored)",
-        v, EXPECTED_MSQUIC_VERSION, v[3],
-    );
-}
-```
-
-Test commands — the exact per-row conformance targets are the MF-3 commands above,
-each carrying the committed provenance feature so exactly one clean-checkout row is
-selected (the msquic native library is pulled in transitively by that feature, so no
-separate `--features find` is needed):
-
-```sh
-# conformance jobs (per matrix row); provenance = committed native-find/native-src
-cargo test -p msquic-h3 --no-default-features --features ${{ matrix.provenance }} accepted_send_reclaims_via_callback_exactly_once -- --exact
-cargo test -p msquic-h3 --no-default-features --features ${{ matrix.provenance }} immediate_send_failure_reclaims_without_completion -- --exact
-cargo test -p msquic-h3 --no-default-features --features ${{ matrix.provenance }} native_version_preflight -- --exact
-```
-
-Record OS, arch, native version, provenance (which committed `native-find`/
-`native-src` feature), and the exact command in `docs/Development.md` and link it from
-the teardown section; until that table exists the release stays gated (documentation
-gate).
-
-**`MAX_ADAPTER_SEND` benchmark harness and acceptance criterion.** The retain/
-adjust decision is a measurement. `MAX_ADAPTER_SEND = 16 MiB` is **PROVISIONAL**
-per the MF-5/T2 resolution above and is **not** ratified from the single-copy
-benchmark alone; the harness below is defined concretely, but ratification also
-requires the multi-stream measurements the MF-5/T2 decision table demands:
-
-- Harness split across TWO targets that share the ONE copy helper: (a) a Criterion
-  benchmark (`benches/send_copy.rs`) over the pure copy path
-  `bench_support::copy_into_send_buffer(&src[..])` (the gated public entry point;
-  `&[u8]` is a `Buf`, so it runs the same `copy_to_bytes` allocation production runs
-  on `&mut WriteBuf<B>`), plus a loopback throughput bench that sends N frames of
-  each size to a local echo; and (b) the deterministic peak-resident **`#[test]`**
-  below, an in-crate test with private access to `buffer::copy_into_send_buffer` (no
-  bench feature needed).
-- Payload sizes: header-only (~32 B), small body (1 KiB), medium (64 KiB), large
-  contiguous body at 1 MiB, 8 MiB, and 16 MiB (`MAX_ADAPTER_SEND`).
-- Reported metrics, per size: wall-clock per copy (source buffer prebuilt once
-  **outside** the timed window, so only `copy_into_send_buffer(&src[..])` is timed),
-  throughput (MiB/s) — **informational/relative**, no hard timing assertion in the
-  bench — and **peak resident bytes** attributable to one in-flight send, asserted
-  by the in-crate `#[test]` via `measure_peak_resident` below (a global-allocator
-  counter reset immediately before the single copy and read immediately after, so
-  the harness and all earlier allocations are excluded), since the owned-copy design
-  transiently doubles peak payload memory.
-- Acceptance criteria (all **necessary**, and NOT sufficient on their own to
-  ratify 16 MiB). (1) *Copy-time (informational)*: reported by the Criterion bench
-  relative to a same-run baseline. With the source prebuilt **once outside** the
-  timed window, the **median** of 64 timed copies is tracked against the ~10 ms
-  reference target, but that number is **advisory only** and the bench carries **no
-  hard fail** until a pinned/isolated runner exists (see MF-4 point 3). (2)
-  *Peak-resident gate (BLOCKING, in-crate `#[test]`)*: measured with source and
-  destination deliberately coexisting so the transient doubling is visible, the
-  `peak_delta` must satisfy the computable bound `peak_delta <= 2 * payload + 1 MiB`
-  (no unexpected extra copy beyond the source+destination doubling); this assertion
-  lives in the crate's own test binary, not in Criterion, so correctness never
-  depends on bench timing. **Required before the cap is ratified (MF-5/T2 gate):**
-  the multi-stream measurements the decision table demands — concurrent large-send
-  *scheduler latency* on the poll thread and *aggregate retained bytes* across N
-  concurrent streams — must also be recorded, because the per-operation cap bounds
-  neither. If the peak-resident gate fails, the copy time is unacceptable on a
-  pinned runner, or the multi-stream aggregate is unacceptable, either lower
-  `MAX_ADAPTER_SEND` to the largest size that meets all gates or open the deferred
-  internal-chunking + per-connection byte-budget design. The chosen value and the
-  measured tables are recorded in `docs/Development.md`. Until the MF-5/T2 table is
-  filled and a value chosen, the 16 MiB cap and the 10 ms budget remain
-  **provisional**, not a committed concrete default.
-
-Concrete Criterion / test-allocator Cargo wiring (added to the package
-`Cargo.toml`; the peak-resident metric needs a counting global allocator, so the
-crate's test binary installs one — under `#[cfg(test)]` — rather than pulling
-`stats_alloc`):
-
-```toml
-[features]
-# Committed bench feature: gates the public `bench_support::copy_into_send_buffer`
-# re-export so the separate Criterion crate can reach the copy path.
-bench-internals = []
-
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-# Backend-implementer feature: exposes h3's internal `Frame`/`WriteBuf` builders so
-# the CountingExec seam tests can construct a valid non-empty `WriteBuf<Bytes>`
-# (`WriteBuf::<Bytes>::from(Frame::Data(..))`). Dev-only; not enabled for consumers.
-h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
-
-[[bench]]
-name = "send_copy"
-harness = false                          # Criterion provides its own harness
-required-features = ["bench-internals"]  # bench needs the gated public entry point
-```
-
-```rust
-// benches/send_copy.rs — INFORMATIONAL copy-time measurement ONLY (no hard timing
-// assertion; the BLOCKING peak-resident gate is the in-crate `#[test]` below).
-fn bench_send_copy(c: &mut criterion::Criterion) {
-    use msquic_h3::bench_support::copy_into_send_buffer;   // gated public entry point
-
-    // The source is built ONCE, OUTSIDE the timed region, so Criterion times ONLY
-    // the owned copy via the public `copy_into_send_buffer(&src[..])` entry point.
-    // `&[u8]` is a `Buf`, so this drives the SAME `src.copy_to_bytes(remaining)`
-    // allocation production runs on `&mut WriteBuf<B>` (for a non-`Bytes`-backed
-    // `B` that copy allocates a fresh buffer, which this models exactly). Criterion
-    // reports per-size copy time relative to a same-run baseline; there is NO
-    // absolute 10 ms fail here — that number stays advisory until a pinned runner
-    // exists (MF-4 point 3).
-    for &size in &[32usize, 1 << 10, 64 << 10, 1 << 20, 8 << 20, 16 << 20] {
-        let src: Vec<u8> = vec![0u8; size];                          // prebuilt, NOT timed
-        c.bench_function(&format!("copy_{size}"), |b| {
-            b.iter(|| {
-                let dst = copy_into_send_buffer(&src[..]);           // TIMED: copy only
-                criterion::black_box(&dst);
-            });
-        });
-    }
-}
-
-criterion::criterion_group!(benches, bench_send_copy);
-criterion::criterion_main!(benches);
-```
-
-The deterministic peak-resident bound is the BLOCKING gate and lives in the crate's
-own test binary (private access to `copy_into_send_buffer`, no bench feature needed),
-so correctness never depends on Criterion timing. A counting global allocator is
-installed **only** for the test build (`#[cfg(test)]`), never for production:
-
-```rust
-// msquic-h3/src/buffer.rs — counting allocator + peak-resident gate, test-only.
-#[cfg(test)]
-use std::alloc::{GlobalAlloc, Layout, System};
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-#[cfg(test)]
-struct Counting;
-#[cfg(test)]
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        let p = unsafe { System.alloc(l) };
-        if !p.is_null() {
-            let now = LIVE.fetch_add(l.size(), Ordering::Relaxed) + l.size();
-            PEAK.fetch_max(now, Ordering::Relaxed);
-        }
-        p
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        LIVE.fetch_sub(l.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(p, l) };
-    }
-}
-#[cfg(test)]
-#[global_allocator]
-static A: Counting = Counting;
-
-/// Peak resident bytes attributable to ONE measured copy: reset immediately
-/// before, read immediately after. `baseline` is the live bytes just before the
-/// op; seeding PEAK to it excludes every earlier allocation (payload setup outside
-/// the closure, background statics). The op's result is returned and held until
-/// PEAK is read, so the destination buffer is live at the peak. The op must run
-/// with no other thread allocating — the test runs it on one thread, so the only
-/// allocations between reset and read are the op's own.
-#[cfg(test)]
-fn measure_peak_resident<R>(op: impl FnOnce() -> R) -> (R, usize) {
-    let baseline = LIVE.load(Ordering::SeqCst);
-    PEAK.store(baseline, Ordering::SeqCst);       // reset immediately before
-    let out = op();                               // the single measured copy path
-    let peak = PEAK.load(Ordering::SeqCst);       // read immediately after
-    (out, peak.saturating_sub(baseline))          // attributable delta, baseline excluded
-}
-
-// Blocking, deterministic; runs under ordinary `cargo test` with private access to
-// the same `copy_into_send_buffer` production uses.
-#[test]
-fn send_copy_peak_resident_bound() {
-    let payload = 16usize << 20;
-    // Source and destination MUST coexist to capture the design's transient
-    // doubling, so both are allocated inside the measured op.
-    let (held, peak_delta) = measure_peak_resident(|| {
-        let src: Vec<u8> = vec![0u8; payload];                       // source allocation
-        let dst = copy_into_send_buffer(&src[..]);                   // owned copy (private path)
-        (src, dst)                                                   // both live at read
-    });
-    std::hint::black_box(&held);
-    assert!(
-        peak_delta <= 2 * payload + (1 << 20),
-        "16 MiB per-send peak {peak_delta} exceeds 2*payload + 1 MiB ({})",
-        2 * payload + (1 << 20),
-    );
-}
-```
+## As-built implementation
+
+> The ~1,800-line "Implementation-ready definitions (round 6)" appendix that
+> formerly stood here was a **temporary pre-implementation scaffold** (MF-7 / T5).
+> Now that the redesign has landed, it has been **removed per its expiry
+> condition** (Phase 10 / implementation-order item 10). The concrete, checked
+> definitions live in the production code under `msquic-h3/src/` and its inline
+> tests; the durable as-built technical reference is
+> [`.paw/work/error-propagation/Docs.md`](../.paw/work/error-propagation/Docs.md).
+> This section promotes the load-bearing invariants the design depends on so
+> nothing is lost with the scaffold.
+
+**Where the code lives (as built).**
+
+- `msquic-h3/src/error.rs` — the scoped terminal vocabulary
+  (`ConnectionTerminal`, `ReceiveTerminal`, `SendTerminal`), the `convert_*`
+  minting boundary, outgoing application-code clamping (`clamp_application_code`,
+  `MAX_QUIC_VARINT`), the send-size ceiling (`MAX_ADAPTER_SEND`, `OversizedSend`),
+  and the pure send reducer (`transition`, `SendInput`/`SendCommand`).
+- `msquic-h3/src/buffer.rs` — the owned `SendBuffer`, `classify_send_len`, the
+  single production copy path (`copy_into_send_buffer`), and the exactly-once
+  reclamation `Drop`.
+- `msquic-h3/src/lib.rs` — the FFI callbacks, the connection terminal slot with
+  refinement/freeze-on-observation, the explicit receive events, safe stream
+  open/identity, and the `SendExec`/`OpenExec` executor seam plus the conformance
+  suite.
+- `msquic-h3/src/attest.rs` — the per-row native-version attestation gate.
+
+**Promoted invariants (design-load-bearing; realized in the code above).**
+
+1. **Single ordered send-event source (MF-1).** All order-sensitive send events
+   (data completion, terminal wake, finish completion) ride one mpsc, so
+   chronological finish-vs-terminal order is preserved by construction. There is
+   no separate finish one-shot to race.
+2. **Pure send reducer over a native-free state machine.** `transition` mutates
+   only `SendState` and emits exactly one `SendCommand` per input; the frontend
+   executor runs the command against MsQuic through the `SendExec` seam and feeds
+   the result back. The send transition table above (see "Send transition table")
+   is the authoritative specification of these transitions.
+3. **`ProvisionalAbort` refinement (MF-2).** A cancelled `SendComplete` with no
+   yet-known cause is recorded as the distinct provisional `SendTerminal::ProvisionalAbort`
+   marker, never surfaced while unobserved, refinable to a richer peer/connection
+   cause, and finalized to `Failed(QUIC_STATUS_ABORTED)` at the defined closure
+   point. A real native `Failed` (including `QUIC_STATUS_ABORTED`) is authoritative
+   and never refined.
+4. **First-writer-wins terminal scopes with bounded refinement (SF-7 / T4,
+   SF-9).** Each scope (connection/receive/send) records its terminal reason
+   once. A *provisional* cause (a `ConnectionTerminal::LocalClose`, or the send
+   `ProvisionalAbort` marker) may be refined to a more-specific peer/transport
+   cause **only while still unobserved**; observation freezes the value.
+5. **Exactly-once `SendBuffer` reclamation (SF-3).** The owned buffer is destroyed
+   exactly once — either by the callback-replayed `SendComplete` reclaiming the
+   leaked box, or by the caller on an immediate `Stream::send` failure — proven by
+   the `Drop` counter in the seam tests, never twice and never leaked.
+6. **Explicit receive events, no empty-non-FIN EOF.** Data, FIN, peer reset,
+   local `stop_sending`, and connection failure are distinct events; an empty,
+   non-FIN receive notification produces no event (it is not EOF). A clean FIN
+   maps to `Ok(None)`; a peer reset maps to `StreamTerminated`.
+7. **Per-row native-version attestation gate (MF-3).** The version gate is
+   **row-specific**: `native-find` (system-package libmsquic) expects `[2,5,8]`;
+   `native-src` (crate-built from the vendored `msquic-2.5.1-beta` source) expects
+   `[2,5,1]`; `MSQUIC_EXPECTED_VERSION` overrides per matrix cell. On Linux the
+   loaded-artifact digest (from `/proc/self/maps`) is a **blocking** part of the
+   gate. This supersedes any earlier single hard-coded `[2,5,1]` pin.
+8. **Close-time inline-drain is source-review-only (SC-007).** The unsafe
+   close-time reclamation premise is established by native-source review plus the
+   binding's uniform `close_inner` contract, **not** by an executable
+   drop-triggered teardown test (the public API cannot hold a real send stream at
+   drop). It is documented as a labelled, untested guarantee.
 
 ## Implementation order
 
@@ -4072,11 +2195,12 @@ fn send_copy_peak_resident_bound() {
 10. **Release, compatibility, and scaffold cleanup gate (resolves MF-6 and the
     MF-7/T5 expiry condition).** Before publishing, complete the compatibility
     and rollback checklist in the "MF-6 — release, versioning, migration, and
-    rollback" resolution below (crate-version decision, `CHANGELOG.md` entry,
-    migration notes), and execute the appendix cleanup checklist in the
-    scaffold banner (delete/archive the ~1,800-line appendix, promote any
-    depended-on invariant into the narrative). The release stays gated until
-    both are done.
+    rollback" resolution above (crate-version decision, `CHANGELOG.md` entry,
+    migration notes), and execute the appendix cleanup (delete/archive the
+    ~1,800-line appendix, promote any depended-on invariant into the narrative).
+    Both are done in Phase 10: the crate is bumped to `0.0.7` with a
+    `CHANGELOG.md`, and the appendix has been replaced by the "As-built
+    implementation" section above.
 
 This order fixes callback safety and the error vocabulary first, then moves each
 callback path onto it while keeping changes reviewable and bisectable.
