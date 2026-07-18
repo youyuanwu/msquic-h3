@@ -22,7 +22,7 @@ use msquic::{
 mod buffer;
 pub use buffer::*;
 mod error;
-use error::clamp_application_code;
+use error::{ConnectionTerminal, clamp_application_code, convert_conn};
 pub use error::{LocalConnectionClose, LocalStreamReset, MsQuicTransportError, OversizedSend};
 mod listener;
 pub use listener::Listener;
@@ -46,6 +46,87 @@ pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Shared, thread-safe slot recording *why* a connection terminated.
+///
+/// Shared between the connection FFI callback (the writer) and the accept
+/// frontends / stream opener (readers). All access goes through
+/// [`lock_recover`] so an FFI callback never panics on a poisoned lock.
+pub(crate) type ConnTerminalSlot = Arc<Mutex<ConnTerminalState>>;
+
+/// Create a fresh, empty connection terminal-reason slot.
+pub(crate) fn new_conn_terminal_slot() -> ConnTerminalSlot {
+    Arc::new(Mutex::new(ConnTerminalState::default()))
+}
+
+/// First-writer-wins record of the connection terminal reason, with
+/// provisional-to-specific refinement until the value is externally observed.
+///
+/// A provisional cause (`LocalClose`) recorded first may be refined by a later,
+/// more-specific peer/transport cause — but only until an external observer
+/// (an accept frontend delivering the terminal to h3) has frozen the value.
+/// After the freeze point the winner is immutable. This is the connection-scope
+/// SF-7 / T4 rule; it is deliberately independent of the send-scope cancellation
+/// state (MF-2), which lives in the send reducer and is never written here.
+#[derive(Debug, Default)]
+pub(crate) struct ConnTerminalState {
+    terminal: Option<ConnectionTerminal>,
+    observed: bool,
+}
+
+impl ConnTerminalState {
+    /// Record a candidate terminal reason under the first-writer / refinement
+    /// rule. A no-op once the value has been frozen by [`Self::observe`].
+    fn record(&mut self, candidate: ConnectionTerminal) {
+        if self.observed {
+            return;
+        }
+        match &self.terminal {
+            None => self.terminal = Some(candidate),
+            Some(existing) => {
+                // Only a provisional cause may be refined, and only to a
+                // specific one. Specific causes never regress to provisional.
+                if existing.is_provisional() && !candidate.is_provisional() {
+                    self.terminal = Some(candidate);
+                }
+            }
+        }
+    }
+
+    /// Freeze the slot and return a clone of the recorded reason (if any).
+    ///
+    /// After this call the value is immutable: later [`Self::record`] calls are
+    /// ignored. This is the external-observation point of the refinement rule.
+    fn observe(&mut self) -> Option<ConnectionTerminal> {
+        self.observed = true;
+        self.terminal.clone()
+    }
+
+    /// Whether an internal (fail-fast) terminal has been published. Read before
+    /// draining queued streams so an internal failure is reported immediately
+    /// rather than behind already-queued items.
+    fn has_internal(&self) -> bool {
+        matches!(self.terminal, Some(ConnectionTerminal::Internal(_)))
+    }
+}
+
+/// Record a connection terminal reason into the shared slot.
+fn record_conn_terminal(slot: &ConnTerminalSlot, candidate: ConnectionTerminal) {
+    lock_recover(slot).record(candidate);
+}
+
+/// Classify a transport shutdown status into a connection terminal reason.
+///
+/// Idle and connection timeouts map to [`ConnectionTerminal::Timeout`]; every
+/// other transport status is retained verbatim (status + wire error code) as a
+/// [`ConnectionTerminal::Transport`] for `Undefined` mapping at the boundary.
+fn classify_transport(status: Status, error_code: u64) -> ConnectionTerminal {
+    match status.try_as_status_code() {
+        Ok(StatusCode::QUIC_STATUS_CONNECTION_TIMEOUT)
+        | Ok(StatusCode::QUIC_STATUS_CONNECTION_IDLE) => ConnectionTerminal::Timeout,
+        _ => ConnectionTerminal::Transport { status, error_code },
+    }
+}
+
 /// Owns the raw msquic connection handle together with its [`RundownGuard`].
 ///
 /// Field order is load-bearing: `inner` is declared before `_guard`, so on drop
@@ -56,15 +137,29 @@ pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Debug)]
 pub(crate) struct ConnHandle {
     inner: msquic::Connection,
+    /// Shared connection terminal-reason slot. Cloned from the connection
+    /// context so the stream opener (`OpenStreams::close`) can record a local
+    /// close through the borrowed handle.
+    terminal: ConnTerminalSlot,
     _guard: RundownGuard,
 }
 
 impl ConnHandle {
-    pub(crate) fn new(inner: msquic::Connection, guard: RundownGuard) -> Self {
+    pub(crate) fn new(
+        inner: msquic::Connection,
+        guard: RundownGuard,
+        terminal: ConnTerminalSlot,
+    ) -> Self {
         Self {
             inner,
+            terminal,
             _guard: guard,
         }
+    }
+
+    /// The shared connection terminal-reason slot.
+    pub(crate) fn terminal(&self) -> &ConnTerminalSlot {
+        &self.terminal
     }
 }
 
@@ -85,19 +180,23 @@ pub struct Connection {
 /// from callback send to fount end.
 #[derive(Debug)]
 struct ConnCtxSender {
-    connected: Option<oneshot::Sender<()>>,
+    connected: Option<oneshot::Sender<Result<(), Status>>>,
     shutdown: Option<oneshot::Sender<()>>,
     bidi: Option<mpsc::UnboundedSender<Option<crate::H3Stream>>>,
     uni: Option<mpsc::UnboundedSender<Option<crate::H3Stream>>>,
+    /// Shared connection terminal-reason slot (writer side).
+    terminal: ConnTerminalSlot,
 }
 
 /// front end receive.
 #[derive(Debug)]
 struct ConnCtxReceiver {
-    connected: Option<oneshot::Receiver<()>>,
+    connected: Option<oneshot::Receiver<Result<(), Status>>>,
     shutdown: Option<oneshot::Receiver<()>>,
     bidi: mpsc::UnboundedReceiver<Option<crate::H3Stream>>,
     uni: mpsc::UnboundedReceiver<Option<crate::H3Stream>>,
+    /// Shared connection terminal-reason slot (reader side).
+    terminal: ConnTerminalSlot,
 }
 
 fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
@@ -105,18 +204,21 @@ fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (bidi_tx, bidi_rx) = mpsc::unbounded();
     let (uni_tx, uni_rx) = mpsc::unbounded();
+    let terminal: ConnTerminalSlot = Arc::new(Mutex::new(ConnTerminalState::default()));
     (
         ConnCtxSender {
             connected: Some(conn_tx),
             shutdown: Some(shutdown_tx),
             bidi: Some(bidi_tx),
             uni: Some(uni_tx),
+            terminal: terminal.clone(),
         },
         ConnCtxReceiver {
             connected: Some(conn_rx),
             shutdown: Some(shutdown_rx),
             bidi: bidi_rx,
             uni: uni_rx,
+            terminal,
         },
     )
 }
@@ -131,7 +233,25 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
             // A duplicate `Connected` (slot already taken) or a dropped receiver
             // (send `Err`) is a safe no-op; never panic across the FFI boundary.
             if let Some(tx) = ctx.connected.take() {
-                let _ = tx.send(());
+                let _ = tx.send(Ok(()));
+            }
+        }
+        ConnectionEvent::ShutdownInitiatedByPeer { error_code } => {
+            // Peer application close: record the exact HTTP/3 code. A peer close
+            // has no lossless `Status`, so a pending connect waiter resolves as
+            // `QUIC_STATUS_ABORTED` (the exact code stays in the terminal slot).
+            record_conn_terminal(&ctx.terminal, ConnectionTerminal::PeerApplication(error_code));
+            if let Some(tx) = ctx.connected.take() {
+                let _ = tx.send(Err(Status::new(StatusCode::QUIC_STATUS_ABORTED)));
+            }
+        }
+        ConnectionEvent::ShutdownInitiatedByTransport { status, error_code } => {
+            // Transport shutdown: timeout statuses become `Timeout`, everything
+            // else retains the status + wire code. Resolve a pending connect
+            // waiter with the real transport `Status` (not a synthetic ABORTED).
+            record_conn_terminal(&ctx.terminal, classify_transport(status.clone(), error_code));
+            if let Some(tx) = ctx.connected.take() {
+                let _ = tx.send(Err(status));
             }
         }
         ConnectionEvent::PeerStreamStarted { stream, flags } => {
@@ -150,8 +270,19 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
             }
         }
         ConnectionEvent::ShutdownComplete { .. } => {
+            // A bare shutdown with no more-specific reason published is a local
+            // close (provisional): `record` keeps any specific cause already
+            // recorded by a peer/transport arm. `ShutdownComplete` itself carries
+            // no error code.
+            record_conn_terminal(&ctx.terminal, ConnectionTerminal::LocalClose);
+            // If the connect waiter is still pending here (neither `Connected`
+            // nor a `ShutdownInitiated*` arm resolved it — e.g. a bare local
+            // close), resolve it as a failure so `connect()` returns `Err`
+            // deterministically rather than mapping a `Canceled` drop.
+            if let Some(tx) = ctx.connected.take() {
+                let _ = tx.send(Err(Status::new(StatusCode::QUIC_STATUS_ABORTED)));
+            }
             // clear all channels.
-            ctx.connected.take();
             ctx.uni.take();
             ctx.bidi.take();
             if let Some(shutdown) = ctx.shutdown.take() {
@@ -188,14 +319,18 @@ impl Connection {
             // path uses ConnHandle's proven ConnectionClose-then-guard drop
             // order rather than the async future's unspecified capture layout.
             let inner = msquic::Connection::open(reg.raw(), handler)?;
-            let conn = Arc::new(ConnHandle::new(inner, guard));
+            let conn = Arc::new(ConnHandle::new(inner, guard, crx.terminal.clone()));
             conn.start(config, server_name, server_port)?;
-            // wait for connection.
+            // wait for connection. The one-shot carries `Result<(), Status>`: a
+            // transport/peer shutdown before `Connected` resolves it with the
+            // real cause, so the caller sees the actual `Status` (handshake
+            // failure, timeout, refusal, ...) instead of a synthetic ABORTED,
+            // and never hangs.
             crx.connected
                 .take()
                 .ok_or_else(|| Status::new(StatusCode::QUIC_STATUS_ABORTED))?
                 .await
-                .map_err(|_| Status::new(StatusCode::QUIC_STATUS_ABORTED))?;
+                .map_err(|_| Status::new(StatusCode::QUIC_STATUS_ABORTED))??;
 
             let opener = StreamOpener::new(conn.clone());
 
@@ -213,7 +348,7 @@ impl Connection {
         let handler =
             move |_: ConnectionRef, ev: ConnectionEvent| connection_callback(&mut ctx, ev);
         inner.set_callback_handler(handler);
-        let conn = Arc::new(ConnHandle::new(inner, guard));
+        let conn = Arc::new(ConnHandle::new(inner, guard, crx.terminal.clone()));
 
         let opener = StreamOpener::new(conn.clone());
 
@@ -237,6 +372,34 @@ impl Connection {
             rx
         });
         ConnectionShutdownWaiter { rx }
+    }
+}
+
+/// Fail-fast terminal check for the accept frontends.
+///
+/// Returns the converted connection error only when an *internal* terminal has
+/// been published, so an adapter-internal failure is reported ahead of any
+/// streams still queued. Observing it also freezes the slot. A non-internal
+/// terminal returns `None`, so the caller drains queued streams first.
+fn fail_fast_terminal(slot: &ConnTerminalSlot) -> Option<ConnectionErrorIncoming> {
+    let mut g = lock_recover(slot);
+    if g.has_internal() {
+        return g.observe().map(convert_conn);
+    }
+    None
+}
+
+/// Freeze the terminal slot and convert the recorded reason for h3.
+///
+/// Called when the incoming-stream channel is drained/closed. A closure with no
+/// recorded reason maps to a defined internal error rather than a synthetic
+/// application close.
+fn observe_terminal(slot: &ConnTerminalSlot) -> ConnectionErrorIncoming {
+    match lock_recover(slot).observe() {
+        Some(t) => convert_conn(t),
+        None => ConnectionErrorIncoming::InternalError(
+            "connection closed without a terminal reason".to_string(),
+        ),
     }
 }
 
@@ -285,12 +448,19 @@ impl<B: Buf> h3::quic::Connection<B> for Connection {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
-        let s = ready!(self.ctx.uni.poll_next_unpin(cx)).unwrap_or(None);
-        // wrap for h3 type. Drop the send stream part
-        std::task::Poll::Ready(
-            s.map(|s| s.recv)
-                .ok_or(ConnectionErrorIncoming::ApplicationClose { error_code: 0 }),
-        )
+        // Fail-fast: an internal terminal is reported immediately, ahead of any
+        // streams still queued in the channel (the adapter has declared its own
+        // connection state invalid). Normal peer/transport/local shutdown keeps
+        // the drain-then-terminal ordering below.
+        if let Some(err) = fail_fast_terminal(&self.ctx.terminal) {
+            return std::task::Poll::Ready(Err(err));
+        }
+        match ready!(self.ctx.uni.poll_next_unpin(cx)) {
+            // wrap for h3 type. Drop the send stream part.
+            Some(Some(s)) => std::task::Poll::Ready(Ok(s.recv)),
+            // Channel drained/closed: report the recorded terminal reason.
+            Some(None) | None => std::task::Poll::Ready(Err(observe_terminal(&self.ctx.terminal))),
+        }
     }
 
     #[cfg_attr(
@@ -301,9 +471,14 @@ impl<B: Buf> h3::quic::Connection<B> for Connection {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
-        let s = ready!(self.ctx.bidi.poll_next_unpin(cx)).unwrap_or(None);
-        // wrap for h3 type
-        std::task::Poll::Ready(s.ok_or(ConnectionErrorIncoming::ApplicationClose { error_code: 0 }))
+        if let Some(err) = fail_fast_terminal(&self.ctx.terminal) {
+            return std::task::Poll::Ready(Err(err));
+        }
+        match ready!(self.ctx.bidi.poll_next_unpin(cx)) {
+            // wrap for h3 type
+            Some(Some(s)) => std::task::Poll::Ready(Ok(s)),
+            Some(None) | None => std::task::Poll::Ready(Err(observe_terminal(&self.ctx.terminal))),
+        }
     }
 
     #[cfg_attr(
@@ -355,6 +530,11 @@ impl<B: Buf> OpenStreams<B> for StreamOpener {
         tracing::instrument(skip_all, level = "trace", ret)
     )]
     fn close(&mut self, code: h3::error::Code, _reason: &[u8]) {
+        // An application-initiated shutdown may proceed straight to
+        // `ShutdownComplete`, so record the provisional local-close reason
+        // before the downcall. A concurrent peer/transport cause may still
+        // refine it until an accept frontend observes the terminal.
+        record_conn_terminal(self.conn.terminal(), ConnectionTerminal::LocalClose);
         self.conn.shutdown(
             ConnectionShutdownFlags::NONE,
             clamp_application_code(code.value()),
@@ -1092,5 +1272,293 @@ mod callback_safety {
         // Recover without panicking and observe the value written before poison.
         let g = lock_recover(&m);
         assert_eq!(*g, 42);
+    }
+}
+
+/// Phase 3 (connection terminal slot & incoming-terminal propagation) unit
+/// tests: proves the connection close mapping, the connected one-shot carrying
+/// `Result<(), Status>`, the provisional-to-specific refinement/freeze rule, and
+/// the drain-vs-fail-fast queue policy. Hermetic (no network).
+#[cfg(test)]
+mod connection_terminal {
+    use h3::quic::ConnectionErrorIncoming;
+
+    use crate::error::ConnectionTerminal;
+    use crate::msquic::{ConnectionEvent, Status, StatusCode};
+    use crate::{
+        ConnTerminalState, ConnCtxReceiver, classify_transport, conn_ctx_channel,
+        connection_callback, fail_fast_terminal, new_conn_terminal_slot, observe_terminal,
+        record_conn_terminal,
+    };
+
+    /// Drive one connection event through the callback and return the frozen,
+    /// converted terminal the accept frontend would report.
+    fn map_event(ev: ConnectionEvent) -> ConnectionErrorIncoming {
+        let (mut ctx, crx) = conn_ctx_channel();
+        assert!(connection_callback(&mut ctx, ev).is_ok());
+        observe_terminal(&crx.terminal)
+    }
+
+    #[test]
+    fn peer_application_close_maps_to_application_close_with_code() {
+        let err = map_event(ConnectionEvent::ShutdownInitiatedByPeer { error_code: 42 });
+        assert!(
+            matches!(err, ConnectionErrorIncoming::ApplicationClose { error_code: 42 }),
+            "expected ApplicationClose(42), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn idle_timeout_maps_to_timeout() {
+        let ev = ConnectionEvent::ShutdownInitiatedByTransport {
+            status: Status::new(StatusCode::QUIC_STATUS_CONNECTION_IDLE),
+            error_code: 0,
+        };
+        let err = map_event(ev);
+        assert!(
+            matches!(err, ConnectionErrorIncoming::Timeout),
+            "expected Timeout, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn connection_timeout_maps_to_timeout() {
+        let ev = ConnectionEvent::ShutdownInitiatedByTransport {
+            status: Status::new(StatusCode::QUIC_STATUS_CONNECTION_TIMEOUT),
+            error_code: 0,
+        };
+        assert!(matches!(map_event(ev), ConnectionErrorIncoming::Timeout));
+    }
+
+    #[test]
+    fn other_transport_failure_maps_to_undefined_transport_error() {
+        let ev = ConnectionEvent::ShutdownInitiatedByTransport {
+            status: Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR),
+            error_code: 7,
+        };
+        let err = map_event(ev);
+        match err {
+            ConnectionErrorIncoming::Undefined(e) => {
+                // The adapter-owned transport error retains the wire code.
+                let s = e.to_string();
+                assert!(s.contains("transport error_code 7"), "display was: {s}");
+            }
+            other => panic!("expected Undefined(MsQuicTransportError), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_close_maps_to_undefined_local_close() {
+        // A bare ShutdownComplete with no more-specific reason is a local close.
+        let err = map_event(ConnectionEvent::ShutdownComplete {
+            handshake_completed: false,
+            peer_acknowledged_shutdown: false,
+            app_close_in_progress: false,
+        });
+        match err {
+            ConnectionErrorIncoming::Undefined(e) => {
+                assert!(e.to_string().contains("locally"), "display was: {e}");
+            }
+            other => panic!("expected Undefined(LocalConnectionClose), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_closed_without_reason_maps_to_internal_error() {
+        // No callback fired: the slot is empty when the channel drains.
+        let slot = new_conn_terminal_slot();
+        match observe_terminal(&slot) {
+            ConnectionErrorIncoming::InternalError(msg) => {
+                assert!(msg.contains("without a terminal reason"), "msg: {msg}");
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    /// Read the resolved value of the connect one-shot without blocking. Panics
+    /// if the waiter is still pending (would hang) or was cancelled.
+    fn connect_result(crx: &mut ConnCtxReceiver) -> Result<(), Status> {
+        crx.connected
+            .take()
+            .expect("connected waiter present")
+            .try_recv()
+            .expect("connect waiter resolved, not cancelled (no hang)")
+            .expect("connect waiter produced a value, not Pending")
+    }
+
+    #[test]
+    fn connected_resolves_ok() {
+        let (mut ctx, mut crx) = conn_ctx_channel();
+        let ev = ConnectionEvent::Connected {
+            session_resumed: false,
+            negotiated_alpn: &[],
+        };
+        assert!(connection_callback(&mut ctx, ev).is_ok());
+        assert!(connect_result(&mut crx).is_ok());
+    }
+
+    #[test]
+    fn connected_waiter_resolves_with_transport_status_on_early_shutdown() {
+        let (mut ctx, mut crx) = conn_ctx_channel();
+        // Transport shutdown before Connected carries the real status.
+        let ev = ConnectionEvent::ShutdownInitiatedByTransport {
+            status: Status::new(StatusCode::QUIC_STATUS_HANDSHAKE_FAILURE),
+            error_code: 0,
+        };
+        assert!(connection_callback(&mut ctx, ev).is_ok());
+        let err = connect_result(&mut crx).expect_err("early shutdown resolves as Err");
+        assert_eq!(
+            err.try_as_status_code().ok(),
+            Some(StatusCode::QUIC_STATUS_HANDSHAKE_FAILURE),
+            "connect() should surface the real transport cause, not synthetic ABORTED"
+        );
+    }
+
+    #[test]
+    fn connected_waiter_resolves_on_peer_shutdown_before_connected() {
+        let (mut ctx, mut crx) = conn_ctx_channel();
+        assert!(
+            connection_callback(&mut ctx, ConnectionEvent::ShutdownInitiatedByPeer {
+                error_code: 9
+            })
+            .is_ok()
+        );
+        // Peer close has no lossless status; the waiter resolves (no hang) as
+        // ABORTED, while the exact peer code stays in the terminal slot.
+        let err = connect_result(&mut crx).expect_err("peer shutdown resolves as Err");
+        assert_eq!(
+            err.try_as_status_code().ok(),
+            Some(StatusCode::QUIC_STATUS_ABORTED)
+        );
+        assert!(matches!(
+            observe_terminal(&crx.terminal),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+    }
+
+    #[test]
+    fn connected_waiter_resolves_on_bare_shutdown_complete() {
+        let (mut ctx, mut crx) = conn_ctx_channel();
+        assert!(
+            connection_callback(&mut ctx, ConnectionEvent::ShutdownComplete {
+                handshake_completed: false,
+                peer_acknowledged_shutdown: false,
+                app_close_in_progress: false,
+            })
+            .is_ok()
+        );
+        let err = connect_result(&mut crx).expect_err("bare shutdown resolves as Err");
+        assert_eq!(
+            err.try_as_status_code().ok(),
+            Some(StatusCode::QUIC_STATUS_ABORTED)
+        );
+    }
+
+    #[test]
+    fn classify_transport_table() {
+        assert!(matches!(
+            classify_transport(Status::new(StatusCode::QUIC_STATUS_CONNECTION_IDLE), 0),
+            ConnectionTerminal::Timeout
+        ));
+        assert!(matches!(
+            classify_transport(Status::new(StatusCode::QUIC_STATUS_CONNECTION_TIMEOUT), 0),
+            ConnectionTerminal::Timeout
+        ));
+        assert!(matches!(
+            classify_transport(Status::new(StatusCode::QUIC_STATUS_TLS_ERROR), 3),
+            ConnectionTerminal::Transport { error_code: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn provisional_local_close_refines_to_specific_before_observation() {
+        let mut st = ConnTerminalState::default();
+        st.record(ConnectionTerminal::LocalClose);
+        // A more-specific peer cause published before observation wins.
+        st.record(ConnectionTerminal::PeerApplication(7));
+        let t = st.observe().expect("terminal recorded");
+        assert!(matches!(t, ConnectionTerminal::PeerApplication(7)));
+        // Frozen after observation: later records are ignored.
+        st.record(ConnectionTerminal::Timeout);
+        assert!(matches!(
+            st.observe(),
+            Some(ConnectionTerminal::PeerApplication(7))
+        ));
+    }
+
+    #[test]
+    fn specific_cause_does_not_regress_to_provisional() {
+        let mut st = ConnTerminalState::default();
+        st.record(ConnectionTerminal::Timeout);
+        // A later provisional local close must not overwrite the specific cause.
+        st.record(ConnectionTerminal::LocalClose);
+        assert!(matches!(st.observe(), Some(ConnectionTerminal::Timeout)));
+    }
+
+    #[test]
+    fn first_specific_cause_wins_over_later_specific() {
+        let mut st = ConnTerminalState::default();
+        st.record(ConnectionTerminal::PeerApplication(1));
+        st.record(ConnectionTerminal::Timeout);
+        assert!(matches!(
+            st.observe(),
+            Some(ConnectionTerminal::PeerApplication(1))
+        ));
+    }
+
+    #[test]
+    fn refinement_frozen_by_observation_even_for_provisional() {
+        let mut st = ConnTerminalState::default();
+        st.record(ConnectionTerminal::LocalClose);
+        // Observing freezes the provisional value; a later specific cause that
+        // arrives after the frontend already reported cannot change it.
+        assert!(matches!(st.observe(), Some(ConnectionTerminal::LocalClose)));
+        st.record(ConnectionTerminal::PeerApplication(3));
+        assert!(matches!(st.observe(), Some(ConnectionTerminal::LocalClose)));
+    }
+
+    #[test]
+    fn normal_shutdown_drains_before_reporting_terminal() {
+        // A non-internal terminal does not fail fast: the accept frontend keeps
+        // the drain-then-terminal ordering (queued streams first).
+        let slot = new_conn_terminal_slot();
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(5));
+        assert!(
+            fail_fast_terminal(&slot).is_none(),
+            "a normal peer close must not fail fast ahead of queued streams"
+        );
+        // Once the channel drains, the recorded reason is reported.
+        assert!(matches!(
+            observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 5 }
+        ));
+    }
+
+    #[test]
+    fn internal_terminal_fails_fast_ahead_of_queued_streams() {
+        let slot = new_conn_terminal_slot();
+        record_conn_terminal(&slot, ConnectionTerminal::Internal("boom"));
+        match fail_fast_terminal(&slot) {
+            Some(ConnectionErrorIncoming::InternalError(msg)) => assert_eq!(msg, "boom"),
+            other => panic!("expected fail-fast InternalError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn callback_records_local_close_provisionally_then_refines() {
+        // Simulate OpenStreams::close (records LocalClose) racing a peer cause
+        // that lands before the frontend observes: the specific cause wins.
+        let (mut ctx, crx) = conn_ctx_channel();
+        record_conn_terminal(&ctx.terminal, ConnectionTerminal::LocalClose);
+        assert!(
+            connection_callback(&mut ctx, ConnectionEvent::ShutdownInitiatedByPeer {
+                error_code: 11
+            })
+            .is_ok()
+        );
+        assert!(matches!(
+            observe_terminal(&crx.terminal),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 11 }
+        ));
     }
 }

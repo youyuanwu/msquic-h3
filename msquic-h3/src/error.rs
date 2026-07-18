@@ -130,9 +130,11 @@ impl std::error::Error for LocalStreamReset {}
 // the polling boundary via the `convert_*` helpers below.
 // ---------------------------------------------------------------------------
 
-/// Why a connection terminated. The first writer wins for the connection scope.
+/// Why a connection terminated. The first writer wins for the connection scope,
+/// except a *provisional* cause may be refined to a more specific peer/transport
+/// cause before the terminal is externally observed (see
+/// [`ConnectionTerminal::is_provisional`]).
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // recorded in the connection terminal slot in Phase 3
 pub(crate) enum ConnectionTerminal {
     /// Peer closed with an HTTP/3 application error code.
     PeerApplication(u64),
@@ -148,7 +150,22 @@ pub(crate) enum ConnectionTerminal {
     /// Local application-initiated close.
     LocalClose,
     /// Internal adapter failure.
+    #[allow(dead_code)] // constructed by the accepted-stream fail-fast path in Phase 5
     Internal(&'static str),
+}
+
+impl ConnectionTerminal {
+    /// Whether this cause is *provisional* and may still be refined.
+    ///
+    /// A provisional cause (a local close, or — in later phases — a generic
+    /// transport fallback derived without a specific reason) may be replaced by
+    /// a subsequently-published, more-specific peer/transport cause until the
+    /// terminal has been externally observed. Specific peer/transport causes and
+    /// internal failures are authoritative and never refine to a provisional
+    /// value. See the SF-7 / T4 refinement decision in `docs/error-propagation.md`.
+    pub(crate) fn is_provisional(&self) -> bool {
+        matches!(self, ConnectionTerminal::LocalClose)
+    }
 }
 
 /// Why a receive half terminated. The first writer wins for the receive scope.
@@ -189,7 +206,6 @@ pub(crate) enum SendTerminal {
 // ---------------------------------------------------------------------------
 
 /// Convert a [`ConnectionTerminal`] into the h3 connection error it represents.
-#[allow(dead_code)] // wired at the connection polling boundary in Phase 3
 pub(crate) fn convert_conn(t: ConnectionTerminal) -> ConnectionErrorIncoming {
     use ConnectionTerminal as C;
     match t {

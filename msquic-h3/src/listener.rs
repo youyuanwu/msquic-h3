@@ -64,8 +64,13 @@ fn listener_callback(
             // set the config
             if let Err(e) = inner.set_configuration(config) {
                 // Close the handle first (releases the rundown ref), then the
-                // guard decrements.
-                drop(crate::ConnHandle::new(inner, guard));
+                // guard decrements. This handle is discarded, so it gets a fresh
+                // terminal slot that no reader ever observes.
+                drop(crate::ConnHandle::new(
+                    inner,
+                    guard,
+                    crate::new_conn_terminal_slot(),
+                ));
                 return Err(e);
             }
             let conn = crate::Connection::attach(inner, guard);
