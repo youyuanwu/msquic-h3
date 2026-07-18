@@ -22,7 +22,9 @@ use msquic::{
 mod buffer;
 pub use buffer::*;
 mod error;
-use error::{ConnectionTerminal, clamp_application_code, convert_conn};
+use error::{
+    ConnectionTerminal, ReceiveTerminal, clamp_application_code, convert_conn, convert_recv,
+};
 pub use error::{LocalConnectionClose, LocalStreamReset, MsQuicTransportError, OversizedSend};
 mod listener;
 pub use listener::Listener;
@@ -124,6 +126,30 @@ fn classify_transport(status: Status, error_code: u64) -> ConnectionTerminal {
         Ok(StatusCode::QUIC_STATUS_CONNECTION_TIMEOUT)
         | Ok(StatusCode::QUIC_STATUS_CONNECTION_IDLE) => ConnectionTerminal::Timeout,
         _ => ConnectionTerminal::Transport { status, error_code },
+    }
+}
+
+/// Classify a connection-caused stream `ShutdownComplete` into a connection
+/// terminal reason.
+///
+/// This is the deterministic fallback a *stream* callback uses when it observes
+/// `ShutdownComplete { connection_shutdown: true, .. }`. It follows MsQuic's
+/// `ConnectionShutdownByApp` / `ConnectionClosedRemotely` semantics (see
+/// `docs/error-propagation.md`, "Receive-side transitions"):
+/// - `by_app && closed_remotely` is a peer HTTP/3 application close;
+/// - `by_app && !closed_remotely` is a local application close (no peer code);
+/// - anything else is a transport close, delegated to [`classify_transport`]
+///   (which distinguishes idle/handshake timeouts from generic transport).
+fn classify_conn_shutdown(
+    by_app: bool,
+    closed_remotely: bool,
+    error_code: u64,
+    status: Status,
+) -> ConnectionTerminal {
+    match (by_app, closed_remotely) {
+        (true, true) => ConnectionTerminal::PeerApplication(error_code),
+        (true, false) => ConnectionTerminal::LocalClose,
+        (false, _) => classify_transport(status, error_code),
     }
 }
 
@@ -632,18 +658,50 @@ struct BufPtr(*const c_void);
 unsafe impl Send for BufPtr {}
 unsafe impl Sync for BufPtr {}
 
+/// Explicit receive-side event delivered from the stream callback to the
+/// frontend receive half.
+///
+/// Splitting the receive path into explicit events makes a graceful FIN, a peer
+/// reset, an empty non-FIN notification, and a connection failure observably
+/// distinct at `poll_data` (they were previously all collapsed into a bare
+/// channel close). Data from a single notification is always enqueued before any
+/// terminal marker from that same notification.
+enum ReceiveEvent {
+    /// Normal received bytes.
+    Data(Bytes),
+    /// Peer finished sending gracefully (FIN / `PeerSendShutdown`): clean EOF.
+    Fin,
+    /// Peer reset the receive side (`PeerSendAborted`) with this code.
+    Reset(u64),
+    /// The whole connection terminated with this reason.
+    Connection(ConnectionTerminal),
+}
+
 struct StreamSendCtx {
     start: Option<oneshot::Sender<Result<(), Status>>>,
     // cancelled, client_context
     send: Option<mpsc::UnboundedSender<(bool, BufPtr)>>,
     shutdown: Option<oneshot::Sender<()>>,
-    receive: Option<mpsc::UnboundedSender<Bytes>>,
+    receive: Option<mpsc::UnboundedSender<ReceiveEvent>>,
+    /// First-writer-wins guard for the receive scope: once a `Fin`, `Reset`, or
+    /// `Connection` terminal has been published, later receive events are
+    /// suppressed (e.g. the usual `Receive { FIN }` then `PeerSendShutdown`
+    /// sequence must not enqueue a duplicate FIN).
+    receive_terminal_sent: bool,
 }
 
 /// ctx for receiving data on frontend.
 #[derive(Debug)]
 struct RecvStreamReceiveCtx {
-    receive: mpsc::UnboundedReceiver<Bytes>,
+    receive: mpsc::UnboundedReceiver<ReceiveEvent>,
+    /// Sticky receive terminal. Once a terminal event has been drained it is
+    /// stored here and every later `poll_data` returns the same class without
+    /// re-polling the channel.
+    terminal: Option<ReceiveTerminal>,
+    /// SF-6: local, sticky end-of-stream flag set by OUR OWN `stop_sending`.
+    /// Distinct from `terminal` (a peer/connection-caused reason); when set,
+    /// `poll_data` returns a clean `Ok(None)` and `terminal` is left untouched.
+    receive_closed: bool,
 }
 
 /// ctx for sending data on frontend.
@@ -667,6 +725,7 @@ fn stream_ctx_channel() -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamRecei
             send: Some(send_tx),
             shutdown: Some(shutdown_tx),
             receive: Some(receive_tx),
+            receive_terminal_sent: false,
         },
         SendStreamReceiveCtx {
             start: Some(start_rx),
@@ -676,6 +735,8 @@ fn stream_ctx_channel() -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamRecei
         },
         RecvStreamReceiveCtx {
             receive: receive_rx,
+            terminal: None,
+            receive_closed: false,
         },
     )
 }
@@ -706,7 +767,12 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
             }
         }
         StreamEvent::Receive { buffers, flags, .. } => {
-            if let Some(receive) = ctx.receive.as_ref() {
+            // Enqueue received bytes (if any) BEFORE any terminal marker from
+            // this same notification, so `poll_data` observes data then FIN.
+            // Once a receive terminal has been published, suppress further data.
+            if !ctx.receive_terminal_sent
+                && let Some(receive) = ctx.receive.as_ref()
+            {
                 let mut b = BytesMut::new();
                 for br in buffers {
                     // skip empty buffs.
@@ -716,20 +782,28 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
                 }
                 let b = b.freeze();
                 if !b.is_empty() {
-                    // Failed delivery (frontend `H3RecvStream` dropped) drops the
-                    // sender so no further receive events are attempted.
-                    if receive.unbounded_send(b).is_err() {
+                    // Failed delivery (frontend `H3RecvStream` dropped) drops
+                    // the sender so no further receive events are attempted.
+                    if receive.unbounded_send(ReceiveEvent::Data(b)).is_err() {
                         ctx.receive.take();
                     }
-                } else {
-                    // zero buff can happen. so drop the receiver.
-                    ctx.receive.take();
                 }
+                // An empty, non-FIN notification produces NO event (Finding
+                // 8): a zero-length receive is not by itself an end-of-stream.
             }
+            // A FIN flag is a clean end-of-stream marker (peer finished sending).
             if flags.contains(ReceiveFlags::FIN) {
-                // close
-                ctx.receive.take();
+                publish_recv_terminal(ctx, ReceiveEvent::Fin);
             }
+        }
+        StreamEvent::PeerSendShutdown => {
+            // Peer gracefully finished sending: clean end-of-stream.
+            publish_recv_terminal(ctx, ReceiveEvent::Fin);
+        }
+        StreamEvent::PeerSendAborted { error_code } => {
+            // Peer RESET_STREAM on its send half: surfaces at `poll_data` as
+            // `StreamTerminated { error_code }`, distinct from a graceful FIN.
+            publish_recv_terminal(ctx, ReceiveEvent::Reset(error_code));
         }
         StreamEvent::SendShutdownComplete { graceful: _ } => {
             // Peer acknowledged shutdown.
@@ -737,7 +811,26 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
                 let _ = shutdown.send(());
             }
         }
-        StreamEvent::ShutdownComplete { .. } => {
+        StreamEvent::ShutdownComplete {
+            connection_shutdown,
+            connection_shutdown_by_app,
+            connection_closed_remotely,
+            connection_error_code,
+            connection_close_status,
+            ..
+        } => {
+            // A connection-caused stream shutdown surfaces the connection error
+            // on the receive half (reusing the Phase-3 connection terminal +
+            // convert helpers). A stream-local shutdown publishes no terminal.
+            if connection_shutdown {
+                let reason = classify_conn_shutdown(
+                    connection_shutdown_by_app,
+                    connection_closed_remotely,
+                    connection_error_code,
+                    connection_close_status,
+                );
+                publish_recv_terminal(ctx, ReceiveEvent::Connection(reason));
+            }
             // close all channels
             ctx.receive.take();
             ctx.send.take();
@@ -747,6 +840,23 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
         _ => {}
     }
     Ok(())
+}
+
+/// Publish a receive-side terminal event under first-writer-wins.
+///
+/// The first `Fin`/`Reset`/`Connection` wins and suppresses later receive
+/// events. After publishing, the receive sender is dropped so no further events
+/// are delivered; bytes already enqueued are preserved by the channel and are
+/// still observed before the terminal.
+fn publish_recv_terminal(ctx: &mut StreamSendCtx, ev: ReceiveEvent) {
+    if ctx.receive_terminal_sent {
+        return;
+    }
+    if let Some(receive) = ctx.receive.as_ref() {
+        let _ = receive.unbounded_send(ev);
+    }
+    ctx.receive_terminal_sent = true;
+    ctx.receive.take();
 }
 
 impl H3Stream {
@@ -901,6 +1011,63 @@ fn get_id(s: &msquic::Stream) -> h3::quic::StreamId {
     raw_id.try_into().expect("cannot parse id")
 }
 
+impl RecvStreamReceiveCtx {
+    /// SF-6: mark the receive half as locally ended by OUR OWN `stop_sending`.
+    ///
+    /// Idempotent and deliberately independent of any FFI outcome: the h3
+    /// `stop_sending` trait method is infallible, so this sticky local
+    /// end-of-stream must be set regardless of whether the `ABORT_RECEIVE`
+    /// submit succeeds. Once set, `poll_event` returns a clean `Ok(None)` and
+    /// leaves the sticky `terminal` slot untouched.
+    fn close_receive_locally(&mut self) {
+        self.receive_closed = true;
+    }
+
+    /// Drain one explicit receive event and map it to the h3 `poll_data` result.
+    ///
+    /// Sticky: once a terminal is stored, every later poll returns the same
+    /// class without touching the channel. SF-6: a local `stop_sending` sets
+    /// `receive_closed`, which yields a clean `Ok(None)` end-of-stream and leaves
+    /// the terminal slot untouched.
+    fn poll_event(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+        use std::task::Poll;
+        // SF-6: our own `stop_sending` ended the receive half locally. This is a
+        // clean end-of-stream, NOT a terminal: `terminal` stays untouched.
+        if self.receive_closed {
+            return Poll::Ready(Ok(None));
+        }
+        // Replay the stored sticky terminal without re-polling the channel.
+        if let Some(terminal) = &self.terminal {
+            return Poll::Ready(convert_recv(terminal.clone()));
+        }
+        match ready!(self.receive.poll_next_unpin(cx)) {
+            Some(ReceiveEvent::Data(b)) => Poll::Ready(Ok(Some(b))),
+            Some(ReceiveEvent::Fin) => self.store_and_convert(ReceiveTerminal::Fin),
+            Some(ReceiveEvent::Reset(code)) => self.store_and_convert(ReceiveTerminal::Reset(code)),
+            Some(ReceiveEvent::Connection(reason)) => {
+                self.store_and_convert(ReceiveTerminal::Connection(reason))
+            }
+            // A closed channel without an explicit terminal event is an internal
+            // fault, not a clean end-of-stream.
+            None => self.store_and_convert(ReceiveTerminal::Internal(
+                "receive channel closed without a terminal reason",
+            )),
+        }
+    }
+
+    /// Store `terminal` as the sticky receive reason and convert it for h3.
+    fn store_and_convert(
+        &mut self,
+        terminal: ReceiveTerminal,
+    ) -> std::task::Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+        self.terminal = Some(terminal.clone());
+        std::task::Poll::Ready(convert_recv(terminal))
+    }
+}
+
 impl RecvStream for H3RecvStream {
     type Buf = Bytes;
 
@@ -912,8 +1079,7 @@ impl RecvStream for H3RecvStream {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-        let res = ready!(self.rctx.receive.poll_next_unpin(cx));
-        std::task::Poll::Ready(Ok(res))
+        self.rctx.poll_event(cx)
     }
 
     /// Stop accepting data. Discard unread data, notify peer to not send.
@@ -922,11 +1088,17 @@ impl RecvStream for H3RecvStream {
         tracing::instrument(skip_all, level = "trace", ret)
     )]
     fn stop_sending(&mut self, error_code: u64) {
-        // Close the send path.
+        // Close the send path (code already clamped, Phase 2).
         let _ = self.stream.shutdown(
             StreamShutdownFlags::ABORT_RECEIVE,
             clamp_application_code(error_code),
         );
+        // SF-6: sticky local end-of-stream. Subsequent `poll_data` returns a
+        // clean `Ok(None)` and injects NO receive terminal (`terminal`
+        // untouched). Set unconditionally via the local-state seam: the FFI
+        // submit above is best-effort and its outcome must not gate the
+        // infallible h3 `stop_sending` contract.
+        self.rctx.close_receive_locally();
     }
 
     fn recv_id(&self) -> h3::quic::StreamId {
@@ -1560,5 +1732,196 @@ mod connection_terminal {
             observe_terminal(&crx.terminal),
             ConnectionErrorIncoming::ApplicationClose { error_code: 11 }
         ));
+    }
+}
+
+/// Phase 4 (explicit receive events) unit tests: prove that a graceful FIN, a
+/// peer reset, an empty non-FIN notification, a peer send-shutdown, a
+/// connection failure, and a local `stop_sending` are all observably distinct at
+/// the `poll_data` boundary. Hermetic (no network): events are driven straight
+/// through `stream_callback` and drained via `RecvStreamReceiveCtx::poll_event`,
+/// so no native `msquic::Stream` is required.
+#[cfg(test)]
+mod receive_events {
+    use std::task::{Context, Poll};
+
+    use bytes::Bytes;
+    use h3::quic::{ConnectionErrorIncoming, StreamErrorIncoming};
+
+    use crate::msquic::{BufferRef, ReceiveFlags, Status, StatusCode, StreamEvent};
+    use crate::{RecvStreamReceiveCtx, stream_callback, stream_ctx_channel};
+
+    fn noop_context() -> Context<'static> {
+        // A leaked no-op waker gives a `'static` context usable across polls.
+        let waker = Box::leak(Box::new(futures::task::noop_waker()));
+        Context::from_waker(waker)
+    }
+
+    /// Drive one `StreamEvent::Receive` carrying `data` and `flags`.
+    fn feed_receive(ctx: &mut crate::StreamSendCtx, data: &[u8], flags: ReceiveFlags) {
+        let bufs = [BufferRef::from(data)];
+        let mut total = data.len() as u64;
+        let ev = StreamEvent::Receive {
+            absolute_offset: 0,
+            total_buffer_length: &mut total,
+            buffers: &bufs,
+            flags,
+        };
+        assert!(stream_callback(ctx, ev).is_ok());
+    }
+
+    fn poll(rrx: &mut RecvStreamReceiveCtx) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+        let mut cx = noop_context();
+        rrx.poll_event(&mut cx)
+    }
+
+    #[test]
+    fn graceful_fin_yields_data_then_clean_eof() {
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        feed_receive(&mut ctx, &[1, 2, 3], ReceiveFlags::FIN);
+        // Data first.
+        match poll(&mut rrx) {
+            Poll::Ready(Ok(Some(b))) => assert_eq!(&b[..], &[1, 2, 3]),
+            other => panic!("expected data, got {other:?}"),
+        }
+        // Then a clean end-of-stream.
+        assert!(matches!(poll(&mut rrx), Poll::Ready(Ok(None))));
+        // Sticky: a later poll keeps returning clean EOF.
+        assert!(matches!(poll(&mut rrx), Poll::Ready(Ok(None))));
+    }
+
+    #[test]
+    fn peer_reset_yields_stream_terminated_with_code() {
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        assert!(stream_callback(&mut ctx, StreamEvent::PeerSendAborted { error_code: 42 }).is_ok());
+        match poll(&mut rrx) {
+            Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                assert_eq!(error_code, 42)
+            }
+            other => panic!("expected StreamTerminated{{42}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graceful_fin_and_peer_reset_are_observably_different() {
+        // FIN => Ok(None); RESET_STREAM => Err(StreamTerminated). The two paths
+        // must not be conflated (Finding 1).
+        let (mut fin_ctx, _s1, mut fin_rrx) = stream_ctx_channel();
+        feed_receive(&mut fin_ctx, &[], ReceiveFlags::FIN);
+        let fin = poll(&mut fin_rrx);
+
+        let (mut rst_ctx, _s2, mut rst_rrx) = stream_ctx_channel();
+        assert!(
+            stream_callback(&mut rst_ctx, StreamEvent::PeerSendAborted { error_code: 7 }).is_ok()
+        );
+        let rst = poll(&mut rst_rrx);
+
+        assert!(matches!(fin, Poll::Ready(Ok(None))));
+        assert!(matches!(
+            rst,
+            Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code: 7 }))
+        ));
+    }
+
+    #[test]
+    fn empty_non_fin_receive_produces_no_event() {
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        // A zero-length, non-FIN notification is not an end-of-stream (Finding 8).
+        feed_receive(&mut ctx, &[], ReceiveFlags::NONE);
+        // No event was enqueued and the channel is still open: Pending.
+        assert!(matches!(poll(&mut rrx), Poll::Pending));
+        // The terminal slot must remain empty.
+        assert!(rrx.terminal.is_none());
+    }
+
+    #[test]
+    fn peer_send_shutdown_yields_clean_eof() {
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        assert!(stream_callback(&mut ctx, StreamEvent::PeerSendShutdown).is_ok());
+        assert!(matches!(poll(&mut rrx), Poll::Ready(Ok(None))));
+    }
+
+    #[test]
+    fn first_receive_terminal_wins() {
+        // The usual `Receive{FIN}` then `PeerSendShutdown` sequence must yield a
+        // single clean EOF, not a duplicate. Likewise a reset published first is
+        // not overwritten by a later FIN.
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        assert!(stream_callback(&mut ctx, StreamEvent::PeerSendAborted { error_code: 9 }).is_ok());
+        // A later graceful FIN must NOT override the earlier reset.
+        assert!(stream_callback(&mut ctx, StreamEvent::PeerSendShutdown).is_ok());
+        assert!(matches!(
+            poll(&mut rrx),
+            Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code: 9 }))
+        ));
+        // Sticky reset persists.
+        assert!(matches!(
+            poll(&mut rrx),
+            Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code: 9 }))
+        ));
+    }
+
+    #[test]
+    fn connection_shutdown_surfaces_connection_error() {
+        // A peer application close (by_app && closed_remotely) delivered as a
+        // connection-caused stream shutdown surfaces the connection error.
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        let ev = StreamEvent::ShutdownComplete {
+            connection_shutdown: true,
+            app_close_in_progress: false,
+            connection_shutdown_by_app: true,
+            connection_closed_remotely: true,
+            connection_error_code: 13,
+            connection_close_status: Status::new(StatusCode::QUIC_STATUS_ABORTED),
+        };
+        assert!(stream_callback(&mut ctx, ev).is_ok());
+        match poll(&mut rrx) {
+            Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            })) => assert_eq!(error_code, 13),
+            other => panic!("expected connection ApplicationClose{{13}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_local_shutdown_publishes_no_connection_terminal() {
+        // A stream-local `ShutdownComplete` (connection_shutdown == false) must
+        // NOT surface a connection error. The channel closes with no terminal
+        // event, which maps to the internal fault class.
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        let ev = StreamEvent::ShutdownComplete {
+            connection_shutdown: false,
+            app_close_in_progress: false,
+            connection_shutdown_by_app: false,
+            connection_closed_remotely: false,
+            connection_error_code: 0,
+            connection_close_status: Status::new(StatusCode::QUIC_STATUS_SUCCESS),
+        };
+        assert!(stream_callback(&mut ctx, ev).is_ok());
+        match poll(&mut rrx) {
+            Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::InternalError(_),
+            })) => {}
+            other => panic!("expected internal-fault on bare channel close, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_data_after_local_stop_sending_is_ok_none() {
+        // SF-6 / FR-017: after a local `stop_sending`, `poll_data` returns a
+        // defined clean end-of-stream (Ok(None)), NOT a peer error, and no
+        // receive terminal is injected. This drives the REAL local-state seam
+        // that `RecvStream::stop_sending` calls (`close_receive_locally`) rather
+        // than poking the field directly, so it genuinely covers the
+        // stop_sending local-EOF behavior without needing a live FFI stream.
+        // `stop_sending` separately submits `ABORT_RECEIVE` with the clamped
+        // application code; that FFI effect is exercised by the loopback tests.
+        let (_ctx, _srx, mut rrx) = stream_ctx_channel();
+        assert!(!rrx.receive_closed);
+        rrx.close_receive_locally(); // the exact call RecvStream::stop_sending makes
+        assert!(matches!(poll(&mut rrx), Poll::Ready(Ok(None))));
+        // No terminal was injected: the sticky recv terminal slot stays empty.
+        assert!(rrx.terminal.is_none());
+        assert!(rrx.receive_closed);
     }
 }

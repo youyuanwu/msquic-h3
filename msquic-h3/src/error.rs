@@ -170,7 +170,6 @@ impl ConnectionTerminal {
 
 /// Why a receive half terminated. The first writer wins for the receive scope.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // recorded on the receive path in Phase 4
 pub(crate) enum ReceiveTerminal {
     /// Clean end of stream (peer FIN / send-shutdown).
     Fin,
@@ -244,7 +243,6 @@ pub(crate) fn convert_send(t: SendTerminal) -> StreamErrorIncoming {
 /// Convert a [`ReceiveTerminal`] into the h3 receive outcome it represents.
 ///
 /// A clean FIN maps to `Ok(None)`; every other terminal maps to an error.
-#[allow(dead_code)] // wired at the receive polling boundary in Phase 4
 pub(crate) fn convert_recv(
     t: ReceiveTerminal,
 ) -> Result<Option<bytes::Bytes>, StreamErrorIncoming> {
