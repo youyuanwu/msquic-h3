@@ -3,12 +3,18 @@ name: build
 on: [push, pull_request]
 
 jobs:
-  build:
-    runs-on: ${{ matrix.os }}
+  # ── Default + `tracing` compile/lint rows ───────────────────────────────────
+  # These rows do a COMPILE/LINT check only (no test/attestation/bench gate):
+  # they prove the library and all targets build and lint cleanly with the
+  # default feature set and with `tracing` enabled. The attested conformance
+  # matrix below still owns the full test/attestation/bench gate on the native
+  # provenance rows. `--all-features` is intentionally NOT used (the two native
+  # provenance features are mutually exclusive).
+  default-tracing-lint:
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [ windows-latest, ubuntu-latest ]
         rust: [ 1.90.0, 1.97.0 ]
     steps:
     - uses: actions/checkout@v7
@@ -22,9 +28,63 @@ jobs:
         toolchain: ${{ matrix.rust }}
         components: rustfmt, clippy
 
-    # choose a older version to avoid apt error
-    - name: Install msquic from apt (linux)
-      if: runner.os == 'Linux'
+    - name: Run cargo check (default features)
+      run: cargo +${{ matrix.rust }} check --all-targets
+
+    - name: Run cargo check (tracing)
+      run: cargo +${{ matrix.rust }} check --all-targets --features tracing
+
+    - name: Run cargo fmt
+      run: cargo +${{ matrix.rust }} fmt --all -- --check
+
+    - name: Run cargo clippy (default features)
+      run: cargo +${{ matrix.rust }} clippy --all-targets -- -D warnings
+
+    - name: Run cargo clippy (tracing)
+      run: cargo +${{ matrix.rust }} clippy --all-targets --features tracing -- -D warnings
+
+  # ── Attested conformance-support matrix (MF-3) ──────────────────────────────
+  # Two committed clean-checkout provenance rows, selected by a committed feature
+  # (never an uncommitted Cargo.toml edit):
+  #   * native-find → links the system-package libmsquic (Linux CI installs 2.5.8)
+  #                   → attested version [2,5,8]
+  #   * native-src  → builds the vendored msquic-2.5.1-beta source via cmake
+  #                   → attested version [2,5,1]
+  # The two features are MUTUALLY EXCLUSIVE (the msquic build script fails fast if
+  # both are set), so `--all-features` is intentionally NOT used anywhere here.
+  linux-conformance:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [ 1.90.0, 1.97.0 ]
+        provenance: [ native-find, native-src ]
+        # Row-specific expected native version (major.minor.patch). Pins the
+        # attestation gate per cell so a silent library drift fails the job.
+        include:
+          - provenance: native-find
+            expected: "2.5.8"
+          - provenance: native-src
+            expected: "2.5.1"
+    env:
+      # Consumed by the `native_version_preflight` attestation test.
+      MSQUIC_EXPECTED_VERSION: ${{ matrix.expected }}
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Get latest version of CMake
+      uses: lukka/get-cmake@latest
+
+    - name: Install rust stable
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ matrix.rust }}
+        components: rustfmt, clippy
+
+    # Only the native-find row installs the system package; native-src builds the
+    # crate-bundled msquic source, so it must NOT have a system libmsquic present.
+    - name: Install msquic from apt (native-find only)
+      if: matrix.provenance == 'native-find'
       run: |
         wget -q https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb;
         sudo dpkg -i packages-microsoft-prod.deb;
@@ -32,8 +92,76 @@ jobs:
         sudo apt-get install libmsquic=2.5.8;
         dpkg -L libmsquic;
 
+    - name: Run cargo check
+      run: cargo +${{ matrix.rust }} check --all-targets --no-default-features --features ${{ matrix.provenance }}
+
+    - name: Run cargo fmt
+      run: cargo +${{ matrix.rust }} fmt --all -- --check
+
+    - name: Run cargo clippy
+      run: cargo +${{ matrix.rust }} clippy --all-targets --no-default-features --features ${{ matrix.provenance }} -- -D warnings
+
+    - name: Run cargo test
+      run: cargo +${{ matrix.rust }} test --no-default-features --features ${{ matrix.provenance }} -- --nocapture
+
+    # ── BLOCKING attestation + exact seam/conformance gate ──────────────────
+    # Replaces any `teardown` substring filter: each named test is run with
+    # `--exact` and the job FAILS unless all four ran (a green job can never
+    # silently run zero seam/conformance tests). The attestation test records the
+    # loaded library's version + git-hash + SHA-256 digest and asserts the
+    # row-specific expected version.
+    - name: Blocking attestation + seam/conformance gate
+      run: |
+        set -euo pipefail
+        OUT=$(cargo +${{ matrix.rust }} test -p msquic-h3 --no-default-features \
+          --features ${{ matrix.provenance }} -- --exact --nocapture \
+          attest::tests::native_version_preflight \
+          send_seam::accepted_send_reclaims_via_callback_exactly_once \
+          send_seam::immediate_send_failure_reclaims_without_completion \
+          conformance::accepted_send_completes_and_teardown_is_panic_free)
+        echo "$OUT"
+        echo "$OUT" | grep -Eq "test result: ok\. 4 passed" \
+          || { echo "::error::expected exactly 4 seam/conformance tests to run under --exact"; exit 1; }
+
+    # ── BLOCKING send-copy benchmark gate (MF-4) ────────────────────────────
+    # Builds AND runs the Criterion target under the same provenance row plus the
+    # committed `bench-internals` feature. Timing is INFORMATIONAL (no hard 10 ms
+    # assertion); the deterministic memory bound is the in-crate
+    # `send_copy_peak_resident_bound` #[test] run above. A build/run failure here
+    # fails the job.
+    - name: Blocking send-copy bench build + run (informational timing)
+      run: |
+        cargo +${{ matrix.rust }} bench -p msquic-h3 --no-default-features \
+          --features ${{ matrix.provenance }},bench-internals --bench send_copy -- --noplot
+
+  # ── Windows compile/test support (vcpkg) ────────────────────────────────────
+  # SCOPE: this job proves the crate compiles and its tests pass on Windows via a
+  # vcpkg-provided libmsquic (the `native-find` feature locates it through
+  # VCPKG_ROOT). It is deliberately DISTINCT from the attested conformance matrix
+  # above: vcpkg's pinned msquic version is not asserted here, so the
+  # `native_version_preflight` gate is skipped. Loaded-module attestation on
+  # Windows (enumerating the mapped `msquic.dll` via GetModuleHandle /
+  # GetModuleFileName) is future work; until then Windows is compile/test support,
+  # not an attested conformance cell.
+  windows-build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [ 1.90.0, 1.97.0 ]
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Get latest version of CMake
+      uses: lukka/get-cmake@latest
+
+    - name: Install rust stable
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ matrix.rust }}
+        components: rustfmt, clippy
+
     - name: Run Vcpkg (windows)
-      if: runner.os == 'Windows'
       uses: lukka/run-vcpkg@v11
       with:
         vcpkgGitCommitId: 52c9e08cdf8580d2d9762f547d22b96fd81e82f2 # 2026.06.24
@@ -41,7 +169,6 @@ jobs:
         VCPKG_BINARY_SOURCES: default,rw
 
     - name: Set up binary cache
-      if: runner.os == 'Windows'
       uses: actions/cache@v6
       with:
         path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
@@ -50,25 +177,29 @@ jobs:
           ${{ runner.os }}-vcpkg-binary-cache-
 
     - name: install msquic from vcpkg (windows)
-      if: runner.os == 'Windows'
-      run: |
-        vcpkg install msquic
+      run: vcpkg install msquic
 
+    # Generates the MsQuic-Test certificate the loopback tests need on Windows.
     - name: run cmake
-      run: > 
-        cmake . -B build
+      run: cmake . -B build
 
     - name: run build
       run: cmake --build build
-    
+
     - name: Run cargo check
-      run: cargo +${{ matrix.rust }} check --all-targets --all-features
+      run: cargo +${{ matrix.rust }} check --all-targets --no-default-features --features native-find
 
     - name: Run cargo fmt
       run: cargo +${{ matrix.rust }} fmt --all -- --check
-    
-    - name: Run cargo clippy
-      run: cargo +${{ matrix.rust }} clippy --all-targets --all-features -- -D warnings
 
-    - name: Run cargo test
-      run: cargo +${{ matrix.rust }} test --all -- --nocapture
+    - name: Run cargo clippy
+      run: cargo +${{ matrix.rust }} clippy --all-targets --no-default-features --features native-find -- -D warnings
+
+    # Compile/test support only: skip the version-attestation gate (vcpkg's msquic
+    # version is not asserted on this platform — see the job-level SCOPE note).
+    - name: Run cargo test (skip version attestation)
+      run: cargo +${{ matrix.rust }} test --no-default-features --features native-find -- --nocapture --skip native_version_preflight
+
+    # Verify the bench still builds+runs on Windows (informational timing only).
+    - name: send-copy bench build + run (informational timing)
+      run: cargo +${{ matrix.rust }} bench -p msquic-h3 --no-default-features --features native-find,bench-internals --bench send_copy -- --noplot

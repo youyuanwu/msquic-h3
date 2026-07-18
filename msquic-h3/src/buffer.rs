@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use msquic::BufferRef;
 
 use crate::error::MAX_ADAPTER_SEND;
@@ -34,6 +34,13 @@ pub(crate) fn classify_send_len(remaining: usize) -> SendLen {
 /// An owned, self-referential send payload handed to MsQuic across the FFI
 /// boundary for the whole lifetime of one `Stream::send`.
 ///
+/// The type is `pub` **only** so the crate-private [`copy_into_send_buffer`]
+/// helper (also `pub`) can appear in a public signature that the committed
+/// `bench-internals` feature re-exports via `crate::bench_support`; the enclosing
+/// `mod buffer` is never `pub`, so neither the type's name nor `SendBuffer::new`
+/// is nameable outside the crate. A bench can only *bind* the returned value by
+/// inference — it can never write the path `buffer::SendBuffer`.
+///
 /// `_bytes` owns the heap storage holding the complete wire representation;
 /// `buffers[0]` is a [`BufferRef`] — a `#[repr(transparent)]` wrapper over
 /// `QUIC_BUFFER { Length: u32, Buffer: *mut u8 }` — whose `Buffer` pointer aims
@@ -44,7 +51,7 @@ pub(crate) fn classify_send_len(remaining: usize) -> SendLen {
 /// struct is self-referential only in the weak sense that `buffers` borrows the
 /// stable heap allocation owned by `_bytes`; that allocation lives exactly as
 /// long as `_bytes`, i.e. as long as the `SendBuffer` itself.
-pub(crate) struct SendBuffer {
+pub struct SendBuffer {
     buffers: [BufferRef; 1],
     /// Owns the heap storage that `buffers[0]` points into. Never read directly
     /// (its leading underscore keeps the crate's `-D warnings` policy happy); it
@@ -104,6 +111,24 @@ impl SendBuffer {
     pub(crate) fn buffers(&self) -> &[BufferRef] {
         &self.buffers
     }
+}
+
+/// The ONE production copy path: consume the complete [`Buf`] into an owned
+/// [`SendBuffer`] via a single `copy_to_bytes` allocation.
+///
+/// Production `send_data` calls this with `&mut WriteBuf<B>` and the Criterion
+/// bench calls it with `&[u8]`; both implement [`Buf`], so both drive the
+/// identical `src.copy_to_bytes(remaining)` allocation — the benchmark measures
+/// the exact production copy, not a second implementation. The caller must have
+/// already classified the payload as non-empty and within [`MAX_ADAPTER_SEND`]
+/// (via [`classify_send_len`]), matching [`SendBuffer::new`]'s contract.
+///
+/// The helper is `pub` (inside the crate-private `mod buffer`) so a gated
+/// `pub use` under the `bench-internals` feature can re-export it; without that
+/// feature it stays unreachable outside the crate.
+pub fn copy_into_send_buffer(mut src: impl Buf) -> SendBuffer {
+    let remaining = src.remaining();
+    SendBuffer::new(src.copy_to_bytes(remaining))
 }
 
 #[cfg(test)]
@@ -173,5 +198,111 @@ mod test {
         // Reclaim exactly once (mirrors the SendComplete / immediate-failure path).
         // SAFETY: `raw` is the pointer from `Box::into_raw`, reclaimed once here.
         drop(unsafe { Box::from_raw(raw) });
+    }
+
+    #[test]
+    fn copy_into_send_buffer_copies_full_payload() {
+        // `&[u8]` is a `Buf`, exactly the shape the bench drives; assert the owned
+        // copy reproduces the source bytes contiguously in one `BufferRef`.
+        let src: &[u8] = b"the one production copy path";
+        let sb = super::copy_into_send_buffer(src);
+        assert_eq!(sb.buffers().len(), 1);
+        assert_eq!(sb.buffers()[0].as_bytes(), src);
+    }
+
+    #[test]
+    fn send_copy_peak_resident_bound() {
+        // BLOCKING deterministic memory gate (MF-4 point 3): peak resident bytes
+        // attributable to ONE send-copy must not exceed the transient
+        // source+destination doubling plus 1 MiB slack. Thread-scoped counting
+        // (see `peak_alloc`) makes this independent of concurrent test threads.
+        let payload = 16usize << 20;
+        // Source and destination MUST coexist to capture the design's transient
+        // doubling, so both are allocated inside the measured op.
+        let (held, peak_delta) = super::peak_alloc::measure_peak_resident(|| {
+            let src: Vec<u8> = vec![0u8; payload]; // source allocation
+            let dst = super::copy_into_send_buffer(&src[..]); // owned copy (private path)
+            (src, dst) // both live at read
+        });
+        std::hint::black_box(&held);
+        let bound = 2 * payload + (1 << 20);
+        assert!(
+            peak_delta <= bound,
+            "16 MiB per-send peak {peak_delta} exceeds 2*payload + 1 MiB ({bound})"
+        );
+        // A meaningful lower bound too: the single owned copy alone is >= payload,
+        // so a zero/near-zero delta would mean the counter never observed the copy.
+        assert!(
+            peak_delta >= payload,
+            "peak {peak_delta} below one payload ({payload}): allocator counter missed the copy"
+        );
+    }
+}
+
+/// Thread-scoped counting global allocator, installed **only** for the crate's
+/// test binary (`#[cfg(test)]`), never for production. Only allocations made on a
+/// thread that has opted in via [`peak_alloc::measure_peak_resident`] are counted,
+/// so the peak-resident gate is deterministic regardless of how many other test
+/// threads allocate concurrently.
+#[cfg(test)]
+mod peak_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    thread_local! {
+        // `const` init is allocation-free, so reading it from inside the global
+        // allocator cannot re-enter the allocator.
+        static MEASURING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    struct Counting;
+
+    #[inline]
+    fn measuring() -> bool {
+        MEASURING.try_with(|m| m.get()).unwrap_or(false)
+    }
+
+    // SAFETY: forwards every request to the system allocator unchanged; the only
+    // added work is bookkeeping on process-global atomics, and it never returns a
+    // different pointer than `System` produced.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc(l) };
+            if !p.is_null() && measuring() {
+                let now = LIVE.fetch_add(l.size(), Ordering::Relaxed) + l.size();
+                PEAK.fetch_max(now, Ordering::Relaxed);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            if measuring() {
+                LIVE.fetch_sub(l.size(), Ordering::Relaxed);
+            }
+            unsafe { System.dealloc(p, l) };
+        }
+    }
+
+    #[global_allocator]
+    static A: Counting = Counting;
+
+    /// Peak resident bytes attributable to ONE measured op on the CURRENT thread.
+    ///
+    /// Counting is enabled only for this thread and only for the op's duration, so
+    /// the returned delta excludes every earlier allocation and every allocation
+    /// on other (parallel) test threads. The op's result is returned and held by
+    /// the caller until PEAK is read, so the destination buffer is still live at
+    /// the peak.
+    pub(super) fn measure_peak_resident<R>(op: impl FnOnce() -> R) -> (R, usize) {
+        MEASURING.with(|m| m.set(true));
+        let baseline = LIVE.load(Ordering::SeqCst);
+        PEAK.store(baseline, Ordering::SeqCst); // reset immediately before
+        let out = op(); // the single measured copy path
+        let peak = PEAK.load(Ordering::SeqCst); // read immediately after
+        MEASURING.with(|m| m.set(false));
+        (out, peak.saturating_sub(baseline)) // attributable delta, baseline excluded
     }
 }

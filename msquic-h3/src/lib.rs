@@ -20,7 +20,7 @@ use msquic::{
 };
 
 mod buffer;
-use buffer::{SendBuffer, SendLen, classify_send_len};
+use buffer::{SendBuffer, SendLen, classify_send_len, copy_into_send_buffer};
 mod error;
 use error::{
     ConnectionTerminal, ReceiveTerminal, SendCommand, SendEvent, SendInput, SendPayload, SendPoll,
@@ -33,6 +33,22 @@ pub use listener::Listener;
 mod registration;
 use registration::RundownGuard;
 pub use registration::{Registration, WaitIdle};
+
+/// Runtime native-library attestation (MF-3): the `native_version_preflight`
+/// gate lives here. Test-only — it queries the live msquic handle for its
+/// version + git hash and digests the loaded `libmsquic`.
+#[cfg(test)]
+mod attest;
+
+/// Feature-gated public re-export of the ONE send-copy path so the separate
+/// Criterion bench crate (`benches/send_copy.rs`) can reach it (MF-4). Only the
+/// function is re-exported; `SendBuffer`'s name is never exposed. The surface
+/// appears **only** when the committed `bench-internals` feature is enabled, so
+/// no bench-only API leaks into the default library build.
+#[cfg(feature = "bench-internals")]
+pub mod bench_support {
+    pub use crate::buffer::copy_into_send_buffer;
+}
 
 /// re-export msquic type
 pub mod msquic {
@@ -491,13 +507,11 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
                 let raw = failpoint.maybe_override(raw)?;
                 Ok(raw)
             };
-            let id = match accept_stream_id(ctx, query) {
-                Ok(id) => id,
-                // Pre-ownership failure: `accept_stream_id` already published the
-                // internal terminal and woke the acceptors. Return the status so
-                // msquic closes the rejected stream itself (single close).
-                Err(status) => return Err(status),
-            };
+            // Pre-ownership failure path: `accept_stream_id` already published the
+            // internal terminal and woke the acceptors, so `?` returns the status
+            // and msquic closes the rejected stream itself (single close). On
+            // success we take native ownership only NOW.
+            let id = accept_stream_id(ctx, query)?;
             // Success: only NOW take native ownership and attach.
             let owned = unsafe { msquic::Stream::from_raw(stream.as_raw()) };
             let h3 = crate::H3Stream::attach(owned, id);
@@ -1634,9 +1648,10 @@ impl<B: Buf> SendStream<B> for H3SendStream {
                     // The single production copy path: materialize the complete
                     // wire representation into owned `Bytes` while `B` is still on
                     // this thread, then hand it to the seam (which reclaims the box
-                    // itself on an immediate `Err`).
-                    let remaining = wb.remaining();
-                    let buf = SendBuffer::new(wb.copy_to_bytes(remaining));
+                    // itself on an immediate `Err`). `&mut WriteBuf<B>` is a `Buf`,
+                    // so this drives the exact `copy_to_bytes` allocation the
+                    // Criterion bench measures through `bench_support`.
+                    let buf = copy_into_send_buffer(&mut wb);
                     let res = self.exec.submit_send(buf);
                     input = SendInput::SendSubmitted {
                         result: res,
