@@ -70,18 +70,22 @@ fn listener_callback(
             }
             let conn = crate::Connection::attach(inner, guard);
             if let Some(tx) = ctx.conn.as_ref() {
-                tx.unbounded_send(Some(conn)).expect("cannot send");
+                // Ownership was taken by `Connection::attach`; if delivery fails
+                // the returned `SendError` carries the owned `Connection`, which
+                // drops here and runs a single `ConnectionClose`. Return `Ok`
+                // (never `Err`) so the callback does not also reject an owned
+                // handle and trip native `listener.c`'s close-and-reject assert.
+                let _ = tx.unbounded_send(Some(conn));
             }
         }
         ListenerEvent::StopComplete { .. } => {
             // none means end of connections
             if let Some(tx) = ctx.conn.as_ref() {
-                tx.unbounded_send(None).expect("cannot send");
+                let _ = tx.unbounded_send(None);
             }
-            let mut lk = ctx.shutdown.lock().unwrap();
-            let tx = lk.take();
+            let tx = crate::lock_recover(&ctx.shutdown).take();
             if let Some(tx) = tx {
-                tx.send(()).expect("cannot send");
+                let _ = tx.send(());
             }
         }
     }
@@ -141,12 +145,15 @@ impl Listener {
     /// shutdown is made immutable to enable it to be called from another thread.
     pub async fn shutdown(&self) {
         let opt_rx = {
-            let mut lk = self.conn.shutdown.lock().unwrap();
+            let mut lk = crate::lock_recover(&self.conn.shutdown);
             lk.take()
         };
         if let Some(rx) = opt_rx {
             self.inner.stop();
-            rx.await.expect("cannot receive");
+            // On cancellation (sender dropped) treat as already shut down and
+            // return rather than panicking. Calling `shutdown` twice is a no-op
+            // because the receiver was taken above.
+            let _ = rx.await;
         }
     }
 }
@@ -307,7 +314,7 @@ mod test {
             .unwrap()
             .block_on(crate::test::send_get_request(uri));
         //std::thread::sleep(Duration::from_secs(1));
-        sht_tx.send(()).unwrap();
+        let _ = sht_tx.send(());
         th.join().unwrap();
     }
 

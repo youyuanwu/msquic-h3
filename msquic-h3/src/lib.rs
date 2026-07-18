@@ -1,4 +1,8 @@
-use std::{ffi::c_void, pin::Pin, sync::Arc};
+use std::{
+    ffi::c_void,
+    pin::Pin,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{
@@ -26,6 +30,17 @@ pub use registration::{Registration, WaitIdle};
 /// re-export msquic type
 pub mod msquic {
     pub use ::msquic::*;
+}
+
+/// Acquire a mutex, recovering the guard if a panic on another thread poisoned
+/// the lock.
+///
+/// FFI callbacks and rundown/waiter paths must never unwind across the msquic
+/// boundary, so a poisoned lock is recovered via [`PoisonError::into_inner`]
+/// rather than propagated as a panic. Every lock these paths touch guards only
+/// plain data with no torn invariant, so the inner value is always safe to use.
+pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Owns the raw msquic connection handle together with its [`RundownGuard`].
@@ -110,19 +125,25 @@ fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
 fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> Result<(), Status> {
     match ev {
         ConnectionEvent::Connected { .. } => {
-            ctx.connected.take().unwrap().send(()).unwrap();
+            // A duplicate `Connected` (slot already taken) or a dropped receiver
+            // (send `Err`) is a safe no-op; never panic across the FFI boundary.
+            if let Some(tx) = ctx.connected.take() {
+                let _ = tx.send(());
+            }
         }
         ConnectionEvent::PeerStreamStarted { stream, flags } => {
             // TODO: need to set callback
             let s = unsafe { msquic::Stream::from_raw(stream.as_raw()) };
             if flags.contains(StreamOpenFlags::UNIDIRECTIONAL) {
                 if let Some(uni) = ctx.uni.as_ref() {
-                    uni.unbounded_send(Some(crate::H3Stream::attach(s)))
-                        .expect("cannot send");
+                    // Ownership was taken by `H3Stream::attach`; if delivery
+                    // fails (frontend gone) the returned `SendError` carries the
+                    // owned `H3Stream`, which drops here and closes the native
+                    // stream exactly once.
+                    let _ = uni.unbounded_send(Some(crate::H3Stream::attach(s)));
                 }
             } else if let Some(bidi) = ctx.bidi.as_ref() {
-                bidi.unbounded_send(Some(crate::H3Stream::attach(s)))
-                    .expect("cannot send");
+                let _ = bidi.unbounded_send(Some(crate::H3Stream::attach(s)));
             }
         }
         ConnectionEvent::ShutdownComplete { .. } => {
@@ -169,7 +190,7 @@ impl Connection {
             // wait for connection.
             crx.connected
                 .take()
-                .unwrap()
+                .ok_or_else(|| Status::new(StatusCode::QUIC_STATUS_ABORTED))?
                 .await
                 .map_err(|_| Status::new(StatusCode::QUIC_STATUS_ABORTED))?;
 
@@ -200,11 +221,19 @@ impl Connection {
         }
     }
 
-    /// Can only be called once after construction.
+    /// Returns the connection shutdown waiter.
+    ///
+    /// The first call waits for shutdown completion. Later calls return a
+    /// waiter that resolves immediately.
     pub fn get_shutdown_waiter(&mut self) -> ConnectionShutdownWaiter {
-        ConnectionShutdownWaiter {
-            rx: self.ctx.shutdown.take().unwrap(),
-        }
+        // If the waiter was already taken, hand back an immediately-resolving
+        // one (its sender is dropped) rather than panicking. `wait` treats a
+        // dropped sender as a benign completion.
+        let rx = self.ctx.shutdown.take().unwrap_or_else(|| {
+            let (_tx, rx) = oneshot::channel();
+            rx
+        });
+        ConnectionShutdownWaiter { rx }
     }
 }
 
@@ -215,9 +244,9 @@ pub struct ConnectionShutdownWaiter {
 impl ConnectionShutdownWaiter {
     /// wait for connection to be fully shutdown.
     pub async fn wait(self) {
-        self.rx
-            .await
-            .expect("failed to wait for connection shutdown");
+        // A dropped sender (connection torn down without a clean
+        // `ShutdownComplete`) resolves the wait rather than panicking.
+        let _ = self.rx.await;
     }
 }
 
@@ -473,11 +502,11 @@ fn stream_ctx_channel() -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamRecei
 fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Status> {
     match ev {
         StreamEvent::StartComplete { status, .. } => {
-            let tx = ctx.start.take().unwrap();
-            if status.is_ok() {
-                tx.send(Ok(())).expect("cannot send");
-            } else {
-                tx.send(Err(status)).expect("cannot send")
+            // Duplicate `StartComplete` (slot already taken) or a dropped
+            // `OpeningStream` receiver is a safe no-op.
+            if let Some(tx) = ctx.start.take() {
+                let result = if status.is_ok() { Ok(()) } else { Err(status) };
+                let _ = tx.send(result);
             }
         }
         StreamEvent::SendComplete {
@@ -485,10 +514,10 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
             client_context,
         } => {
             if let Some(send) = ctx.send.as_ref() {
-                send.unbounded_send((cancelled, BufPtr(client_context)))
-                    .expect("cannot send");
-            } else {
-                debug_assert!(false, "mem leak");
+                // NOTE: on delivery failure (frontend gone) the buffer behind
+                // `client_context` is not reclaimed here; that structural
+                // reclamation lands in Phase 6. Phase 1 only removes the panic.
+                let _ = send.unbounded_send((cancelled, BufPtr(client_context)));
             }
         }
         StreamEvent::Receive { buffers, flags, .. } => {
@@ -502,7 +531,11 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
                 }
                 let b = b.freeze();
                 if !b.is_empty() {
-                    receive.unbounded_send(b).expect("cannot send");
+                    // Failed delivery (frontend `H3RecvStream` dropped) drops the
+                    // sender so no further receive events are attempted.
+                    if receive.unbounded_send(b).is_err() {
+                        ctx.receive.take();
+                    }
                 } else {
                     // zero buff can happen. so drop the receiver.
                     ctx.receive.take();
@@ -516,7 +549,7 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
         StreamEvent::SendShutdownComplete { graceful: _ } => {
             // Peer acknowledged shutdown.
             if let Some(shutdown) = ctx.shutdown.take() {
-                shutdown.send(()).expect("cannot send");
+                let _ = shutdown.send(());
             }
         }
         StreamEvent::ShutdownComplete { .. } => {
@@ -991,5 +1024,67 @@ mod test {
             .build()
             .unwrap()
             .block_on(send_get_request(uri));
+    }
+}
+
+/// Phase 1 (callback safety) unit tests: proves the FFI callback surfaces are
+/// panic-free when a receiver has been dropped, and that the poison-recovering
+/// lock helper never panics on a poisoned mutex. Hermetic (no network).
+#[cfg(test)]
+mod callback_safety {
+    use std::sync::{Arc, Mutex};
+
+    use crate::msquic::{ConnectionEvent, StreamEvent};
+    use crate::{
+        conn_ctx_channel, connection_callback, lock_recover, stream_callback, stream_ctx_channel,
+    };
+
+    #[test]
+    fn connection_callback_connected_with_dropped_receiver_is_noop() {
+        let (mut ctx, rx) = conn_ctx_channel();
+        // Frontend gone: the `Connected` one-shot receiver is dropped.
+        drop(rx);
+        let ev = ConnectionEvent::Connected {
+            session_resumed: false,
+            negotiated_alpn: &[],
+        };
+        // The fallible send returns Err internally; the callback must not panic
+        // and must return Ok across the FFI boundary.
+        assert!(connection_callback(&mut ctx, ev).is_ok());
+        // The one-shot slot was consumed exactly once.
+        assert!(ctx.connected.is_none());
+    }
+
+    #[test]
+    fn stream_callback_send_complete_with_dropped_receiver_is_noop() {
+        let (mut ctx, srx, rrx) = stream_ctx_channel();
+        // Frontend gone: drop the receive side of the send-complete channel.
+        drop(srx);
+        drop(rrx);
+        let ev = StreamEvent::SendComplete {
+            cancelled: false,
+            client_context: std::ptr::null(),
+        };
+        // Fallible unbounded_send returns Err; no panic, callback returns Ok.
+        assert!(stream_callback(&mut ctx, ev).is_ok());
+    }
+
+    #[test]
+    fn lock_recover_recovers_poisoned_mutex() {
+        let m = Arc::new(Mutex::new(41u32));
+        let m2 = m.clone();
+        // Poison the mutex by panicking while its guard is held.
+        let joined = std::thread::spawn(move || {
+            let mut g = m2.lock().unwrap();
+            *g = 42;
+            panic!("poison the callback-path lock");
+        })
+        .join();
+        assert!(joined.is_err(), "helper thread should have panicked");
+        assert!(m.is_poisoned(), "mutex should be poisoned");
+
+        // Recover without panicking and observe the value written before poison.
+        let g = lock_recover(&m);
+        assert_eq!(*g, 42);
     }
 }

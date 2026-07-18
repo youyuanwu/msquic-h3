@@ -59,7 +59,7 @@ impl Drop for RundownGuard {
             // Wake every outstanding waiter. Collect under the lock, wake after
             // releasing it.
             let woken: Vec<Waker> = {
-                let mut w = self.state.waiters.lock().unwrap();
+                let mut w = crate::lock_recover(&self.state.waiters);
                 w.map.drain().map(|(_, waker)| waker).collect()
             };
             for waker in woken {
@@ -139,7 +139,7 @@ pub struct WaitIdle {
 impl WaitIdle {
     fn deregister(&mut self) {
         if let Some(k) = self.key.take() {
-            self.state.waiters.lock().unwrap().map.remove(&k);
+            crate::lock_recover(&self.state.waiters).map.remove(&k);
         }
     }
 }
@@ -156,7 +156,7 @@ impl Future for WaitIdle {
         }
         // Register/refresh this task's waker under the lock.
         {
-            let mut w = this.state.waiters.lock().unwrap();
+            let mut w = crate::lock_recover(&this.state.waiters);
             match this.key {
                 Some(k) => {
                     w.map.insert(k, cx.waker().clone());
