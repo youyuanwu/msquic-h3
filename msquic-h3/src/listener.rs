@@ -42,6 +42,55 @@ fn listener_ctx_channel() -> (ListenerCtxSender, ListenerCtxReceiver) {
     )
 }
 
+/// The single-outcome decision for a listener `NewConnection` event, factored
+/// out of the FFI callback so every branch is unit-testable without a forgeable
+/// `ConnectionRef`.
+///
+/// The listener double-close hazard lives entirely in *which* of these three
+/// outcomes runs; keeping the choice in a pure function lets tests assert it
+/// directly while [`listener_callback`] performs the matching ownership action.
+#[derive(Debug)]
+enum NewConnDecision {
+    /// `set_configuration` failed on the borrowed `ConnectionRef` *before* any
+    /// ownership was taken. The callback returns this `Status` so native
+    /// `listener.c` performs the single close; the reserved rundown guard is
+    /// released (never `from_raw`, never a Rust-side close).
+    ConfigFailedClose(Status),
+    /// Configuration succeeded and the owned connection was handed to the accept
+    /// frontend. The callback returns `Ok`.
+    DeliveredOwned,
+    /// Configuration succeeded and ownership was taken, but frontend delivery
+    /// failed (receiver lost). The owned `Connection` is dropped (a single
+    /// `ConnectionClose`) and the callback returns `Ok` — never close-then-reject
+    /// the same handle (which would trip native `listener.c`'s assert).
+    DeliveryFailedDropOwned,
+}
+
+/// Pure decision logic for the listener `NewConnection` event.
+///
+/// `config` is the result of `set_configuration` run through the *borrowed*
+/// `ConnectionRef`. Only when it succeeds is `deliver` invoked; that closure
+/// takes native ownership (`from_raw`), attaches, and attempts frontend
+/// delivery, returning `true` on delivery and `false` if the receiver was lost
+/// (dropping the now-owned connection). On a config failure `deliver` is never
+/// called, so no ownership is ever taken — and any rundown guard the closure
+/// captured is released when the un-invoked closure is dropped here.
+fn decide_new_connection(
+    config: Result<(), Status>,
+    deliver: impl FnOnce() -> bool,
+) -> NewConnDecision {
+    match config {
+        Err(e) => NewConnDecision::ConfigFailedClose(e),
+        Ok(()) => {
+            if deliver() {
+                NewConnDecision::DeliveredOwned
+            } else {
+                NewConnDecision::DeliveryFailedDropOwned
+            }
+        }
+    }
+}
+
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(skip(ctx, config, state), level = "trace", ret, err)
@@ -57,30 +106,44 @@ fn listener_callback(
             info: _,
             connection,
         } => {
-            let inner = unsafe { msquic::Connection::from_raw(connection.as_raw()) };
-            // The native handle already holds a registration rundown ref here;
-            // reserve our count immediately.
+            // `connection` is the borrowed `ConnectionRef`; the native handle
+            // already holds a registration rundown ref, so reserve our count now.
             let guard = RundownGuard::new(state.clone());
-            // set the config
-            if let Err(e) = inner.set_configuration(config) {
-                // Close the handle first (releases the rundown ref), then the
-                // guard decrements. This handle is discarded, so it gets a fresh
-                // terminal slot that no reader ever observes.
-                drop(crate::ConnHandle::new(
-                    inner,
-                    guard,
-                    crate::new_conn_terminal_slot(),
-                ));
-                return Err(e);
-            }
-            let conn = crate::Connection::attach(inner, guard);
-            if let Some(tx) = ctx.conn.as_ref() {
-                // Ownership was taken by `Connection::attach`; if delivery fails
-                // the returned `SendError` carries the owned `Connection`, which
-                // drops here and runs a single `ConnectionClose`. Return `Ok`
-                // (never `Err`) so the callback does not also reject an owned
-                // handle and trip native `listener.c`'s close-and-reject assert.
-                let _ = tx.unbounded_send(Some(conn));
+            // Validate/configure through the BORROWED ref, before taking
+            // ownership. `ConnectionRef` derefs to `Connection` and its `Drop`
+            // only nulls the handle — it never closes it.
+            let config = connection.set_configuration(config);
+            // The `deliver` closure runs (taking ownership) only if `config`
+            // succeeded. It captures `guard` by move: on the config-failure path
+            // it is dropped un-invoked, releasing the reserved rundown count with
+            // no `from_raw` and no Rust-side close — native `listener.c` performs
+            // the single close on our returned `Err`.
+            let decision = decide_new_connection(config, move || {
+                // `set_configuration` succeeded: only NOW take ownership.
+                let inner = unsafe { msquic::Connection::from_raw(connection.as_raw()) };
+                let conn = crate::Connection::attach(inner, guard);
+                match ctx.conn.as_ref() {
+                    Some(tx) => match tx.unbounded_send(Some(conn)) {
+                        Ok(()) => true,
+                        // Delivery failed after ownership: the `SendError`
+                        // carries the owned `Connection`, dropped here for a
+                        // single `ConnectionClose`.
+                        Err(send_err) => {
+                            drop(send_err.into_inner());
+                            false
+                        }
+                    },
+                    // No sender (listener frontend gone): drop the owned
+                    // `Connection` for a single close.
+                    None => {
+                        drop(conn);
+                        false
+                    }
+                }
+            });
+            match decision {
+                NewConnDecision::ConfigFailedClose(e) => return Err(e),
+                NewConnDecision::DeliveredOwned | NewConnDecision::DeliveryFailedDropOwned => {}
             }
         }
         ListenerEvent::StopComplete { .. } => {
@@ -373,5 +436,78 @@ mod test {
                 .await
                 .expect("wait_idle should resolve after the listener is dropped");
         });
+    }
+}
+
+/// Phase 5 listener connection failure-path unit tests. The real `NewConnection`
+/// callback is FFI-driven and a `ConnectionRef` cannot be forged hermetically,
+/// so the single-outcome decision is factored into [`decide_new_connection`] and
+/// asserted directly for all three branches: pre-ownership `set_configuration`
+/// failure (single close / `Err`), post-ownership delivery success (owned +
+/// `Ok`), and post-ownership delivery failure (owned dropped + `Ok`). The real
+/// success path is covered end-to-end by `basic_server_test`.
+#[cfg(test)]
+mod new_conn_decision {
+    use std::{cell::Cell, sync::Arc};
+
+    use msquic::{Status, StatusCode};
+
+    use super::{NewConnDecision, decide_new_connection};
+    use crate::registration::{RundownGuard, RundownState};
+
+    /// Pre-ownership `set_configuration` failure: the deliver closure (which is
+    /// the only thing that takes native ownership) never runs, the decision is
+    /// `ConfigFailedClose` carrying the status the callback returns as `Err` (so
+    /// native `listener.c` performs the single close), and the reserved rundown
+    /// guard captured by the un-invoked closure is released.
+    #[test]
+    fn config_failure_closes_once_without_taking_ownership() {
+        let state = Arc::new(RundownState::default());
+        let base = Arc::strong_count(&state);
+        let guard = RundownGuard::new(state.clone());
+        // Reserving a guard clones the shared `RundownState` Arc.
+        assert_eq!(Arc::strong_count(&state), base + 1);
+
+        let delivered = Cell::new(false);
+        let status = Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR);
+        let expected = status.try_as_status_code().ok();
+        let decision = decide_new_connection(Err(status), || {
+            // Would take ownership + deliver in production; must not run here.
+            delivered.set(true);
+            let _consumes_guard = guard;
+            true
+        });
+
+        match decision {
+            NewConnDecision::ConfigFailedClose(e) => {
+                assert_eq!(e.try_as_status_code().ok(), expected);
+            }
+            other => panic!("expected ConfigFailedClose, got {other:?}"),
+        }
+        assert!(
+            !delivered.get(),
+            "no ownership must be taken when set_configuration fails (single native close)"
+        );
+        // The un-invoked closure dropped the guard it captured, releasing the
+        // reserved rundown count back to the pre-reservation baseline.
+        assert_eq!(Arc::strong_count(&state), base);
+    }
+
+    /// Post-ownership delivery success: configuration passed and the owned
+    /// connection reached the frontend → `DeliveredOwned` (callback returns `Ok`).
+    #[test]
+    fn delivery_success_reports_delivered_owned() {
+        let decision = decide_new_connection(Ok(()), || true);
+        assert!(matches!(decision, NewConnDecision::DeliveredOwned));
+    }
+
+    /// Post-ownership delivery failure (receiver lost): configuration passed and
+    /// ownership was taken, but delivery failed → `DeliveryFailedDropOwned`. The
+    /// callback drops the owned connection (single close) and returns `Ok` —
+    /// never close-then-reject.
+    #[test]
+    fn delivery_failure_reports_drop_owned() {
+        let decision = decide_new_connection(Ok(()), || false);
+        assert!(matches!(decision, NewConnDecision::DeliveryFailedDropOwned));
     }
 }

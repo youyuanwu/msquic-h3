@@ -55,7 +55,10 @@ pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// [`lock_recover`] so an FFI callback never panics on a poisoned lock.
 pub(crate) type ConnTerminalSlot = Arc<Mutex<ConnTerminalState>>;
 
-/// Create a fresh, empty connection terminal-reason slot.
+/// Create a fresh, empty connection terminal-reason slot. Test-only helper for
+/// exercising the terminal slot directly (production builds the slot inline in
+/// [`conn_ctx_channel`]).
+#[cfg(test)]
 pub(crate) fn new_conn_terminal_slot() -> ConnTerminalSlot {
     Arc::new(Mutex::new(ConnTerminalState::default()))
 }
@@ -212,6 +215,15 @@ struct ConnCtxSender {
     uni: Option<mpsc::UnboundedSender<Option<crate::H3Stream>>>,
     /// Shared connection terminal-reason slot (writer side).
     terminal: ConnTerminalSlot,
+    /// Connection-scoped test seam that forces an accepted-stream ID resolution
+    /// to fail exactly once. Shares its atomic with
+    /// [`ConnCtxReceiver::accepted_id_failpoint`] (created once in
+    /// [`conn_ctx_channel`]) so a live [`Connection`] can arm it before an
+    /// accept; lives in the shared connection state rather than a
+    /// thread-local/process-global because msquic callbacks run on worker
+    /// threads and a connection can migrate between them.
+    #[cfg(test)]
+    accepted_id_failpoint: Arc<AcceptedIdFailpoint>,
 }
 
 /// front end receive.
@@ -223,6 +235,13 @@ struct ConnCtxReceiver {
     uni: mpsc::UnboundedReceiver<Option<crate::H3Stream>>,
     /// Shared connection terminal-reason slot (reader side).
     terminal: ConnTerminalSlot,
+    /// Reader/frontend handle to the connection-scoped accepted-ID failpoint.
+    /// Shares the same atomic as [`ConnCtxSender::accepted_id_failpoint`], so a
+    /// test holding a live [`Connection`] (which owns this receiver) can arm the
+    /// failpoint *before* a peer stream is accepted; the callback's
+    /// `PeerStreamStarted` path then reads it through the sender-side clone.
+    #[cfg(test)]
+    accepted_id_failpoint: Arc<AcceptedIdFailpoint>,
 }
 
 fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
@@ -231,6 +250,10 @@ fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
     let (bidi_tx, bidi_rx) = mpsc::unbounded();
     let (uni_tx, uni_rx) = mpsc::unbounded();
     let terminal: ConnTerminalSlot = Arc::new(Mutex::new(ConnTerminalState::default()));
+    // The accepted-ID failpoint atomic is shared (cloned) between the callback's
+    // sender and the frontend's receiver so a live `Connection` can arm it.
+    #[cfg(test)]
+    let accepted_id_failpoint: Arc<AcceptedIdFailpoint> = Arc::new(AcceptedIdFailpoint::default());
     (
         ConnCtxSender {
             connected: Some(conn_tx),
@@ -238,6 +261,8 @@ fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
             bidi: Some(bidi_tx),
             uni: Some(uni_tx),
             terminal: terminal.clone(),
+            #[cfg(test)]
+            accepted_id_failpoint: accepted_id_failpoint.clone(),
         },
         ConnCtxReceiver {
             connected: Some(conn_rx),
@@ -245,8 +270,116 @@ fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
             bidi: bidi_rx,
             uni: uni_rx,
             terminal,
+            #[cfg(test)]
+            accepted_id_failpoint,
         },
     )
+}
+
+/// Pure, unit-testable ID validation. MsQuic stream IDs are 62-bit so this
+/// never fails for a live peer, but the [`h3::quic::InvalidStreamId`] branch is
+/// still handled explicitly (a test seam and future callers can drive it).
+fn validate_stream_id(raw: u64) -> Result<h3::quic::StreamId, h3::quic::InvalidStreamId> {
+    h3::quic::StreamId::try_from(raw)
+}
+
+/// Non-freezing read of the connection terminal reason.
+///
+/// Unlike [`ConnTerminalState::observe`], this clones the recorded reason
+/// without marking the slot observed, so the stream-open path can consult the
+/// connection terminal without freezing it for the accept frontends.
+fn peek_conn_terminal(slot: &ConnTerminalSlot) -> Option<ConnectionTerminal> {
+    lock_recover(slot).terminal.clone()
+}
+
+/// Wake both accept frontends by dropping the incoming-stream senders.
+///
+/// Used only on the fail-fast accepted-stream attachment path: once the adapter
+/// has declared its own connection state invalid (an `Internal` terminal), it
+/// must stop handing new streams to h3 and unpark any parked acceptor so it
+/// observes the published terminal.
+fn wake_acceptors(ctx: &mut ConnCtxSender) {
+    ctx.uni.take();
+    ctx.bidi.take();
+}
+
+/// Resolve and validate a peer-accepted stream's h3 [`h3::quic::StreamId`]
+/// *before* native ownership is taken.
+///
+/// `query` produces the raw 62-bit ID from the still-borrowed `StreamRef`. On
+/// any failure this publishes an `Internal` connection terminal, wakes both
+/// acceptors, and returns the `Status` the callback must return so msquic closes
+/// the rejected stream itself — the adapter never takes Rust ownership, so it
+/// never double-closes. On success the caller is cleared to take ownership.
+fn accept_stream_id(
+    ctx: &mut ConnCtxSender,
+    query: impl FnOnce() -> Result<u64, Status>,
+) -> Result<h3::quic::StreamId, Status> {
+    let raw = match query() {
+        Ok(raw) => raw,
+        Err(status) => {
+            record_conn_terminal(
+                &ctx.terminal,
+                ConnectionTerminal::Internal("accepted stream ID query failed"),
+            );
+            wake_acceptors(ctx);
+            return Err(status);
+        }
+    };
+    match validate_stream_id(raw) {
+        Ok(id) => Ok(id),
+        Err(_) => {
+            record_conn_terminal(
+                &ctx.terminal,
+                ConnectionTerminal::Internal("accepted stream ID is invalid"),
+            );
+            wake_acceptors(ctx);
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR))
+        }
+    }
+}
+
+/// Connection-scoped test seam forcing exactly one accepted-stream ID
+/// resolution to fail. An atomic (not a thread-local) because the msquic
+/// callback runs on a worker thread; consuming itself atomically identifies the
+/// single rejected stream and stays correct under the parallel test harness.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct AcceptedIdFailpoint {
+    mode: std::sync::atomic::AtomicU8,
+}
+
+#[cfg(test)]
+impl AcceptedIdFailpoint {
+    const OFF: u8 = 0;
+    const QUERY_FAIL: u8 = 1;
+    const INVALID_ID: u8 = 2;
+
+    /// Arm the next accepted-stream attachment to fail its native ID query.
+    fn arm_query_fail(&self) {
+        self.mode
+            .store(Self::QUERY_FAIL, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Arm the next accepted-stream attachment to yield an invalid h3 ID.
+    fn arm_invalid_id(&self) {
+        self.mode
+            .store(Self::INVALID_ID, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Consume the armed mode atomically and transform the queried raw ID:
+    /// off → `Ok(raw)`, query-fail → `Err(status)`, invalid → an out-of-range
+    /// ID that fails [`validate_stream_id`].
+    fn maybe_override(&self, raw: u64) -> Result<u64, Status> {
+        match self
+            .mode
+            .swap(Self::OFF, std::sync::atomic::Ordering::Relaxed)
+        {
+            Self::QUERY_FAIL => Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            Self::INVALID_ID => Ok(u64::MAX),
+            _ => Ok(raw),
+        }
+    }
 }
 
 #[cfg_attr(
@@ -266,7 +399,10 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
             // Peer application close: record the exact HTTP/3 code. A peer close
             // has no lossless `Status`, so a pending connect waiter resolves as
             // `QUIC_STATUS_ABORTED` (the exact code stays in the terminal slot).
-            record_conn_terminal(&ctx.terminal, ConnectionTerminal::PeerApplication(error_code));
+            record_conn_terminal(
+                &ctx.terminal,
+                ConnectionTerminal::PeerApplication(error_code),
+            );
             if let Some(tx) = ctx.connected.take() {
                 let _ = tx.send(Err(Status::new(StatusCode::QUIC_STATUS_ABORTED)));
             }
@@ -275,25 +411,53 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
             // Transport shutdown: timeout statuses become `Timeout`, everything
             // else retains the status + wire code. Resolve a pending connect
             // waiter with the real transport `Status` (not a synthetic ABORTED).
-            record_conn_terminal(&ctx.terminal, classify_transport(status.clone(), error_code));
+            record_conn_terminal(
+                &ctx.terminal,
+                classify_transport(status.clone(), error_code),
+            );
             if let Some(tx) = ctx.connected.take() {
                 let _ = tx.send(Err(status));
             }
         }
         ConnectionEvent::PeerStreamStarted { stream, flags } => {
-            // TODO: need to set callback
-            let s = unsafe { msquic::Stream::from_raw(stream.as_raw()) };
-            if flags.contains(StreamOpenFlags::UNIDIRECTIONAL) {
-                if let Some(uni) = ctx.uni.as_ref() {
-                    // Ownership was taken by `H3Stream::attach`; if delivery
-                    // fails (frontend gone) the returned `SendError` carries the
-                    // owned `H3Stream`, which drops here and closes the native
-                    // stream exactly once.
-                    let _ = uni.unbounded_send(Some(crate::H3Stream::attach(s)));
-                }
-            } else if let Some(bidi) = ctx.bidi.as_ref() {
-                let _ = bidi.unbounded_send(Some(crate::H3Stream::attach(s)));
+            // Resolve and validate the stream ID against the still-BORROWED
+            // `StreamRef` (auto-deref to `Stream::get_stream_id`). No owning
+            // `Stream` is created until this succeeds, so a validation failure
+            // returns the `Status` for msquic to close the rejected stream —
+            // the adapter never took ownership, avoiding the reject-and-close
+            // double-close hazard in native `stream_set.c`.
+            #[cfg(test)]
+            let failpoint = ctx.accepted_id_failpoint.clone();
+            let query = || {
+                let raw = stream.get_stream_id()?;
+                #[cfg(test)]
+                let raw = failpoint.maybe_override(raw)?;
+                Ok(raw)
+            };
+            let id = match accept_stream_id(ctx, query) {
+                Ok(id) => id,
+                // Pre-ownership failure: `accept_stream_id` already published the
+                // internal terminal and woke the acceptors. Return the status so
+                // msquic closes the rejected stream itself (single close).
+                Err(status) => return Err(status),
+            };
+            // Success: only NOW take native ownership and attach.
+            let owned = unsafe { msquic::Stream::from_raw(stream.as_raw()) };
+            let h3 = crate::H3Stream::attach(owned, id);
+            let target = if flags.contains(StreamOpenFlags::UNIDIRECTIONAL) {
+                ctx.uni.as_ref()
+            } else {
+                ctx.bidi.as_ref()
+            };
+            if let Some(tx) = target {
+                // Post-ownership delivery failure: the returned `SendError`
+                // carries the owned `H3Stream`, which drops here and runs a
+                // single `StreamClose`. Do NOT return `Err` — combined with the
+                // close it would trip native `stream_set.c`'s reject assert.
+                let _ = tx.unbounded_send(Some(h3));
             }
+            // No target sender (fail-fast already dropped them): `h3` drops here
+            // and closes exactly once.
         }
         ConnectionEvent::ShutdownComplete { .. } => {
             // A bare shutdown with no more-specific reason published is a local
@@ -401,6 +565,32 @@ impl Connection {
     }
 }
 
+/// Test-only seam to arm the connection-scoped accepted-stream-ID failpoint from
+/// a *live* `Connection`. Because the atomic is stored in the shared connection
+/// state (cloned into both the callback's sender and this frontend's receiver),
+/// a Phase 8 loopback test holding the accepted `Connection` can arm the
+/// failpoint *before* the peer opens a stream; the real `PeerStreamStarted`
+/// accept path then trips on it, driving the native reject + connection
+/// `H3_INTERNAL_ERROR` close.
+#[cfg(test)]
+impl Connection {
+    /// Arm the next accepted-stream attachment to fail its native ID query.
+    pub(crate) fn arm_accepted_id_query_fail(&self) {
+        self.ctx.accepted_id_failpoint.arm_query_fail();
+    }
+
+    /// Arm the next accepted-stream attachment to yield an invalid h3 ID.
+    pub(crate) fn arm_accepted_id_invalid(&self) {
+        self.ctx.accepted_id_failpoint.arm_invalid_id();
+    }
+
+    /// Test-only view of the shared failpoint atomic — the same one the callback
+    /// consults on the accept path — so a test can prove arming took effect.
+    pub(crate) fn accepted_id_failpoint(&self) -> &Arc<AcceptedIdFailpoint> {
+        &self.ctx.accepted_id_failpoint
+    }
+}
+
 /// Fail-fast terminal check for the accept frontends.
 ///
 /// Returns the converted connection error only when an *internal* terminal has
@@ -446,8 +636,8 @@ impl ConnectionShutdownWaiter {
 #[derive(Debug)]
 pub struct StreamOpener {
     conn: Arc<ConnHandle>,
-    bidi_temp: Option<H3Stream>,
-    uni_temp: Option<H3Stream>,
+    bidi_temp: Option<OpeningStream>,
+    uni_temp: Option<OpeningStream>,
 }
 
 impl Clone for StreamOpener {
@@ -577,38 +767,107 @@ impl StreamOpener {
         }
     }
 
-    /// open a stream and poll it in the holder.
+    /// Open a native stream, then drive it to a fully-identified [`H3Stream`].
+    ///
+    /// Never panics: a connection-caused cancellation of the pending start maps
+    /// to a connection error, and a start cancelled with no published reason to
+    /// a nested internal error. The local stream ID is sourced from the
+    /// `StartComplete` outcome and validated before an `H3Stream` is built.
     fn poll_open_inner(
         conn: &Arc<ConnHandle>,
         uni: bool,
-        stream_holder: &mut Option<H3Stream>,
+        holder: &mut Option<OpeningStream>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<H3Stream, StreamErrorIncoming>> {
-        if stream_holder.is_none() {
-            // create new stream
-            let s = match H3Stream::open_and_start(conn, uni) {
-                Ok(s) => s,
-                Err(e) => {
-                    return std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(e.into())));
-                }
-            };
-            *stream_holder = Some(s);
+        use std::task::Poll;
+        // 1. Fail fast if the connection already published a terminal.
+        if let Some(reason) = peek_conn_terminal(conn.terminal()) {
+            *holder = None; // drop any in-flight OpeningStream
+            return Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: convert_conn(reason),
+            }));
         }
-
-        // poll stream start.
-        let res = {
-            let s = stream_holder.as_mut().unwrap();
-            let rx = s.send.sctx.start.as_mut().unwrap();
-            let p = Pin::new(rx);
-            ready!(std::future::Future::poll(p, cx))
+        // 2. Create + start the native stream if none is in flight.
+        if holder.is_none() {
+            match H3Stream::open_and_start(conn, uni) {
+                Ok(opening) => *holder = Some(opening),
+                Err(status) => {
+                    // A shutdown may have raced the open; prefer the terminal.
+                    return Poll::Ready(Err(match peek_conn_terminal(conn.terminal()) {
+                        Some(reason) => StreamErrorIncoming::ConnectionErrorIncoming {
+                            connection_error: convert_conn(reason),
+                        },
+                        None => StreamErrorIncoming::Unknown(status.into()),
+                    }));
+                }
+            }
+        }
+        // 3. Await StartComplete on the OpeningStream's `start` receiver.
+        let raw = {
+            let Some(opening) = holder.as_mut() else {
+                return Poll::Pending;
+            };
+            match Pin::new(&mut opening.start).poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(raw)) => raw, // Result<u64, Status> from StartComplete
+                Poll::Ready(Err(oneshot::Canceled)) => {
+                    // Sender dropped by ShutdownComplete without a StartComplete:
+                    // a connection-caused cancellation (never a panic).
+                    *holder = None;
+                    return Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                        connection_error: stream_open_conn_error(conn.terminal()),
+                    }));
+                }
+            }
         };
-        // current stream is either ready or error. So ready to be returned or dropped.
-        let s = stream_holder.take().unwrap();
-        let res = res
-            .expect("cannot receive")
-            .map(|_| s)
-            .map_err(|e| StreamErrorIncoming::Unknown(e.into()));
-        std::task::Poll::Ready(res)
+        // 4. StartComplete carried a status; classify it and finalize.
+        let Some(opening) = holder.take() else {
+            return Poll::Pending;
+        };
+        Poll::Ready(match classify_start_outcome(raw, conn.terminal()) {
+            Ok(id) => Ok(opening.finalize(id)),
+            Err(e) => Err(e),
+        })
+    }
+}
+
+/// Connection error for a stream-open whose start channel was cancelled.
+///
+/// A published connection terminal is the true cause; a cancellation with no
+/// recorded reason is a defined internal error, never a synthetic peer code.
+fn stream_open_conn_error(slot: &ConnTerminalSlot) -> ConnectionErrorIncoming {
+    match peek_conn_terminal(slot) {
+        Some(reason) => convert_conn(reason),
+        None => ConnectionErrorIncoming::InternalError(
+            "stream start cancelled without a terminal reason".to_string(),
+        ),
+    }
+}
+
+/// Classify a `StartComplete` outcome into a validated local [`h3::quic::StreamId`]
+/// or a stream error.
+///
+/// A failed start prefers a published connection terminal, else surfaces the raw
+/// `Status` as `Unknown`. A successful start validates the ID; an out-of-range
+/// ID is an adapter-internal fault (never `Unknown`).
+fn classify_start_outcome(
+    raw: Result<u64, Status>,
+    slot: &ConnTerminalSlot,
+) -> Result<h3::quic::StreamId, StreamErrorIncoming> {
+    match raw {
+        Err(status) => Err(match peek_conn_terminal(slot) {
+            Some(reason) => StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: convert_conn(reason),
+            },
+            None => StreamErrorIncoming::Unknown(status.into()),
+        }),
+        Ok(raw_id) => {
+            validate_stream_id(raw_id).map_err(|_| StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::InternalError(
+                    "local stream ID is invalid".to_string(),
+                ),
+            })
+        }
     }
 }
 
@@ -678,7 +937,7 @@ enum ReceiveEvent {
 }
 
 struct StreamSendCtx {
-    start: Option<oneshot::Sender<Result<(), Status>>>,
+    start: Option<oneshot::Sender<Result<u64, Status>>>,
     // cancelled, client_context
     send: Option<mpsc::UnboundedSender<(bool, BufPtr)>>,
     shutdown: Option<oneshot::Sender<()>>,
@@ -693,6 +952,11 @@ struct StreamSendCtx {
 /// ctx for receiving data on frontend.
 #[derive(Debug)]
 struct RecvStreamReceiveCtx {
+    /// Cached, validated stream identity. Resolved before an `H3RecvStream` is
+    /// exposed (from `StartComplete` for local streams, from the borrowed
+    /// `get_stream_id` query for accepted streams), so `recv_id` never queries a
+    /// native parameter and cannot panic after shutdown.
+    id: h3::quic::StreamId,
     receive: mpsc::UnboundedReceiver<ReceiveEvent>,
     /// Sticky receive terminal. Once a terminal event has been drained it is
     /// stored here and every later `poll_data` returns the same class without
@@ -707,15 +971,95 @@ struct RecvStreamReceiveCtx {
 /// ctx for sending data on frontend.
 #[derive(Debug)]
 struct SendStreamReceiveCtx {
-    start: Option<oneshot::Receiver<Result<(), Status>>>,
+    /// Cached, validated stream identity (see [`RecvStreamReceiveCtx::id`]); read
+    /// by `send_id` without a native query.
+    id: h3::quic::StreamId,
     // cancelled, client_context
     send: mpsc::UnboundedReceiver<(bool, BufPtr)>,
     send_inprogress: bool,
     shutdown: oneshot::Receiver<()>,
 }
 
-fn stream_ctx_channel() -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamReceiveCtx) {
-    let (start_tx, start_rx) = oneshot::channel::<Result<(), Status>>();
+/// Frontend *receiver* ends held by an [`OpeningStream`] until the stream ID is
+/// known. The matching *sender* halves live in the callback-owned
+/// [`StreamSendCtx`]; holding these keeps every channel open (so callback sends
+/// never fail) and lets `finalize` move them into the [`H3Stream`] halves.
+#[derive(Debug)]
+struct PreIdReceivers {
+    start: oneshot::Receiver<Result<u64, Status>>,
+    send: mpsc::UnboundedReceiver<(bool, BufPtr)>,
+    shutdown: oneshot::Receiver<()>,
+    receive: mpsc::UnboundedReceiver<ReceiveEvent>,
+}
+
+/// A locally opened stream whose native handle is started but whose h3
+/// [`h3::quic::StreamId`] is not yet known. Private to [`StreamOpener`]; the
+/// only stream form allowed to exist without a cached ID. On a successful
+/// `StartComplete` it is consumed into an [`H3Stream`] with concrete ID fields
+/// in both halves.
+#[derive(Debug)]
+struct OpeningStream {
+    stream: Arc<msquic::Stream>,
+    /// Pending-start receiver, polled by `poll_open_inner` until `StartComplete`.
+    start: oneshot::Receiver<Result<u64, Status>>,
+    /// The remaining receiver ends, moved into the `H3Stream` halves by
+    /// `finalize` once the ID is validated.
+    tail: PreIdTail,
+}
+
+/// The non-start receiver ends of an [`OpeningStream`] (kept apart so `start` can
+/// be polled independently while these wait for `finalize`).
+#[derive(Debug)]
+struct PreIdTail {
+    send: mpsc::UnboundedReceiver<(bool, BufPtr)>,
+    shutdown: oneshot::Receiver<()>,
+    receive: mpsc::UnboundedReceiver<ReceiveEvent>,
+}
+
+impl OpeningStream {
+    /// Consume into an [`H3Stream`] once `StartComplete` has yielded a validated
+    /// ID. The `start` receiver has already been driven to completion and is
+    /// dropped here; the remaining three receivers move into the two halves.
+    fn finalize(self, id: h3::quic::StreamId) -> H3Stream {
+        let OpeningStream {
+            stream,
+            start: _,
+            tail,
+        } = self;
+        let PreIdTail {
+            send,
+            shutdown,
+            receive,
+        } = tail;
+        H3Stream {
+            send: H3SendStream {
+                stream: stream.clone(),
+                sctx: SendStreamReceiveCtx {
+                    id,
+                    send,
+                    send_inprogress: false,
+                    shutdown,
+                },
+            },
+            recv: H3RecvStream {
+                stream,
+                rctx: RecvStreamReceiveCtx {
+                    id,
+                    receive,
+                    terminal: None,
+                    receive_closed: false,
+                },
+            },
+        }
+    }
+}
+
+/// Pre-ID variant of the stream channel builder: no [`h3::quic::StreamId`] is
+/// required or produced. Builds the callback-owned [`StreamSendCtx`] (senders)
+/// and returns the matching receiver ends bundled, so an [`OpeningStream`] can
+/// hold them until `StartComplete` yields the ID.
+fn stream_ctx_channel_pre_id() -> (StreamSendCtx, PreIdReceivers) {
+    let (start_tx, start_rx) = oneshot::channel::<Result<u64, Status>>();
     let (send_tx, send_rx) = mpsc::unbounded();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (receive_tx, receive_rx) = mpsc::unbounded();
@@ -727,14 +1071,40 @@ fn stream_ctx_channel() -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamRecei
             receive: Some(receive_tx),
             receive_terminal_sent: false,
         },
-        SendStreamReceiveCtx {
-            start: Some(start_rx),
+        PreIdReceivers {
+            start: start_rx,
             send: send_rx,
-            send_inprogress: false,
             shutdown: shutdown_rx,
+            receive: receive_rx,
+        },
+    )
+}
+
+/// ID-bearing stream channel builder used where the identity is already known
+/// (accepted streams and tests). Splits the pre-ID receivers into the two
+/// frontend halves' ctxs directly.
+#[cfg(test)]
+fn stream_ctx_channel(
+    id: h3::quic::StreamId,
+) -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamReceiveCtx) {
+    let (ctx, recv) = stream_ctx_channel_pre_id();
+    let PreIdReceivers {
+        start: _,
+        send,
+        shutdown,
+        receive,
+    } = recv;
+    (
+        ctx,
+        SendStreamReceiveCtx {
+            id,
+            send,
+            send_inprogress: false,
+            shutdown,
         },
         RecvStreamReceiveCtx {
-            receive: receive_rx,
+            id,
+            receive,
             terminal: None,
             receive_closed: false,
         },
@@ -747,11 +1117,12 @@ fn stream_ctx_channel() -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamRecei
 )]
 fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Status> {
     match ev {
-        StreamEvent::StartComplete { status, .. } => {
+        StreamEvent::StartComplete { status, id, .. } => {
             // Duplicate `StartComplete` (slot already taken) or a dropped
-            // `OpeningStream` receiver is a safe no-op.
+            // `OpeningStream` receiver is a safe no-op. The `id: u62` outcome is
+            // the local stream's identity source (validated by poll_open_inner).
             if let Some(tx) = ctx.start.take() {
-                let result = if status.is_ok() { Ok(()) } else { Err(status) };
+                let result = if status.is_ok() { Ok(id) } else { Err(status) };
                 let _ = tx.send(result);
             }
         }
@@ -860,31 +1231,36 @@ fn publish_recv_terminal(ctx: &mut StreamSendCtx, ev: ReceiveEvent) {
 }
 
 impl H3Stream {
-    /// attach to accepted stream
-    pub(crate) fn attach(stream: msquic::Stream) -> Self {
-        let (mut ctx, rtx, rrtx) = stream_ctx_channel();
+    /// Attach to a peer-accepted stream whose identity was already validated
+    /// from the borrowed `StreamRef` (see [`accept_stream_id`]). Takes native
+    /// ownership of `stream` (the caller must have confirmed success first).
+    pub(crate) fn attach(stream: msquic::Stream, id: h3::quic::StreamId) -> Self {
+        let (mut ctx, recv) = stream_ctx_channel_pre_id();
         let handler = move |_: StreamRef, ev: StreamEvent| stream_callback(&mut ctx, ev);
-
         stream.set_callback_handler(handler);
-        let s = Arc::new(stream);
-        Self {
-            send: H3SendStream {
-                stream: s.clone(),
-                sctx: rtx,
-            },
-            recv: H3RecvStream {
-                stream: s,
-                rctx: rrtx,
+        // The ID is known, so finalize straight away. An accepted stream never
+        // receives `StartComplete`, so its `start` receiver simply drops.
+        OpeningStream {
+            stream: Arc::new(stream),
+            start: recv.start,
+            tail: PreIdTail {
+                send: recv.send,
+                shutdown: recv.shutdown,
+                receive: recv.receive,
             },
         }
+        .finalize(id)
     }
 
+    /// Open + start a native stream, returning the pre-ID [`OpeningStream`]. The
+    /// h3 identity is not known yet; it arrives later via `StartComplete` and is
+    /// resolved by [`StreamOpener::poll_open_inner`].
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, level = "trace", err, ret)
     )]
-    fn open_and_start(conn: &msquic::Connection, uni: bool) -> Result<Self, Status> {
-        let (mut ctx, rtx, rrtx) = stream_ctx_channel();
+    fn open_and_start(conn: &msquic::Connection, uni: bool) -> Result<OpeningStream, Status> {
+        let (mut ctx, recv) = stream_ctx_channel_pre_id();
         let handler = move |_: StreamRef, ev: StreamEvent| stream_callback(&mut ctx, ev);
 
         let flag = match uni {
@@ -893,16 +1269,14 @@ impl H3Stream {
         };
 
         let s = msquic::Stream::open(conn, flag, handler)?;
-        s.start(StreamStartFlags::NONE)?;
-        let s = Arc::new(s);
-        Ok(Self {
-            send: H3SendStream {
-                stream: s.clone(),
-                sctx: rtx,
-            },
-            recv: H3RecvStream {
-                stream: s,
-                rctx: rrtx,
+        s.start(StreamStartFlags::NONE)?; // id arrives later via StartComplete
+        Ok(OpeningStream {
+            stream: Arc::new(s),
+            start: recv.start,
+            tail: PreIdTail {
+                send: recv.send,
+                shutdown: recv.shutdown,
+                receive: recv.receive,
             },
         })
     }
@@ -999,16 +1373,9 @@ impl<B: Buf> SendStream<B> for H3SendStream {
     }
 
     fn send_id(&self) -> h3::quic::StreamId {
-        get_id(&self.stream)
+        // Cached at construction; no native query, so this never panics.
+        self.sctx.id
     }
-}
-
-fn get_id(s: &msquic::Stream) -> h3::quic::StreamId {
-    let raw_id = unsafe {
-        msquic::Api::get_param_auto::<u64>(s.as_raw(), msquic::ffi::QUIC_PARAM_STREAM_ID)
-    }
-    .unwrap();
-    raw_id.try_into().expect("cannot parse id")
 }
 
 impl RecvStreamReceiveCtx {
@@ -1102,7 +1469,8 @@ impl RecvStream for H3RecvStream {
     }
 
     fn recv_id(&self) -> h3::quic::StreamId {
-        get_id(&self.stream)
+        // Cached at construction; no native query, so this never panics.
+        self.rctx.id
     }
 }
 
@@ -1415,7 +1783,7 @@ mod callback_safety {
 
     #[test]
     fn stream_callback_send_complete_with_dropped_receiver_is_noop() {
-        let (mut ctx, srx, rrx) = stream_ctx_channel();
+        let (mut ctx, srx, rrx) = stream_ctx_channel(4u64.try_into().unwrap());
         // Frontend gone: drop the receive side of the send-complete channel.
         drop(srx);
         drop(rrx);
@@ -1458,7 +1826,7 @@ mod connection_terminal {
     use crate::error::ConnectionTerminal;
     use crate::msquic::{ConnectionEvent, Status, StatusCode};
     use crate::{
-        ConnTerminalState, ConnCtxReceiver, classify_transport, conn_ctx_channel,
+        ConnCtxReceiver, ConnTerminalState, classify_transport, conn_ctx_channel,
         connection_callback, fail_fast_terminal, new_conn_terminal_slot, observe_terminal,
         record_conn_terminal,
     };
@@ -1475,7 +1843,10 @@ mod connection_terminal {
     fn peer_application_close_maps_to_application_close_with_code() {
         let err = map_event(ConnectionEvent::ShutdownInitiatedByPeer { error_code: 42 });
         assert!(
-            matches!(err, ConnectionErrorIncoming::ApplicationClose { error_code: 42 }),
+            matches!(
+                err,
+                ConnectionErrorIncoming::ApplicationClose { error_code: 42 }
+            ),
             "expected ApplicationClose(42), got {err:?}"
         );
     }
@@ -1590,9 +1961,10 @@ mod connection_terminal {
     fn connected_waiter_resolves_on_peer_shutdown_before_connected() {
         let (mut ctx, mut crx) = conn_ctx_channel();
         assert!(
-            connection_callback(&mut ctx, ConnectionEvent::ShutdownInitiatedByPeer {
-                error_code: 9
-            })
+            connection_callback(
+                &mut ctx,
+                ConnectionEvent::ShutdownInitiatedByPeer { error_code: 9 }
+            )
             .is_ok()
         );
         // Peer close has no lossless status; the waiter resolves (no hang) as
@@ -1612,11 +1984,14 @@ mod connection_terminal {
     fn connected_waiter_resolves_on_bare_shutdown_complete() {
         let (mut ctx, mut crx) = conn_ctx_channel();
         assert!(
-            connection_callback(&mut ctx, ConnectionEvent::ShutdownComplete {
-                handshake_completed: false,
-                peer_acknowledged_shutdown: false,
-                app_close_in_progress: false,
-            })
+            connection_callback(
+                &mut ctx,
+                ConnectionEvent::ShutdownComplete {
+                    handshake_completed: false,
+                    peer_acknowledged_shutdown: false,
+                    app_close_in_progress: false,
+                }
+            )
             .is_ok()
         );
         let err = connect_result(&mut crx).expect_err("bare shutdown resolves as Err");
@@ -1723,9 +2098,10 @@ mod connection_terminal {
         let (mut ctx, crx) = conn_ctx_channel();
         record_conn_terminal(&ctx.terminal, ConnectionTerminal::LocalClose);
         assert!(
-            connection_callback(&mut ctx, ConnectionEvent::ShutdownInitiatedByPeer {
-                error_code: 11
-            })
+            connection_callback(
+                &mut ctx,
+                ConnectionEvent::ShutdownInitiatedByPeer { error_code: 11 }
+            )
             .is_ok()
         );
         assert!(matches!(
@@ -1777,7 +2153,7 @@ mod receive_events {
 
     #[test]
     fn graceful_fin_yields_data_then_clean_eof() {
-        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel(4u64.try_into().unwrap());
         feed_receive(&mut ctx, &[1, 2, 3], ReceiveFlags::FIN);
         // Data first.
         match poll(&mut rrx) {
@@ -1792,7 +2168,7 @@ mod receive_events {
 
     #[test]
     fn peer_reset_yields_stream_terminated_with_code() {
-        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel(4u64.try_into().unwrap());
         assert!(stream_callback(&mut ctx, StreamEvent::PeerSendAborted { error_code: 42 }).is_ok());
         match poll(&mut rrx) {
             Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
@@ -1806,11 +2182,11 @@ mod receive_events {
     fn graceful_fin_and_peer_reset_are_observably_different() {
         // FIN => Ok(None); RESET_STREAM => Err(StreamTerminated). The two paths
         // must not be conflated (Finding 1).
-        let (mut fin_ctx, _s1, mut fin_rrx) = stream_ctx_channel();
+        let (mut fin_ctx, _s1, mut fin_rrx) = stream_ctx_channel(4u64.try_into().unwrap());
         feed_receive(&mut fin_ctx, &[], ReceiveFlags::FIN);
         let fin = poll(&mut fin_rrx);
 
-        let (mut rst_ctx, _s2, mut rst_rrx) = stream_ctx_channel();
+        let (mut rst_ctx, _s2, mut rst_rrx) = stream_ctx_channel(4u64.try_into().unwrap());
         assert!(
             stream_callback(&mut rst_ctx, StreamEvent::PeerSendAborted { error_code: 7 }).is_ok()
         );
@@ -1825,7 +2201,7 @@ mod receive_events {
 
     #[test]
     fn empty_non_fin_receive_produces_no_event() {
-        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel(4u64.try_into().unwrap());
         // A zero-length, non-FIN notification is not an end-of-stream (Finding 8).
         feed_receive(&mut ctx, &[], ReceiveFlags::NONE);
         // No event was enqueued and the channel is still open: Pending.
@@ -1836,7 +2212,7 @@ mod receive_events {
 
     #[test]
     fn peer_send_shutdown_yields_clean_eof() {
-        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel(4u64.try_into().unwrap());
         assert!(stream_callback(&mut ctx, StreamEvent::PeerSendShutdown).is_ok());
         assert!(matches!(poll(&mut rrx), Poll::Ready(Ok(None))));
     }
@@ -1846,7 +2222,7 @@ mod receive_events {
         // The usual `Receive{FIN}` then `PeerSendShutdown` sequence must yield a
         // single clean EOF, not a duplicate. Likewise a reset published first is
         // not overwritten by a later FIN.
-        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel(4u64.try_into().unwrap());
         assert!(stream_callback(&mut ctx, StreamEvent::PeerSendAborted { error_code: 9 }).is_ok());
         // A later graceful FIN must NOT override the earlier reset.
         assert!(stream_callback(&mut ctx, StreamEvent::PeerSendShutdown).is_ok());
@@ -1865,7 +2241,7 @@ mod receive_events {
     fn connection_shutdown_surfaces_connection_error() {
         // A peer application close (by_app && closed_remotely) delivered as a
         // connection-caused stream shutdown surfaces the connection error.
-        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel(4u64.try_into().unwrap());
         let ev = StreamEvent::ShutdownComplete {
             connection_shutdown: true,
             app_close_in_progress: false,
@@ -1888,7 +2264,7 @@ mod receive_events {
         // A stream-local `ShutdownComplete` (connection_shutdown == false) must
         // NOT surface a connection error. The channel closes with no terminal
         // event, which maps to the internal fault class.
-        let (mut ctx, _srx, mut rrx) = stream_ctx_channel();
+        let (mut ctx, _srx, mut rrx) = stream_ctx_channel(4u64.try_into().unwrap());
         let ev = StreamEvent::ShutdownComplete {
             connection_shutdown: false,
             app_close_in_progress: false,
@@ -1916,12 +2292,289 @@ mod receive_events {
         // stop_sending local-EOF behavior without needing a live FFI stream.
         // `stop_sending` separately submits `ABORT_RECEIVE` with the clamped
         // application code; that FFI effect is exercised by the loopback tests.
-        let (_ctx, _srx, mut rrx) = stream_ctx_channel();
+        let (_ctx, _srx, mut rrx) = stream_ctx_channel(4u64.try_into().unwrap());
         assert!(!rrx.receive_closed);
         rrx.close_receive_locally(); // the exact call RecvStream::stop_sending makes
         assert!(matches!(poll(&mut rrx), Poll::Ready(Ok(None))));
         // No terminal was injected: the sticky recv terminal slot stays empty.
         assert!(rrx.terminal.is_none());
         assert!(rrx.receive_closed);
+    }
+}
+
+/// Phase 5 (safe stream open & identity) unit tests: prove the pure stream-ID
+/// validation, the accepted-stream borrow-before-own resolution (with its
+/// connection-scoped failpoint seam), and the non-panicking classification of a
+/// local stream's `StartComplete` outcome (including connection-caused
+/// cancellation). Hermetic (no network): a live peer stream always has a valid
+/// 62-bit ID and a real `StreamRef` cannot be forged, so the resolution logic is
+/// exercised through its factored, testable seams. The real success path is
+/// covered end-to-end by the loopback `basic_server_test`.
+#[cfg(test)]
+mod stream_open_identity {
+    use futures::channel::oneshot;
+    use h3::quic::{ConnectionErrorIncoming, StreamErrorIncoming};
+
+    use crate::error::ConnectionTerminal;
+    use crate::msquic::{Status, StatusCode};
+    use crate::{
+        accept_stream_id, classify_start_outcome, conn_ctx_channel, fail_fast_terminal,
+        new_conn_terminal_slot, record_conn_terminal, stream_ctx_channel_pre_id,
+        stream_open_conn_error, validate_stream_id,
+    };
+
+    /// The largest valid QUIC stream ID (62-bit VarInt max).
+    const MAX_VALID_ID: u64 = (1 << 62) - 1;
+
+    #[test]
+    fn validate_stream_id_boundaries() {
+        // 0 and the 62-bit maximum are valid; anything larger is rejected.
+        assert_eq!(validate_stream_id(0).unwrap().into_inner(), 0);
+        assert_eq!(
+            validate_stream_id(MAX_VALID_ID).unwrap().into_inner(),
+            MAX_VALID_ID
+        );
+        assert!(validate_stream_id(MAX_VALID_ID + 1).is_err());
+        assert!(validate_stream_id(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn accept_stream_id_success_takes_no_terminal() {
+        let (mut ctx, crx) = conn_ctx_channel();
+        let id = accept_stream_id(&mut ctx, || Ok(8)).expect("valid id accepted");
+        assert_eq!(id.into_inner(), 8);
+        // No terminal published; both acceptor senders remain open.
+        assert!(fail_fast_terminal(&crx.terminal).is_none());
+        assert!(ctx.uni.is_some() && ctx.bidi.is_some());
+    }
+
+    #[test]
+    fn accept_stream_id_query_failure_publishes_internal_and_wakes_acceptors() {
+        let (mut ctx, crx) = conn_ctx_channel();
+        let status = Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR);
+        // A native get_stream_id failure returns its Status from the callback...
+        let err = accept_stream_id(&mut ctx, || Err(status.clone())).expect_err("query failed");
+        assert_eq!(
+            err.try_as_status_code().ok(),
+            status.try_as_status_code().ok()
+        );
+        // ...publishes a fail-fast internal terminal the acceptors observe...
+        match fail_fast_terminal(&crx.terminal) {
+            Some(ConnectionErrorIncoming::InternalError(_)) => {}
+            other => panic!("expected fail-fast InternalError, got {other:?}"),
+        }
+        // ...and drops both acceptor senders so parked acceptors are woken.
+        assert!(ctx.uni.is_none() && ctx.bidi.is_none());
+    }
+
+    #[test]
+    fn accept_stream_id_invalid_id_publishes_internal_and_returns_internal_status() {
+        let (mut ctx, crx) = conn_ctx_channel();
+        // A (synthetic) out-of-range ID fails h3 validation: internal terminal,
+        // QUIC_STATUS_INTERNAL_ERROR returned so msquic closes the stream.
+        let err = accept_stream_id(&mut ctx, || Ok(u64::MAX)).expect_err("invalid id rejected");
+        assert_eq!(
+            err.try_as_status_code().ok(),
+            Some(StatusCode::QUIC_STATUS_INTERNAL_ERROR)
+        );
+        assert!(matches!(
+            fail_fast_terminal(&crx.terminal),
+            Some(ConnectionErrorIncoming::InternalError(_))
+        ));
+        assert!(ctx.uni.is_none() && ctx.bidi.is_none());
+    }
+
+    #[test]
+    fn already_published_peer_terminal_wins_over_internal() {
+        // An accepted-stream failure records Internal, but a peer application
+        // close published first is preserved (first-writer-wins).
+        let (mut ctx, crx) = conn_ctx_channel();
+        record_conn_terminal(&ctx.terminal, ConnectionTerminal::PeerApplication(7));
+        let _ = accept_stream_id(&mut ctx, || Ok(u64::MAX)).expect_err("invalid id rejected");
+        // The winning terminal is the earlier peer close, not the internal fault.
+        assert!(matches!(
+            crate::observe_terminal(&crx.terminal),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 7 }
+        ));
+    }
+
+    #[test]
+    fn accepted_id_failpoint_query_fail_seam_rejects_then_consumes() {
+        // Drive the exact seam the callback uses, but arm it through the
+        // RECEIVER-side handle a live `Connection` frontend holds — proving the
+        // failpoint atomic is shared with the callback's sender-side clone.
+        let (mut ctx, crx) = conn_ctx_channel();
+        crx.accepted_id_failpoint.arm_query_fail();
+        // The callback consults its own (shared) sender-side handle.
+        let fp = ctx.accepted_id_failpoint.clone();
+        let err = accept_stream_id(&mut ctx, || fp.maybe_override(4)).expect_err("seam trips once");
+        assert_eq!(
+            err.try_as_status_code().ok(),
+            Some(StatusCode::QUIC_STATUS_INTERNAL_ERROR)
+        );
+        assert!(matches!(
+            fail_fast_terminal(&crx.terminal),
+            Some(ConnectionErrorIncoming::InternalError(_))
+        ));
+        // The failpoint consumed itself: a fresh query now passes through.
+        let fp2 = crx.accepted_id_failpoint.clone();
+        assert_eq!(fp2.maybe_override(4).unwrap(), 4);
+    }
+
+    #[test]
+    fn accepted_id_failpoint_invalid_seam_rejects() {
+        let (mut ctx, crx) = conn_ctx_channel();
+        // Arm through the receiver-side (frontend) handle; read via the sender.
+        crx.accepted_id_failpoint.arm_invalid_id();
+        let fp = ctx.accepted_id_failpoint.clone();
+        // The seam yields an out-of-range ID, which fails validation downstream.
+        let err = accept_stream_id(&mut ctx, || fp.maybe_override(4)).expect_err("invalid seam");
+        assert_eq!(
+            err.try_as_status_code().ok(),
+            Some(StatusCode::QUIC_STATUS_INTERNAL_ERROR)
+        );
+        assert!(matches!(
+            fail_fast_terminal(&crx.terminal),
+            Some(ConnectionErrorIncoming::InternalError(_))
+        ));
+    }
+
+    #[test]
+    fn classify_start_outcome_valid_id() {
+        let slot = new_conn_terminal_slot();
+        let id = classify_start_outcome(Ok(12), &slot).expect("valid local id");
+        assert_eq!(id.into_inner(), 12);
+    }
+
+    #[test]
+    fn classify_start_outcome_invalid_local_id_is_internal() {
+        let slot = new_conn_terminal_slot();
+        match classify_start_outcome(Ok(u64::MAX), &slot) {
+            Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::InternalError(msg),
+            }) => assert!(msg.contains("local stream ID is invalid"), "msg: {msg}"),
+            other => panic!("expected nested InternalError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_start_outcome_failed_start_without_terminal_is_unknown() {
+        let slot = new_conn_terminal_slot();
+        let status = Status::new(StatusCode::QUIC_STATUS_ABORTED);
+        match classify_start_outcome(Err(status), &slot) {
+            Err(StreamErrorIncoming::Unknown(_)) => {}
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_start_outcome_failed_start_with_terminal_is_connection_error() {
+        let slot = new_conn_terminal_slot();
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(5));
+        let status = Status::new(StatusCode::QUIC_STATUS_ABORTED);
+        match classify_start_outcome(Err(status), &slot) {
+            Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code: 5 },
+            }) => {}
+            other => panic!("expected connection ApplicationClose(5), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_open_conn_error_without_reason_is_internal() {
+        let slot = new_conn_terminal_slot();
+        match stream_open_conn_error(&slot) {
+            ConnectionErrorIncoming::InternalError(msg) => {
+                assert!(
+                    msg.contains("cancelled without a terminal reason"),
+                    "msg: {msg}"
+                );
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_open_conn_error_with_reason_converts_terminal() {
+        let slot = new_conn_terminal_slot();
+        record_conn_terminal(&slot, ConnectionTerminal::Timeout);
+        assert!(matches!(
+            stream_open_conn_error(&slot),
+            ConnectionErrorIncoming::Timeout
+        ));
+    }
+
+    #[test]
+    fn start_cancellation_is_detected_without_panic() {
+        // Simulate ShutdownComplete dropping the start sender (StreamSendCtx)
+        // before StartComplete: the OpeningStream's start receiver resolves as
+        // Canceled, which poll_open_inner maps to a connection error (never a
+        // panic). Here we assert the Canceled detection + the mapping helper.
+        let (ctx, mut recv) = stream_ctx_channel_pre_id();
+        drop(ctx); // drops the start sender -> cancellation
+        match recv.start.try_recv() {
+            Err(oneshot::Canceled) => {}
+            other => panic!("expected Canceled after sender drop, got {other:?}"),
+        }
+        // Cancelled with no published reason -> internal error.
+        let slot = new_conn_terminal_slot();
+        assert!(matches!(
+            stream_open_conn_error(&slot),
+            ConnectionErrorIncoming::InternalError(_)
+        ));
+        // Cancelled by a connection close -> connection error.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(3));
+        assert!(matches!(
+            stream_open_conn_error(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 3 }
+        ));
+    }
+
+    /// The accepted-ID failpoint must be arm-able from a *live* `Connection`
+    /// (what a Phase 8 loopback test holds) before any peer stream is accepted.
+    /// A real, unstarted connection is opened (no network) and armed through the
+    /// frontend `Connection`; the shared atomic the callback's accept path reads
+    /// then trips exactly once — proving the seam is reachable end-to-end.
+    #[test]
+    fn live_connection_arms_accepted_id_failpoint() {
+        use crate::msquic::{ConnectionEvent, ConnectionRef, RegistrationConfig};
+        use crate::registration::RundownGuard;
+
+        let reg = crate::Registration::new(&RegistrationConfig::default()).unwrap();
+        // Open a real (unstarted) native connection, then attach the frontend —
+        // exactly the ownership the listener's accept path produces.
+        let inner =
+            crate::msquic::Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| {
+                Ok(())
+            })
+            .unwrap();
+        let guard = RundownGuard::new(reg.state().clone());
+        let conn = crate::Connection::attach(inner, guard);
+
+        // Arm query-fail through the live `Connection`; the shared atomic the
+        // accept path consults trips once then consumes itself.
+        conn.arm_accepted_id_query_fail();
+        assert!(
+            conn.accepted_id_failpoint().maybe_override(4).is_err(),
+            "armed query-fail must trip on the next accepted stream"
+        );
+        assert_eq!(
+            conn.accepted_id_failpoint().maybe_override(4).unwrap(),
+            4,
+            "failpoint consumes itself after one trip"
+        );
+
+        // Arm invalid-id through the live `Connection`; the seam yields an
+        // out-of-range ID that fails downstream validation.
+        conn.arm_accepted_id_invalid();
+        assert_eq!(
+            conn.accepted_id_failpoint().maybe_override(4).unwrap(),
+            u64::MAX,
+            "armed invalid-id must yield an out-of-range ID"
+        );
+
+        // Close the connection (single native ConnectionClose) before the
+        // registration is dropped.
+        drop(conn);
     }
 }
