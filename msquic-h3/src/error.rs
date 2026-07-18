@@ -24,9 +24,8 @@ use crate::msquic::Status;
 pub const MAX_QUIC_VARINT: u64 = (1 << 62) - 1;
 
 /// Maximum single `send_data` payload the adapter will accept before rejecting
-/// with [`OversizedSend`]. Provisional value (16 MiB); the enforcement site is
-/// wired in Phase 6.
-#[allow(dead_code)] // referenced by OversizedSend Display; enforced in Phase 6
+/// with [`OversizedSend`]. Provisional value (16 MiB); enforced by the send-length
+/// classification in [`crate::buffer`] and the `send_data` rejection site.
 pub const MAX_ADAPTER_SEND: u64 = 16 * 1024 * 1024;
 
 /// Clamp an outgoing application error code to the QUIC 62-bit varint maximum.
@@ -47,10 +46,9 @@ pub(crate) fn clamp_application_code(code: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// A `send_data` payload above [`MAX_ADAPTER_SEND`]. One-shot; never stored in
-/// the shared send-terminal slot. Constructed at the send-rejection site in
-/// Phase 6.
+/// the shared send-terminal slot. Constructed at the `send_data` rejection site
+/// and boxed into `StreamErrorIncoming::Unknown`.
 #[derive(Debug)]
-#[allow(dead_code)] // constructed at the send-rejection site in Phase 6
 pub struct OversizedSend {
     /// Requested payload length in bytes (the `remaining()` that was rejected).
     pub len: usize,

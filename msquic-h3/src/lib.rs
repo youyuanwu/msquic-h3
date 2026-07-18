@@ -20,7 +20,7 @@ use msquic::{
 };
 
 mod buffer;
-pub use buffer::*;
+use buffer::{SendBuffer, SendLen, classify_send_len};
 mod error;
 use error::{
     ConnectionTerminal, ReceiveTerminal, clamp_application_code, convert_conn, convert_recv,
@@ -638,6 +638,9 @@ pub struct StreamOpener {
     conn: Arc<ConnHandle>,
     bidi_temp: Option<OpeningStream>,
     uni_temp: Option<OpeningStream>,
+    /// Connection-scoped open seam (prod = [`StreamOpenExecutor`]); lets a test
+    /// substitute the native open/start without a live connection.
+    open_exec: Box<dyn OpenExec>,
 }
 
 impl Clone for StreamOpener {
@@ -646,6 +649,9 @@ impl Clone for StreamOpener {
             conn: self.conn.clone(),
             bidi_temp: None,
             uni_temp: None,
+            // An in-flight OpeningStream is not shared, so a clone starts with
+            // empty temps and a fresh production open seam.
+            open_exec: Box::new(StreamOpenExecutor),
         }
     }
 }
@@ -720,7 +726,13 @@ impl<B: Buf> OpenStreams<B> for StreamOpener {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
-        Self::poll_open_inner(&self.conn, false, &mut self.bidi_temp, cx)
+        Self::poll_open_inner(
+            &self.conn,
+            self.open_exec.as_ref(),
+            false,
+            &mut self.bidi_temp,
+            cx,
+        )
     }
 
     #[cfg_attr(
@@ -733,6 +745,7 @@ impl<B: Buf> OpenStreams<B> for StreamOpener {
     ) -> std::task::Poll<Result<Self::SendStream, StreamErrorIncoming>> {
         let res = ready!(Self::poll_open_inner(
             &self.conn,
+            self.open_exec.as_ref(),
             true,
             &mut self.uni_temp,
             cx
@@ -764,6 +777,7 @@ impl StreamOpener {
             conn,
             bidi_temp: None,
             uni_temp: None,
+            open_exec: Box::new(StreamOpenExecutor),
         }
     }
 
@@ -775,6 +789,7 @@ impl StreamOpener {
     /// `StartComplete` outcome and validated before an `H3Stream` is built.
     fn poll_open_inner(
         conn: &Arc<ConnHandle>,
+        open_exec: &dyn OpenExec,
         uni: bool,
         holder: &mut Option<OpeningStream>,
         cx: &mut std::task::Context<'_>,
@@ -789,7 +804,7 @@ impl StreamOpener {
         }
         // 2. Create + start the native stream if none is in flight.
         if holder.is_none() {
-            match H3Stream::open_and_start(conn, uni) {
+            match open_exec.submit_open_start(conn, uni) {
                 Ok(opening) => *holder = Some(opening),
                 Err(status) => {
                     // A shutdown may have raced the open; prefer the terminal.
@@ -904,7 +919,12 @@ pub struct H3Stream {
 }
 #[derive(Debug)]
 pub struct H3SendStream {
-    stream: Arc<msquic::Stream>,
+    /// Every native send-side verb goes through `exec`; the production
+    /// [`StreamExecutor`] (held here) owns the `Arc<msquic::Stream>` that keeps
+    /// the send half's native handle alive. This ownership is independent of the
+    /// recv half (which holds its own `Arc` clone), and it lets a test inject a
+    /// double without a live connection.
+    exec: Box<dyn SendExec>,
     sctx: SendStreamReceiveCtx,
 }
 #[derive(Debug)]
@@ -913,9 +933,101 @@ pub struct H3RecvStream {
     rctx: RecvStreamReceiveCtx,
 }
 
-struct BufPtr(*const c_void);
-unsafe impl Send for BufPtr {}
-unsafe impl Sync for BufPtr {}
+/// Send-side command-executor seam: acts on an already-open stream. Stored behind
+/// a trait object in [`H3SendStream`] so a test double (the Phase 8 `CountingExec`)
+/// can replace it without a live connection. The production implementation is
+/// [`StreamExecutor`].
+///
+/// `Send + Sync` keep `H3SendStream` `Send + Sync` (as it was when it held the
+/// `Arc<msquic::Stream>` directly).
+trait SendExec: std::fmt::Debug + Send + Sync {
+    /// Box the already-validated non-empty [`SendBuffer`], `Box::into_raw` it as
+    /// `client_context`, and call `Stream::send`. On an immediate `Err` the box is
+    /// reconstructed and dropped here (MsQuic took no ownership and will deliver no
+    /// `SendComplete`), before returning.
+    fn submit_send(&mut self, buf: SendBuffer) -> Result<(), Status>;
+    /// `Stream::shutdown(GRACEFUL)` — the FIN for a graceful finish.
+    fn submit_graceful(&mut self) -> Result<(), Status>;
+    /// `Stream::shutdown(ABORT_SEND)` with an already-clamped application code.
+    /// Unused until Phase 7's send reset; defined here so the seam is complete.
+    #[allow(dead_code)] // wired at the reset call site in Phase 7
+    fn submit_reset(&mut self, code: u64) -> Result<(), Status>;
+}
+
+/// Production send-side seam. Owns the `Arc<msquic::Stream>` and issues real
+/// native send/shutdown downcalls.
+#[derive(Debug)]
+struct StreamExecutor {
+    stream: Arc<msquic::Stream>,
+}
+
+impl SendExec for StreamExecutor {
+    fn submit_send(&mut self, buf: SendBuffer) -> Result<(), Status> {
+        // Box the self-referential SendBuffer and hand its raw pointer to MsQuic
+        // as `client_context`. `buf`'s single `BufferRef` points into the owned
+        // `Bytes` heap storage and stays valid because the box is not moved again
+        // until the `SendComplete` callback (or the immediate-failure reclaim
+        // below) reconstructs it.
+        let cc: *mut SendBuffer = Box::into_raw(Box::new(buf));
+        // SAFETY: `cc` is a live `Box<SendBuffer>` leaked just above; `(*cc)` is a
+        // unique, valid reference. Its `buffers` memory stays valid until the
+        // `SendComplete` callback reconstructs and drops the box (`Stream::send`'s
+        // documented contract). FIN is not set on a data send — a graceful finish
+        // is a separate `submit_graceful` shutdown call.
+        let res = unsafe {
+            self.stream
+                .send((*cc).buffers(), SendFlags::NONE, cc as *const c_void)
+        };
+        if let Err(status) = res {
+            // Immediate failure: MsQuic took no ownership and delivers no
+            // `SendComplete`, so reclaim the box here (mirroring the callback drop)
+            // before returning. Reclaimed exactly once.
+            // SAFETY: `cc` is the pointer from `Box::into_raw` above; MsQuic did
+            // not take ownership on an error, so this is the sole reclamation.
+            drop(unsafe { Box::from_raw(cc) });
+            return Err(status);
+        }
+        Ok(())
+    }
+
+    fn submit_graceful(&mut self) -> Result<(), Status> {
+        // GRACEFUL FIN; the error_code is ignored for a graceful shutdown.
+        self.stream.shutdown(StreamShutdownFlags::GRACEFUL, 0)
+    }
+
+    fn submit_reset(&mut self, code: u64) -> Result<(), Status> {
+        self.stream.shutdown(StreamShutdownFlags::ABORT_SEND, code)
+    }
+}
+
+/// Connection-scoped open seam: *creates and starts* the native stream, returning
+/// the pre-ID [`OpeningStream`]. Separate from [`SendExec`] because it cannot act
+/// on an `Arc<Stream>` that does not exist yet. Stored in [`StreamOpener`] so a
+/// test can substitute the native open/start. Production is [`StreamOpenExecutor`].
+trait OpenExec: std::fmt::Debug + Send + Sync {
+    fn submit_open_start(&self, conn: &ConnHandle, uni: bool) -> Result<OpeningStream, Status>;
+}
+
+/// Production open seam: the real `Stream::open` + `Stream::start`.
+#[derive(Debug)]
+struct StreamOpenExecutor;
+
+impl OpenExec for StreamOpenExecutor {
+    fn submit_open_start(&self, conn: &ConnHandle, uni: bool) -> Result<OpeningStream, Status> {
+        H3Stream::open_and_start(conn, uni)
+    }
+}
+
+#[cfg(test)]
+impl H3SendStream {
+    /// Test/internal constructor: inject any [`SendExec`] (including the seam-test
+    /// double) plus a send-side context whose channel senders the test retains.
+    /// No live connection or native stream is required — the send path touches
+    /// only `exec` and `sctx`.
+    fn with_exec(exec: Box<dyn SendExec>, sctx: SendStreamReceiveCtx) -> Self {
+        H3SendStream { exec, sctx }
+    }
+}
 
 /// Explicit receive-side event delivered from the stream callback to the
 /// frontend receive half.
@@ -938,8 +1050,8 @@ enum ReceiveEvent {
 
 struct StreamSendCtx {
     start: Option<oneshot::Sender<Result<u64, Status>>>,
-    // cancelled, client_context
-    send: Option<mpsc::UnboundedSender<(bool, BufPtr)>>,
+    // send-completion signal: `cancelled`
+    send: Option<mpsc::UnboundedSender<bool>>,
     shutdown: Option<oneshot::Sender<()>>,
     receive: Option<mpsc::UnboundedSender<ReceiveEvent>>,
     /// First-writer-wins guard for the receive scope: once a `Fin`, `Reset`, or
@@ -974,8 +1086,10 @@ struct SendStreamReceiveCtx {
     /// Cached, validated stream identity (see [`RecvStreamReceiveCtx::id`]); read
     /// by `send_id` without a native query.
     id: h3::quic::StreamId,
-    // cancelled, client_context
-    send: mpsc::UnboundedReceiver<(bool, BufPtr)>,
+    // send-completion signal: `cancelled`. The owned `SendBuffer` behind the
+    // completed send is already reclaimed by the callback, so only the outcome
+    // flag crosses this channel.
+    send: mpsc::UnboundedReceiver<bool>,
     send_inprogress: bool,
     shutdown: oneshot::Receiver<()>,
 }
@@ -987,7 +1101,7 @@ struct SendStreamReceiveCtx {
 #[derive(Debug)]
 struct PreIdReceivers {
     start: oneshot::Receiver<Result<u64, Status>>,
-    send: mpsc::UnboundedReceiver<(bool, BufPtr)>,
+    send: mpsc::UnboundedReceiver<bool>,
     shutdown: oneshot::Receiver<()>,
     receive: mpsc::UnboundedReceiver<ReceiveEvent>,
 }
@@ -1011,7 +1125,7 @@ struct OpeningStream {
 /// be polled independently while these wait for `finalize`).
 #[derive(Debug)]
 struct PreIdTail {
-    send: mpsc::UnboundedReceiver<(bool, BufPtr)>,
+    send: mpsc::UnboundedReceiver<bool>,
     shutdown: oneshot::Receiver<()>,
     receive: mpsc::UnboundedReceiver<ReceiveEvent>,
 }
@@ -1033,7 +1147,9 @@ impl OpeningStream {
         } = tail;
         H3Stream {
             send: H3SendStream {
-                stream: stream.clone(),
+                exec: Box::new(StreamExecutor {
+                    stream: stream.clone(),
+                }),
                 sctx: SendStreamReceiveCtx {
                     id,
                     send,
@@ -1130,11 +1246,24 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
             cancelled,
             client_context,
         } => {
+            // Owned-buffer reclamation (Phase 6): reconstruct and drop the
+            // `Box<SendBuffer>` handed to MsQuic as `client_context` BEFORE
+            // enqueueing the completion, so the allocation is reclaimed exactly
+            // once even if the frontend receiver is gone. MsQuic guarantees
+            // `SendComplete` ends its use of the submitted buffers.
+            //
+            // SAFETY: every successful adapter send passes exactly one
+            // `Box::into_raw(Box<SendBuffer>)` as `client_context`, and MsQuic
+            // returns that same pointer here exactly once. A null pointer means no
+            // owned buffer was attached (e.g. a test-synthesized event), so it is
+            // skipped rather than dereferenced.
+            if let Some(cc) = std::ptr::NonNull::new(client_context as *mut SendBuffer) {
+                drop(unsafe { Box::from_raw(cc.as_ptr()) });
+            }
             if let Some(send) = ctx.send.as_ref() {
-                // NOTE: on delivery failure (frontend gone) the buffer behind
-                // `client_context` is not reclaimed here; that structural
-                // reclamation lands in Phase 6. Phase 1 only removes the panic.
-                let _ = send.unbounded_send((cancelled, BufPtr(client_context)));
+                // The buffer is already reclaimed above; only the outcome flag is
+                // forwarded to `poll_ready`. A gone frontend is a safe no-op.
+                let _ = send.unbounded_send(cancelled);
             }
         }
         StreamEvent::Receive { buffers, flags, .. } => {
@@ -1298,11 +1427,10 @@ impl<B: Buf> SendStream<B> for H3SendStream {
             return std::task::Poll::Ready(Ok(()));
         }
         match ready!(self.sctx.send.poll_next_unpin(cx)) {
-            Some((cancelled, ptr)) => {
+            Some(cancelled) => {
                 self.sctx.send_inprogress = false;
-                // reattach buff
-                let _: H3Buff<h3::quic::WriteBuf<B>> =
-                    unsafe { H3Buff::from_raw(ptr.0 as *mut c_void) };
+                // The owned `SendBuffer` was already reclaimed by the
+                // `SendComplete` callback; only the outcome flag arrives here.
                 match cancelled {
                     true => std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(
                         Status::from(StatusCode::QUIC_STATUS_ABORTED).into(),
@@ -1326,16 +1454,39 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         data: T,
     ) -> Result<(), StreamErrorIncoming> {
         if self.sctx.send_inprogress {
-            panic!("send while send is in progress.");
+            // A send is already outstanding: h3 should have gated this behind
+            // `poll_ready`. This is an adapter-internal misuse — report it rather
+            // than panicking across the executor / FFI boundary.
+            return Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::InternalError(
+                    "send_data called while a send is already in progress".to_string(),
+                ),
+            });
         }
-        let data: h3::quic::WriteBuf<B> = data.into();
-        let buff = H3Buff::new(data);
-        let (buff_ref, ptr) = unsafe { buff.into_raw() };
-        unsafe { self.stream.send(buff_ref, SendFlags::NONE, ptr) }
-            .inspect_err(|_| {
-                // reattach buff
-                let _: H3Buff<h3::quic::WriteBuf<B>> = unsafe { H3Buff::from_raw(ptr) };
-            })
+        let mut data: h3::quic::WriteBuf<B> = data.into();
+        let remaining = data.remaining();
+        // Validate the complete length against the adapter ceiling BEFORE any
+        // allocation or native submission (see the owned-buffer design).
+        match classify_send_len(remaining) {
+            // Empty payload is a successful no-op: no allocation, no native send,
+            // `send_inprogress` stays false.
+            SendLen::Empty => return Ok(()),
+            // Above the ceiling: reject without materializing a buffer or
+            // transmitting. Non-sticky, leaves all state unchanged.
+            SendLen::Oversized => {
+                return Err(StreamErrorIncoming::Unknown(Box::new(OversizedSend {
+                    len: remaining,
+                })));
+            }
+            // `0 < len <= MAX_ADAPTER_SEND`: materialize and submit below.
+            SendLen::NonEmpty => {}
+        }
+        // Materialize the complete wire representation into owned `Bytes` while the
+        // generic `B` is still on this thread, then submit through the send seam.
+        let bytes = data.copy_to_bytes(remaining);
+        let buf = SendBuffer::new(bytes);
+        self.exec
+            .submit_send(buf)
             .map_err(|e| StreamErrorIncoming::Unknown(e.into()))?;
         self.sctx.send_inprogress = true;
         Ok(())
@@ -1350,8 +1501,8 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), StreamErrorIncoming>> {
-        // Graceful sends a Fin to peer.
-        if let Err(e) = self.stream.shutdown(StreamShutdownFlags::GRACEFUL, 0) {
+        // Graceful sends a Fin to peer (through the send seam).
+        if let Err(e) = self.exec.submit_graceful() {
             return std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(e.into())));
         }
         // poll the ctx
@@ -2576,5 +2727,270 @@ mod stream_open_identity {
         // Close the connection (single native ConnectionClose) before the
         // registration is dropped.
         drop(conn);
+    }
+}
+
+/// Phase 6 (Owned `SendBuffer` & command-executor seam) unit tests.
+///
+/// These prove the send seam mechanism WITHOUT a live connection: an injected
+/// [`SendExec`] test double (`CountingExec`) shares the exact allocation/reclaim
+/// contract as the production `StreamExecutor`, and the retained `client_context`
+/// is replayed through the PRODUCTION [`stream_callback`] — the real reconstruct+
+/// drop path — so the exactly-once ownership guarantee is exercised, not mocked.
+/// The comprehensive `CountingExec` matrix + loopback ordering test are Phase 8.
+#[cfg(test)]
+mod send_seam {
+    use std::collections::VecDeque;
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use bytes::Bytes;
+    use h3::proto::frame::Frame;
+    use h3::quic::{SendStream, StreamErrorIncoming};
+
+    use crate::error::MAX_ADAPTER_SEND;
+    use crate::msquic::{Status, StatusCode, StreamEvent};
+    use crate::{
+        ConnectionErrorIncoming, H3SendStream, OversizedSend, SendBuffer, SendExec,
+        SendStreamReceiveCtx, StreamSendCtx, stream_callback, stream_ctx_channel,
+    };
+
+    /// Shared, inspectable counters + `client_context` slots. A clone is kept by
+    /// the test so every counter stays readable after the `CountingExec` is moved
+    /// into `H3SendStream` behind `Box<dyn SendExec>`.
+    #[derive(Clone, Debug, Default)]
+    struct CountingHandle {
+        sends: Arc<AtomicUsize>,
+        gracefuls: Arc<AtomicUsize>,
+        resets: Arc<AtomicUsize>,
+        /// Total `Box<SendBuffer>` created (`Box::into_raw`).
+        allocs: Arc<AtomicUsize>,
+        /// In-exec reclamations (immediate-failure arm only).
+        reclaims: Arc<AtomicUsize>,
+        /// Raw pointers "native" holds; the test replays each through
+        /// `stream_callback` (the production reclaim path).
+        client_ctx: Arc<Mutex<VecDeque<usize>>>,
+    }
+
+    /// Test double for the send seam. Mirrors `StreamExecutor`'s box/into_raw and
+    /// immediate-failure reclaim EXACTLY, so a scripted result models the real
+    /// allocation and ownership handoff without a native stream.
+    #[derive(Debug)]
+    struct CountingExec {
+        h: CountingHandle,
+        script: VecDeque<Result<(), Status>>,
+    }
+
+    impl CountingExec {
+        fn new(h: CountingHandle, script: VecDeque<Result<(), Status>>) -> Self {
+            Self { h, script }
+        }
+    }
+
+    impl SendExec for CountingExec {
+        fn submit_send(&mut self, buf: SendBuffer) -> Result<(), Status> {
+            self.h.sends.fetch_add(1, Relaxed);
+            // Mirror StreamExecutor EXACTLY: box + into_raw BEFORE inspecting the
+            // scripted result, so both arms model the real allocation.
+            let cc = Box::into_raw(Box::new(buf));
+            self.h.allocs.fetch_add(1, Relaxed);
+            match self.script.pop_front().unwrap_or(Ok(())) {
+                Ok(()) => {
+                    // Native accepted ownership: retain the pointer so the test can
+                    // replay the native SendComplete through stream_callback. The
+                    // box is NOT dropped here; it is outstanding until that callback.
+                    self.h
+                        .client_ctx
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push_back(cc as usize);
+                    Ok(())
+                }
+                Err(status) => {
+                    // Immediate failure: MsQuic takes no ownership and delivers no
+                    // SendComplete, so the caller reclaims here and now — exactly as
+                    // StreamExecutor's immediate-Err arm does.
+                    // SAFETY: `cc` is the pointer from `Box::into_raw` above; this is
+                    // its sole reclamation (native took no ownership on Err).
+                    drop(unsafe { Box::from_raw(cc) });
+                    self.h.reclaims.fetch_add(1, Relaxed);
+                    Err(status)
+                }
+            }
+        }
+        fn submit_graceful(&mut self) -> Result<(), Status> {
+            self.h.gracefuls.fetch_add(1, Relaxed);
+            Ok(())
+        }
+        fn submit_reset(&mut self, _code: u64) -> Result<(), Status> {
+            self.h.resets.fetch_add(1, Relaxed);
+            Ok(())
+        }
+    }
+
+    /// Build a send-side context with NO live connection: an id-bearing set of
+    /// channel halves. Returns the frontend `SendStreamReceiveCtx` plus the
+    /// callback-owned `StreamSendCtx` (kept so the test can drive `stream_callback`).
+    fn test_send_ctx() -> (SendStreamReceiveCtx, StreamSendCtx) {
+        let id: h3::quic::StreamId = 0u64.try_into().expect("valid StreamId");
+        let (ctx, sctx, _rctx) = stream_ctx_channel(id);
+        (sctx, ctx)
+    }
+
+    #[test]
+    fn send_data_wires_through_seam_and_signals_ready() {
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new())); // all-Ok script
+        let (sctx, mut ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+
+        // Valid WriteBuf<Bytes>: an h3 DATA frame, built via the real
+        // From<Frame<B>> impl. send_data classifies it NonEmpty and submits.
+        SendStream::<Bytes>::send_data(&mut s, Frame::Data(Bytes::from_static(b"hello world")))
+            .unwrap();
+        assert_eq!(h.sends.load(Relaxed), 1);
+        assert_eq!(h.allocs.load(Relaxed), 1); // one Box<SendBuffer> created
+        assert_eq!(h.reclaims.load(Relaxed), 0); // not the immediate-failure arm
+        assert_eq!(h.client_ctx.lock().unwrap().len(), 1); // outstanding: "native" holds it
+
+        // Replay the native SendComplete through the PRODUCTION callback path.
+        let cc = h.client_ctx.lock().unwrap().pop_front().unwrap();
+        stream_callback(
+            &mut ctx,
+            StreamEvent::SendComplete {
+                cancelled: false,
+                client_context: cc as *const c_void,
+            },
+        )
+        .unwrap();
+
+        // The callback reconstructed+dropped the box and enqueued exactly one
+        // completion (`cancelled == false`); a second poll is empty. reclaims stays
+        // 0 (reclaim happened in the callback, not the immediate-failure arm).
+        assert!(
+            !s.sctx.send.try_recv().unwrap(),
+            "completion must report cancelled == false"
+        );
+        assert!(s.sctx.send.try_recv().is_err());
+        assert_eq!(h.reclaims.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn send_buffer_reclaimed_exactly_once_via_callback() {
+        // Concrete exactly-once proof: a drop-counted SendBuffer submitted (Ok) and
+        // reclaimed by the production stream_callback increments its counter from 0
+        // (outstanding) to exactly 1 (reclaimed once).
+        let counter = Arc::new(AtomicUsize::new(0));
+        let buf = SendBuffer::new_counted(Bytes::from_static(b"payload"), counter.clone());
+        let h = CountingHandle::default();
+        let mut exec = CountingExec::new(h.clone(), VecDeque::new());
+
+        exec.submit_send(buf).unwrap();
+        assert_eq!(h.allocs.load(Relaxed), 1);
+        assert_eq!(
+            counter.load(Relaxed),
+            0,
+            "outstanding buffer must not be dropped yet"
+        );
+        assert_eq!(h.client_ctx.lock().unwrap().len(), 1);
+
+        let (_sctx, mut ctx) = test_send_ctx();
+        let cc = h.client_ctx.lock().unwrap().pop_front().unwrap();
+        stream_callback(
+            &mut ctx,
+            StreamEvent::SendComplete {
+                cancelled: false,
+                client_context: cc as *const c_void,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            counter.load(Relaxed),
+            1,
+            "callback must reconstruct+drop the Box<SendBuffer> exactly once"
+        );
+        assert_eq!(h.reclaims.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn immediate_send_failure_reclaims_without_completion() {
+        let h = CountingHandle::default();
+        let mut script = VecDeque::new();
+        script.push_back(Err(Status::from(StatusCode::QUIC_STATUS_INVALID_PARAMETER)));
+        let exec = Box::new(CountingExec::new(h.clone(), script));
+        let (sctx, _ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+
+        // submit_send returns Err; send_data surfaces the error.
+        assert!(
+            SendStream::<Bytes>::send_data(&mut s, Frame::Data(Bytes::from_static(b"hello world")))
+                .is_err()
+        );
+
+        // One allocation, one immediate in-exec reclamation, nothing outstanding,
+        // and ZERO SendComplete callbacks (native took no ownership, emitted none).
+        assert_eq!(h.sends.load(Relaxed), 1);
+        assert_eq!(h.allocs.load(Relaxed), 1);
+        assert_eq!(h.reclaims.load(Relaxed), 1);
+        assert!(h.client_ctx.lock().unwrap().is_empty());
+        assert!(s.sctx.send.try_recv().is_err()); // no Complete event ever enqueued
+    }
+
+    #[test]
+    fn oversized_send_rejected_before_allocation() {
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, _ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+
+        // A payload just past the ceiling: rejected before any copy or submission.
+        let payload = Bytes::from(vec![0u8; MAX_ADAPTER_SEND as usize + 1]);
+        let err = SendStream::<Bytes>::send_data(&mut s, Frame::Data(payload))
+            .expect_err("oversized send must be rejected");
+
+        match err {
+            StreamErrorIncoming::Unknown(e) => {
+                assert!(
+                    e.downcast_ref::<OversizedSend>().is_some(),
+                    "expected OversizedSend, got {e:?}"
+                );
+            }
+            other => panic!("expected Unknown(OversizedSend), got {other:?}"),
+        }
+        // No allocation and no native submission occurred, and no send is in flight.
+        assert_eq!(h.sends.load(Relaxed), 0);
+        assert_eq!(h.allocs.load(Relaxed), 0);
+        assert!(s.sctx.send.try_recv().is_err());
+    }
+
+    #[test]
+    fn send_data_while_in_progress_returns_internal_error() {
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new())); // all-Ok
+        let (sctx, _ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+
+        // First send succeeds and marks a send in progress.
+        SendStream::<Bytes>::send_data(&mut s, Frame::Data(Bytes::from_static(b"first"))).unwrap();
+        assert_eq!(h.sends.load(Relaxed), 1);
+
+        // Second send while the first is still outstanding is an internal error
+        // (not a panic), and does not allocate or submit again.
+        let err =
+            SendStream::<Bytes>::send_data(&mut s, Frame::Data(Bytes::from_static(b"second")))
+                .expect_err("send while in progress must error");
+        match err {
+            StreamErrorIncoming::ConnectionErrorIncoming { connection_error } => {
+                assert!(
+                    matches!(connection_error, ConnectionErrorIncoming::InternalError(_)),
+                    "expected InternalError, got {connection_error:?}"
+                );
+            }
+            other => panic!("expected ConnectionErrorIncoming::InternalError, got {other:?}"),
+        }
+        assert_eq!(h.sends.load(Relaxed), 1, "no second native submission");
+        assert_eq!(h.allocs.load(Relaxed), 1, "no second allocation");
     }
 }

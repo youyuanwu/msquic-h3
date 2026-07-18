@@ -32,3 +32,7 @@ tokio = {version = "1", features = ["full"]}
 tracing-subscriber = "0.3"
 tracing = { version = "0.1", features = ["log"] }
 msquic = { version = "2.5.1-beta", default-features = false, features = ["find"] }
+# Backend feature exposes h3's internal `proto::frame::Frame` / `WriteBuf` builders
+# so seam tests can construct a real data-carrying `WriteBuf<Bytes>` exactly as
+# h3's own frontend does. Dev-only: not enabled for the published library build.
+h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
