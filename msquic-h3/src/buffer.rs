@@ -248,7 +248,7 @@ mod test {
 mod peak_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     thread_local! {
         // `const` init is allocation-free, so reading it from inside the global
@@ -258,6 +258,12 @@ mod peak_alloc {
 
     static LIVE: AtomicUsize = AtomicUsize::new(0);
     static PEAK: AtomicUsize = AtomicUsize::new(0);
+    /// Single-active-measurement guard (O1). The process-global `LIVE`/`PEAK`
+    /// atomics are only meaningful for one measurer at a time; a second
+    /// *concurrent* measurer would silently skew the peak. This flag makes that
+    /// misuse fail loudly instead: [`measure_peak_resident`] claims it on entry
+    /// and releases it on exit, asserting it was not already held.
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
 
     struct Counting;
 
@@ -297,12 +303,19 @@ mod peak_alloc {
     /// the caller until PEAK is read, so the destination buffer is still live at
     /// the peak.
     pub(super) fn measure_peak_resident<R>(op: impl FnOnce() -> R) -> (R, usize) {
+        // O1: fail loudly if a second measurement is already active on any thread
+        // (the shared LIVE/PEAK atomics admit only one measurer at a time).
+        assert!(
+            !ACTIVE.swap(true, Ordering::SeqCst),
+            "concurrent peak_alloc measurement: LIVE/PEAK support only one active measurer"
+        );
         MEASURING.with(|m| m.set(true));
         let baseline = LIVE.load(Ordering::SeqCst);
         PEAK.store(baseline, Ordering::SeqCst); // reset immediately before
         let out = op(); // the single measured copy path
         let peak = PEAK.load(Ordering::SeqCst); // read immediately after
         MEASURING.with(|m| m.set(false));
+        ACTIVE.store(false, Ordering::SeqCst); // release the single-measurement guard
         (out, peak.saturating_sub(baseline)) // attributable delta, baseline excluded
     }
 }

@@ -41,12 +41,20 @@ source.
 
 | OS / arch          | Provenance    | Native `libmsquic` | Expected version | Status                 |
 |--------------------|---------------|--------------------|------------------|------------------------|
-| Linux x86-64       | `native-find` | system package     | `2.5.8`          | CI + canonical local   |
-| Linux x86-64       | `native-src`  | crate-built (cmake)| `2.5.1`          | CI                     |
-| Windows x86-64     | vcpkg / pwsh  | vcpkg-provided     | matrix-pinned    | compile / test support |
+| Linux x86-64       | `native-find` | system package     | `2.5.8`          | CI + canonical local — attested (SC-012) |
+| Linux x86-64       | `native-src`  | crate-built (cmake)| `2.5.1`          | CI — attested (SC-012)  |
+| Windows x86-64     | vcpkg / pwsh  | vcpkg-provided     | UNATTESTED       | compile / test only — outside SC-012 |
 
 `MSQUIC_EXPECTED_VERSION="major.minor.patch"` overrides the per-row default so any
 supported matrix cell can pin its own value.
+
+> **Windows scope (honest limitation).** The Windows job builds and runs the test
+> suite but does **not** run `native_version_preflight`: the loaded-module (DLL)
+> path/digest query is not yet implemented, so no version/git-hash/digest is
+> attested there. Windows is therefore explicitly **outside** the SC-012 attested
+> conformance-support matrix — it has no expected-version pin and must not be
+> described as attested until the loaded-module query lands. Only the two Linux
+> provenance rows are attested release gates.
 
 ## Native-version attestation policy
 
