@@ -23,7 +23,9 @@ mod buffer;
 use buffer::{SendBuffer, SendLen, classify_send_len};
 mod error;
 use error::{
-    ConnectionTerminal, ReceiveTerminal, clamp_application_code, convert_conn, convert_recv,
+    ConnectionTerminal, ReceiveTerminal, SendCommand, SendEvent, SendInput, SendPayload, SendPoll,
+    SendState, SendTerminal, clamp_application_code, convert_conn, convert_recv, convert_send,
+    convert_send_op, transition,
 };
 pub use error::{LocalConnectionClose, LocalStreamReset, MsQuicTransportError, OversizedSend};
 mod listener;
@@ -71,7 +73,8 @@ pub(crate) fn new_conn_terminal_slot() -> ConnTerminalSlot {
 /// (an accept frontend delivering the terminal to h3) has frozen the value.
 /// After the freeze point the winner is immutable. This is the connection-scope
 /// SF-7 / T4 rule; it is deliberately independent of the send-scope cancellation
-/// state (MF-2), which lives in the send reducer and is never written here.
+/// state (MF-2), which lives in the send-terminal slot (as an unobserved
+/// [`SendTerminal::ProvisionalAbort`] marker) and is never written here.
 #[derive(Debug, Default)]
 pub(crate) struct ConnTerminalState {
     terminal: Option<ConnectionTerminal>,
@@ -117,6 +120,60 @@ impl ConnTerminalState {
 /// Record a connection terminal reason into the shared slot.
 fn record_conn_terminal(slot: &ConnTerminalSlot, candidate: ConnectionTerminal) {
     lock_recover(slot).record(candidate);
+}
+
+/// Shared, thread-safe slot recording the sticky *why* a send half terminated.
+///
+/// Written by the stream FFI callback (peer `STOP_SENDING`, connection shutdown)
+/// and by the send-side reducer's local candidates (immediate send/graceful/reset
+/// failure, `LocalReset`, internal faults). A single first-writer owns the slot,
+/// except the distinct unobserved provisional cancellation marker
+/// ([`SendTerminal::ProvisionalAbort`], MF-2), which is refined to a later specific
+/// cause or finalized to an authoritative abort at the closure point. Both the
+/// callback and the send frontend hold a clone, so a peer/connection terminal is
+/// observable from `poll_ready`/`poll_finish` even with no send in flight. Never
+/// written into the connection terminal slot (the provisional stays send-scoped).
+pub(crate) type SendTerminalSlot = Arc<Mutex<Option<SendTerminal>>>;
+
+/// Create a fresh, empty send-terminal slot.
+fn new_send_terminal_slot() -> SendTerminalSlot {
+    Arc::new(Mutex::new(None))
+}
+
+/// Read the current sticky send winner (poison-safe clone; `None` if unset).
+fn load_winner(slot: &SendTerminalSlot) -> Option<SendTerminal> {
+    lock_recover(slot).clone()
+}
+
+/// First-writer publish of a local send-terminal candidate, returning whichever
+/// value now owns the slot.
+///
+/// The distinct provisional cancellation marker ([`SendTerminal::ProvisionalAbort`],
+/// MF-2) already in the slot is refined by a later authoritative candidate (a
+/// specific peer/connection cause, a `LocalReset`, or the closure-point abort); an
+/// authoritative winner is never overwritten. The callback and the reducer race
+/// into the same slot; whichever authoritative cause lands first wins, and the
+/// unobserved provisional marker never permanently masks it.
+fn publish_send(slot: &SendTerminalSlot, candidate: SendTerminal) -> SendTerminal {
+    let mut guard = lock_recover(slot);
+    match &*guard {
+        // Empty slot: this candidate wins. Return it directly (no re-clone/unwrap).
+        None => {
+            *guard = Some(candidate.clone());
+            candidate
+        }
+        Some(existing) => {
+            if existing.is_provisional() && !candidate.is_provisional() {
+                // Refine the unobserved provisional marker to the authoritative cause.
+                *guard = Some(candidate.clone());
+                candidate
+            } else {
+                // First authoritative writer (or a provisional that cannot refine an
+                // existing value) keeps the slot; surface the current owner.
+                existing.clone()
+            }
+        }
+    }
 }
 
 /// Classify a transport shutdown status into a connection terminal reason.
@@ -764,10 +821,8 @@ impl<B: Buf> OpenStreams<B> for StreamOpener {
         // before the downcall. A concurrent peer/transport cause may still
         // refine it until an accept frontend observes the terminal.
         record_conn_terminal(self.conn.terminal(), ConnectionTerminal::LocalClose);
-        self.conn.shutdown(
-            ConnectionShutdownFlags::NONE,
-            clamp_application_code(code.value()),
-        );
+        self.open_exec
+            .submit_conn_shutdown(&self.conn, clamp_application_code(code.value()));
     }
 }
 
@@ -929,7 +984,7 @@ pub struct H3SendStream {
 }
 #[derive(Debug)]
 pub struct H3RecvStream {
-    stream: Arc<msquic::Stream>,
+    exec: Box<dyn RecvExec>,
     rctx: RecvStreamReceiveCtx,
 }
 
@@ -949,8 +1004,7 @@ trait SendExec: std::fmt::Debug + Send + Sync {
     /// `Stream::shutdown(GRACEFUL)` — the FIN for a graceful finish.
     fn submit_graceful(&mut self) -> Result<(), Status>;
     /// `Stream::shutdown(ABORT_SEND)` with an already-clamped application code.
-    /// Unused until Phase 7's send reset; defined here so the seam is complete.
-    #[allow(dead_code)] // wired at the reset call site in Phase 7
+    /// Wired at the `SendStream::reset` call site (Phase 7).
     fn submit_reset(&mut self, code: u64) -> Result<(), Status>;
 }
 
@@ -1000,12 +1054,41 @@ impl SendExec for StreamExecutor {
     }
 }
 
+/// Receive-side command-executor seam: the recv half's only native downcall is
+/// `stop_sending` (`Stream::shutdown(ABORT_RECEIVE)`). Stored behind a trait
+/// object in [`H3RecvStream`] so a test double can assert the *actual* clamped
+/// code submitted with no live stream. Production is [`RecvStreamExecutor`],
+/// which also owns the recv half's `Arc<msquic::Stream>` clone (SF-1), keeping
+/// the native handle alive for as long as the recv half exists.
+trait RecvExec: std::fmt::Debug + Send + Sync {
+    /// `Stream::shutdown(ABORT_RECEIVE)` with an already-clamped application code.
+    fn submit_stop_sending(&self, code: u64) -> Result<(), Status>;
+}
+
+/// Production receive-side seam. Owns the `Arc<msquic::Stream>` and issues the
+/// real native `ABORT_RECEIVE` shutdown.
+#[derive(Debug)]
+struct RecvStreamExecutor {
+    stream: Arc<msquic::Stream>,
+}
+
+impl RecvExec for RecvStreamExecutor {
+    fn submit_stop_sending(&self, code: u64) -> Result<(), Status> {
+        self.stream
+            .shutdown(StreamShutdownFlags::ABORT_RECEIVE, code)
+    }
+}
+
 /// Connection-scoped open seam: *creates and starts* the native stream, returning
 /// the pre-ID [`OpeningStream`]. Separate from [`SendExec`] because it cannot act
 /// on an `Arc<Stream>` that does not exist yet. Stored in [`StreamOpener`] so a
 /// test can substitute the native open/start. Production is [`StreamOpenExecutor`].
 trait OpenExec: std::fmt::Debug + Send + Sync {
     fn submit_open_start(&self, conn: &ConnHandle, uni: bool) -> Result<OpeningStream, Status>;
+    /// `Connection::shutdown(NONE)` for `OpenStreams::close`, with an
+    /// already-clamped application code. Behind the seam so a test double can
+    /// assert the *actual* submitted value without a live connection.
+    fn submit_conn_shutdown(&self, conn: &ConnHandle, code: u64);
 }
 
 /// Production open seam: the real `Stream::open` + `Stream::start`.
@@ -1015,6 +1098,9 @@ struct StreamOpenExecutor;
 impl OpenExec for StreamOpenExecutor {
     fn submit_open_start(&self, conn: &ConnHandle, uni: bool) -> Result<OpeningStream, Status> {
         H3Stream::open_and_start(conn, uni)
+    }
+    fn submit_conn_shutdown(&self, conn: &ConnHandle, code: u64) {
+        conn.shutdown(ConnectionShutdownFlags::NONE, code);
     }
 }
 
@@ -1026,6 +1112,31 @@ impl H3SendStream {
     /// only `exec` and `sctx`.
     fn with_exec(exec: Box<dyn SendExec>, sctx: SendStreamReceiveCtx) -> Self {
         H3SendStream { exec, sctx }
+    }
+}
+
+#[cfg(test)]
+impl H3RecvStream {
+    /// Test constructor: inject any [`RecvExec`] (the clamp-recording double) plus
+    /// a receive-side context. No live stream is required — `stop_sending` touches
+    /// only `exec` and `rctx`.
+    fn with_exec(exec: Box<dyn RecvExec>, rctx: RecvStreamReceiveCtx) -> Self {
+        H3RecvStream { exec, rctx }
+    }
+}
+
+#[cfg(test)]
+impl StreamOpener {
+    /// Test constructor: inject any [`OpenExec`] (the clamp-recording double) so
+    /// `close` can be exercised against a real (unstarted) `ConnHandle` without
+    /// any native shutdown reaching the wire.
+    fn with_open_exec(conn: Arc<ConnHandle>, open_exec: Box<dyn OpenExec>) -> Self {
+        Self {
+            conn,
+            bidi_temp: None,
+            uni_temp: None,
+            open_exec,
+        }
     }
 }
 
@@ -1050,9 +1161,13 @@ enum ReceiveEvent {
 
 struct StreamSendCtx {
     start: Option<oneshot::Sender<Result<u64, Status>>>,
-    // send-completion signal: `cancelled`
-    send: Option<mpsc::UnboundedSender<bool>>,
-    shutdown: Option<oneshot::Sender<()>>,
+    /// Single ordered send-event channel (MF-1): data `SendComplete`, terminal
+    /// wakes, and finish completion all ride this one FIFO so chronological
+    /// finish-vs-terminal order is preserved by construction.
+    send: Option<mpsc::UnboundedSender<SendEvent>>,
+    /// Shared sticky send-terminal slot; the callback publishes peer
+    /// `STOP_SENDING` and connection-shutdown reasons here (first-writer).
+    send_terminal: SendTerminalSlot,
     receive: Option<mpsc::UnboundedSender<ReceiveEvent>>,
     /// First-writer-wins guard for the receive scope: once a `Fin`, `Reset`, or
     /// `Connection` terminal has been published, later receive events are
@@ -1086,12 +1201,15 @@ struct SendStreamReceiveCtx {
     /// Cached, validated stream identity (see [`RecvStreamReceiveCtx::id`]); read
     /// by `send_id` without a native query.
     id: h3::quic::StreamId,
-    // send-completion signal: `cancelled`. The owned `SendBuffer` behind the
-    // completed send is already reclaimed by the callback, so only the outcome
-    // flag crosses this channel.
-    send: mpsc::UnboundedReceiver<bool>,
-    send_inprogress: bool,
-    shutdown: oneshot::Receiver<()>,
+    /// Shared sticky send-terminal slot (see [`SendTerminalSlot`]). Loaded on
+    /// every reducer input as the current winner; local candidates are published
+    /// here via the first-writer helper.
+    send_terminal: SendTerminalSlot,
+    /// Single ordered send-event source (MF-1): data completion, terminal wake,
+    /// and finish completion. The reducer observes it only as a [`SendPoll`].
+    send: mpsc::UnboundedReceiver<SendEvent>,
+    /// Pure send-side reducer bookkeeping (replaces the old `send_inprogress`).
+    reducer: SendState,
 }
 
 /// Frontend *receiver* ends held by an [`OpeningStream`] until the stream ID is
@@ -1101,8 +1219,9 @@ struct SendStreamReceiveCtx {
 #[derive(Debug)]
 struct PreIdReceivers {
     start: oneshot::Receiver<Result<u64, Status>>,
-    send: mpsc::UnboundedReceiver<bool>,
-    shutdown: oneshot::Receiver<()>,
+    send: mpsc::UnboundedReceiver<SendEvent>,
+    /// Shared send-terminal slot clone, moved into the send half by `finalize`.
+    send_terminal: SendTerminalSlot,
     receive: mpsc::UnboundedReceiver<ReceiveEvent>,
 }
 
@@ -1125,8 +1244,8 @@ struct OpeningStream {
 /// be polled independently while these wait for `finalize`).
 #[derive(Debug)]
 struct PreIdTail {
-    send: mpsc::UnboundedReceiver<bool>,
-    shutdown: oneshot::Receiver<()>,
+    send: mpsc::UnboundedReceiver<SendEvent>,
+    send_terminal: SendTerminalSlot,
     receive: mpsc::UnboundedReceiver<ReceiveEvent>,
 }
 
@@ -1142,7 +1261,7 @@ impl OpeningStream {
         } = self;
         let PreIdTail {
             send,
-            shutdown,
+            send_terminal,
             receive,
         } = tail;
         H3Stream {
@@ -1152,13 +1271,13 @@ impl OpeningStream {
                 }),
                 sctx: SendStreamReceiveCtx {
                     id,
+                    send_terminal,
                     send,
-                    send_inprogress: false,
-                    shutdown,
+                    reducer: SendState::new(),
                 },
             },
             recv: H3RecvStream {
-                stream,
+                exec: Box::new(RecvStreamExecutor { stream }),
                 rctx: RecvStreamReceiveCtx {
                     id,
                     receive,
@@ -1177,20 +1296,20 @@ impl OpeningStream {
 fn stream_ctx_channel_pre_id() -> (StreamSendCtx, PreIdReceivers) {
     let (start_tx, start_rx) = oneshot::channel::<Result<u64, Status>>();
     let (send_tx, send_rx) = mpsc::unbounded();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let send_terminal = new_send_terminal_slot();
     let (receive_tx, receive_rx) = mpsc::unbounded();
     (
         StreamSendCtx {
             start: Some(start_tx),
             send: Some(send_tx),
-            shutdown: Some(shutdown_tx),
+            send_terminal: send_terminal.clone(),
             receive: Some(receive_tx),
             receive_terminal_sent: false,
         },
         PreIdReceivers {
             start: start_rx,
             send: send_rx,
-            shutdown: shutdown_rx,
+            send_terminal,
             receive: receive_rx,
         },
     )
@@ -1207,16 +1326,16 @@ fn stream_ctx_channel(
     let PreIdReceivers {
         start: _,
         send,
-        shutdown,
+        send_terminal,
         receive,
     } = recv;
     (
         ctx,
         SendStreamReceiveCtx {
             id,
+            send_terminal,
             send,
-            send_inprogress: false,
-            shutdown,
+            reducer: SendState::new(),
         },
         RecvStreamReceiveCtx {
             id,
@@ -1262,8 +1381,9 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
             }
             if let Some(send) = ctx.send.as_ref() {
                 // The buffer is already reclaimed above; only the outcome flag is
-                // forwarded to `poll_ready`. A gone frontend is a safe no-op.
-                let _ = send.unbounded_send(cancelled);
+                // forwarded to the reducer via the single ordered channel (MF-1).
+                // A gone frontend is a safe no-op.
+                let _ = send.unbounded_send(SendEvent::Complete { cancelled });
             }
         }
         StreamEvent::Receive { buffers, flags, .. } => {
@@ -1305,10 +1425,21 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
             // `StreamTerminated { error_code }`, distinct from a graceful FIN.
             publish_recv_terminal(ctx, ReceiveEvent::Reset(error_code));
         }
-        StreamEvent::SendShutdownComplete { graceful: _ } => {
-            // Peer acknowledged shutdown.
-            if let Some(shutdown) = ctx.shutdown.take() {
-                let _ = shutdown.send(());
+        StreamEvent::PeerReceiveAborted { error_code } => {
+            // Peer STOP_SENDING on OUR send half: publish the sticky send terminal
+            // and wake the send frontend through the single ordered channel so
+            // `poll_ready`/`poll_finish` observe `Stopped(code)` even with no send
+            // in flight (SC-003). First-writer / MF-2 refinement is in `publish_send`.
+            publish_send(&ctx.send_terminal, SendTerminal::Stopped(error_code));
+            if let Some(send) = ctx.send.as_ref() {
+                let _ = send.unbounded_send(SendEvent::TerminalWake);
+            }
+        }
+        StreamEvent::SendShutdownComplete { graceful } => {
+            // Graceful finish (or abort) completed: an ordinary send event on the
+            // single ordered channel (MF-1), so finish-vs-terminal order holds.
+            if let Some(send) = ctx.send.as_ref() {
+                let _ = send.unbounded_send(SendEvent::FinishComplete { graceful });
             }
         }
         StreamEvent::ShutdownComplete {
@@ -1321,7 +1452,9 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
         } => {
             // A connection-caused stream shutdown surfaces the connection error
             // on the receive half (reusing the Phase-3 connection terminal +
-            // convert helpers). A stream-local shutdown publishes no terminal.
+            // convert helpers) and, symmetrically, publishes it as the sticky
+            // send terminal so the send half observes the same reason. A
+            // stream-local shutdown publishes no terminal.
             if connection_shutdown {
                 let reason = classify_conn_shutdown(
                     connection_shutdown_by_app,
@@ -1329,12 +1462,12 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
                     connection_error_code,
                     connection_close_status,
                 );
-                publish_recv_terminal(ctx, ReceiveEvent::Connection(reason));
+                publish_recv_terminal(ctx, ReceiveEvent::Connection(reason.clone()));
+                publish_send(&ctx.send_terminal, SendTerminal::Connection(reason));
             }
             // close all channels
             ctx.receive.take();
             ctx.send.take();
-            ctx.shutdown.take();
             ctx.start.take();
         }
         _ => {}
@@ -1374,7 +1507,7 @@ impl H3Stream {
             start: recv.start,
             tail: PreIdTail {
                 send: recv.send,
-                shutdown: recv.shutdown,
+                send_terminal: recv.send_terminal,
                 receive: recv.receive,
             },
         }
@@ -1404,7 +1537,7 @@ impl H3Stream {
             start: recv.start,
             tail: PreIdTail {
                 send: recv.send,
-                shutdown: recv.shutdown,
+                send_terminal: recv.send_terminal,
                 receive: recv.receive,
             },
         })
@@ -1412,8 +1545,7 @@ impl H3Stream {
 }
 
 impl<B: Buf> SendStream<B> for H3SendStream {
-    // Seems like poll_ready is called after send_data is called.
-    // To ensure data is sent.
+    // h3 calls `poll_ready` after `send_data` to await the in-flight send.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, level = "trace", ret)
@@ -1422,26 +1554,56 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), StreamErrorIncoming>> {
-        if !self.sctx.send_inprogress {
-            // no send is current so ready to get more.
-            return std::task::Poll::Ready(Ok(()));
+        use std::task::Poll;
+        // SF-2 non-consuming finish guard: once a finish has started, `poll_ready`
+        // must NOT poll (and thereby consume) the shared send channel — a consumed
+        // `FinishComplete` would be lost and hang a later `poll_finish`. Resolve
+        // purely from non-consuming state: a published terminal winner is surfaced;
+        // otherwise the finish-after-poll_ready misuse (non-sticky).
+        if self.sctx.reducer.finish_started {
+            return match load_winner(&self.sctx.send_terminal) {
+                Some(w) => Poll::Ready(Err(convert_send(w))),
+                None => Poll::Ready(Err(convert_send(SendTerminal::Internal(
+                    "poll_ready after finish",
+                )))),
+            };
         }
-        match ready!(self.sctx.send.poll_next_unpin(cx)) {
-            Some(cancelled) => {
-                self.sctx.send_inprogress = false;
-                // The owned `SendBuffer` was already reclaimed by the
-                // `SendComplete` callback; only the outcome flag arrives here.
-                match cancelled {
-                    true => std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(
-                        Status::from(StatusCode::QUIC_STATUS_ABORTED).into(),
-                    ))),
-                    false => std::task::Poll::Ready(Ok(())),
+        // First input polls the channel; subsequent inputs are fed results.
+        let mut input = SendInput::PollReady {
+            poll: self.poll_send_channel(cx),
+            terminal: load_winner(&self.sctx.send_terminal),
+        };
+        loop {
+            match transition(&mut self.sctx.reducer, input) {
+                SendCommand::Pending => return Poll::Pending, // waker already registered
+                SendCommand::ReturnReady => return Poll::Ready(Ok(())),
+                SendCommand::ReturnError(t) => return Poll::Ready(Err(convert_send(t))),
+                SendCommand::RepollReady => {
+                    // Re-poll the channel in THIS call so a synchronously-queued
+                    // paired terminal / channel close (the closure point) is drained
+                    // or the waker re-armed — the retained provisional cancellation
+                    // (MF-2) is never returned to the caller.
+                    input = SendInput::PollReady {
+                        poll: self.poll_send_channel(cx),
+                        terminal: load_winner(&self.sctx.send_terminal),
+                    };
+                }
+                SendCommand::PublishTerminal {
+                    candidate,
+                    continuation,
+                } => {
+                    let winner = publish_send(&self.sctx.send_terminal, candidate);
+                    input = SendInput::TerminalPublished {
+                        winner,
+                        continuation,
+                    };
+                }
+                _ => {
+                    return Poll::Ready(Err(convert_send(SendTerminal::Internal(
+                        "unexpected poll_ready command",
+                    ))));
                 }
             }
-            // closed.
-            None => std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(
-                Status::from(StatusCode::QUIC_STATUS_ABORTED).into(),
-            ))),
         }
     }
 
@@ -1453,46 +1615,54 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         &mut self,
         data: T,
     ) -> Result<(), StreamErrorIncoming> {
-        if self.sctx.send_inprogress {
-            // A send is already outstanding: h3 should have gated this behind
-            // `poll_ready`. This is an adapter-internal misuse — report it rather
-            // than panicking across the executor / FFI boundary.
-            return Err(StreamErrorIncoming::ConnectionErrorIncoming {
-                connection_error: ConnectionErrorIncoming::InternalError(
-                    "send_data called while a send is already in progress".to_string(),
-                ),
-            });
-        }
-        let mut data: h3::quic::WriteBuf<B> = data.into();
-        let remaining = data.remaining();
-        // Validate the complete length against the adapter ceiling BEFORE any
-        // allocation or native submission (see the owned-buffer design).
-        match classify_send_len(remaining) {
-            // Empty payload is a successful no-op: no allocation, no native send,
-            // `send_inprogress` stays false.
-            SendLen::Empty => return Ok(()),
-            // Above the ceiling: reject without materializing a buffer or
-            // transmitting. Non-sticky, leaves all state unchanged.
-            SendLen::Oversized => {
-                return Err(StreamErrorIncoming::Unknown(Box::new(OversizedSend {
-                    len: remaining,
-                })));
+        // The generic `WriteBuf<B>` stays on this frontend stack; only its length
+        // classification enters the reducer. Owned bytes are materialized solely
+        // when the reducer returns `SubmitSend`, so nothing is copied on a
+        // terminal / misuse / oversized / empty path.
+        let mut wb: h3::quic::WriteBuf<B> = data.into();
+        let payload = classify_payload(wb.remaining());
+        let mut input = SendInput::SendRequested {
+            payload,
+            terminal: load_winner(&self.sctx.send_terminal),
+        };
+        loop {
+            match transition(&mut self.sctx.reducer, input) {
+                SendCommand::ReturnSent => return Ok(()),
+                SendCommand::ReturnImmediateError(e) => return Err(convert_send_op(e)),
+                SendCommand::ReturnError(t) => return Err(convert_send(t)),
+                SendCommand::SubmitSend => {
+                    // The single production copy path: materialize the complete
+                    // wire representation into owned `Bytes` while `B` is still on
+                    // this thread, then hand it to the seam (which reclaims the box
+                    // itself on an immediate `Err`).
+                    let remaining = wb.remaining();
+                    let buf = SendBuffer::new(wb.copy_to_bytes(remaining));
+                    let res = self.exec.submit_send(buf);
+                    input = SendInput::SendSubmitted {
+                        result: res,
+                        terminal: load_winner(&self.sctx.send_terminal),
+                    };
+                }
+                SendCommand::PublishTerminal {
+                    candidate,
+                    continuation,
+                } => {
+                    let winner = publish_send(&self.sctx.send_terminal, candidate);
+                    input = SendInput::TerminalPublished {
+                        winner,
+                        continuation,
+                    };
+                }
+                _ => {
+                    return Err(convert_send(SendTerminal::Internal(
+                        "unexpected send_data command",
+                    )));
+                }
             }
-            // `0 < len <= MAX_ADAPTER_SEND`: materialize and submit below.
-            SendLen::NonEmpty => {}
         }
-        // Materialize the complete wire representation into owned `Bytes` while the
-        // generic `B` is still on this thread, then submit through the send seam.
-        let bytes = data.copy_to_bytes(remaining);
-        let buf = SendBuffer::new(bytes);
-        self.exec
-            .submit_send(buf)
-            .map_err(|e| StreamErrorIncoming::Unknown(e.into()))?;
-        self.sctx.send_inprogress = true;
-        Ok(())
     }
 
-    // Send FIN signal to peer.
+    // Send FIN signal to peer (graceful shutdown), idempotently.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, level = "trace", ret)
@@ -1501,31 +1671,123 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), StreamErrorIncoming>> {
-        // Graceful sends a Fin to peer (through the send seam).
-        if let Err(e) = self.exec.submit_graceful() {
-            return std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(e.into())));
+        use std::task::Poll;
+        let mut input = SendInput::PollFinish {
+            poll: self.poll_send_channel(cx),
+            terminal: load_winner(&self.sctx.send_terminal),
+        };
+        loop {
+            match transition(&mut self.sctx.reducer, input) {
+                SendCommand::Pending => return Poll::Pending,
+                SendCommand::ReturnFinished => return Poll::Ready(Ok(())),
+                SendCommand::ReturnError(t) => return Poll::Ready(Err(convert_send(t))),
+                SendCommand::SubmitGraceful => {
+                    let res = self.exec.submit_graceful();
+                    input = SendInput::GracefulSubmitted {
+                        result: res,
+                        terminal: load_winner(&self.sctx.send_terminal),
+                    };
+                }
+                SendCommand::RepollFinish => {
+                    // Re-poll the channel in THIS call so a synchronously-queued
+                    // `FinishComplete` is drained (or the waker re-armed) — never
+                    // defer to a later poll (that recreates the lost-waker bug).
+                    input = SendInput::PollFinish {
+                        poll: self.poll_send_channel(cx),
+                        terminal: load_winner(&self.sctx.send_terminal),
+                    };
+                }
+                SendCommand::PublishTerminal {
+                    candidate,
+                    continuation,
+                } => {
+                    let winner = publish_send(&self.sctx.send_terminal, candidate);
+                    input = SendInput::TerminalPublished {
+                        winner,
+                        continuation,
+                    };
+                }
+                _ => {
+                    return Poll::Ready(Err(convert_send(SendTerminal::Internal(
+                        "unexpected poll_finish command",
+                    ))));
+                }
+            }
         }
-        // poll the ctx
-        let rx = &mut self.sctx.shutdown;
-        let p = Pin::new(rx);
-        // if backend is closed return error.
-        let res = ready!(std::future::Future::poll(p, cx)).map_err(|_| {
-            StreamErrorIncoming::Unknown(Status::from(StatusCode::QUIC_STATUS_ABORTED).into())
-        });
-        std::task::Poll::Ready(res)
     }
 
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, level = "trace", ret)
     )]
-    fn reset(&mut self, _reset_code: u64) {
-        panic!("reset not supported")
+    fn reset(&mut self, reset_code: u64) {
+        // Infallible: issues at most one native `RESET_STREAM` with a clamped code
+        // through the seam, records the terminal for a later poll, and clears the
+        // reset reservation. A callback-published peer/connection terminal wins
+        // over this local reset (no second native op).
+        let mut input = SendInput::Reset {
+            code: clamp_application_code(reset_code),
+            terminal: load_winner(&self.sctx.send_terminal),
+        };
+        loop {
+            match transition(&mut self.sctx.reducer, input) {
+                SendCommand::NoOp => return, // already terminal / published
+                SendCommand::SubmitReset(c) => {
+                    let res = self.exec.submit_reset(c);
+                    input = SendInput::ResetSubmitted {
+                        code: c,
+                        result: res,
+                        terminal: load_winner(&self.sctx.send_terminal),
+                    };
+                }
+                SendCommand::PublishTerminal {
+                    candidate,
+                    continuation,
+                } => {
+                    let winner = publish_send(&self.sctx.send_terminal, candidate);
+                    input = SendInput::TerminalPublished {
+                        winner,
+                        continuation,
+                    };
+                }
+                // reset consumes any terminal; nothing to surface to h3 now.
+                _ => return,
+            }
+        }
     }
 
     fn send_id(&self) -> h3::quic::StreamId {
         // Cached at construction; no native query, so this never panics.
         self.sctx.id
+    }
+}
+
+impl H3SendStream {
+    /// Poll the single ordered send-event channel (MF-1) into a [`SendPoll`].
+    ///
+    /// A closed channel with no queued event is an adapter-internal fault
+    /// (`SendPoll::Closed`), distinct from `Pending`; the reducer surfaces a
+    /// published terminal winner ahead of it, so a normal connection-shutdown
+    /// close still yields the terminal reason rather than `Closed`.
+    fn poll_send_channel(&mut self, cx: &mut std::task::Context<'_>) -> SendPoll {
+        match self.sctx.send.poll_next_unpin(cx) {
+            std::task::Poll::Ready(Some(ev)) => SendPoll::Event(ev),
+            std::task::Poll::Ready(None) => SendPoll::Closed,
+            std::task::Poll::Pending => SendPoll::Pending,
+        }
+    }
+}
+
+/// Classify a `send_data` payload length into a [`SendPayload`] before any
+/// allocation. The `NonEmpty` upper bound is `MAX_ADAPTER_SEND` (< `u32::MAX`),
+/// so the `as u32` cast never truncates.
+fn classify_payload(remaining: usize) -> SendPayload {
+    match classify_send_len(remaining) {
+        SendLen::Empty => SendPayload::Empty,
+        SendLen::Oversized => SendPayload::Oversized { len: remaining },
+        SendLen::NonEmpty => SendPayload::NonEmpty {
+            len: remaining as u32,
+        },
     }
 }
 
@@ -1606,11 +1868,10 @@ impl RecvStream for H3RecvStream {
         tracing::instrument(skip_all, level = "trace", ret)
     )]
     fn stop_sending(&mut self, error_code: u64) {
-        // Close the send path (code already clamped, Phase 2).
-        let _ = self.stream.shutdown(
-            StreamShutdownFlags::ABORT_RECEIVE,
-            clamp_application_code(error_code),
-        );
+        // Close the send path (code clamped here through the seam, Phase 2/7).
+        let _ = self
+            .exec
+            .submit_stop_sending(clamp_application_code(error_code));
         // SF-6: sticky local end-of-stream. Subsequent `poll_data` returns a
         // clean `Ok(None)` and injects NO receive terminal (`terminal`
         // untouched). Set unconditionally via the local-state seam: the FFI
@@ -2764,6 +3025,8 @@ mod send_seam {
         sends: Arc<AtomicUsize>,
         gracefuls: Arc<AtomicUsize>,
         resets: Arc<AtomicUsize>,
+        /// Every clamped code submitted to `submit_reset`, in order.
+        reset_codes: Arc<Mutex<Vec<u64>>>,
         /// Total `Box<SendBuffer>` created (`Box::into_raw`).
         allocs: Arc<AtomicUsize>,
         /// In-exec reclamations (immediate-failure arm only).
@@ -2823,8 +3086,13 @@ mod send_seam {
             self.h.gracefuls.fetch_add(1, Relaxed);
             Ok(())
         }
-        fn submit_reset(&mut self, _code: u64) -> Result<(), Status> {
+        fn submit_reset(&mut self, code: u64) -> Result<(), Status> {
             self.h.resets.fetch_add(1, Relaxed);
+            self.h
+                .reset_codes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(code);
             Ok(())
         }
     }
@@ -2868,8 +3136,9 @@ mod send_seam {
         // The callback reconstructed+dropped the box and enqueued exactly one
         // completion (`cancelled == false`); a second poll is empty. reclaims stays
         // 0 (reclaim happened in the callback, not the immediate-failure arm).
-        assert!(
-            !s.sctx.send.try_recv().unwrap(),
+        assert_eq!(
+            s.sctx.send.try_recv().unwrap(),
+            crate::error::SendEvent::Complete { cancelled: false },
             "completion must report cancelled == false"
         );
         assert!(s.sctx.send.try_recv().is_err());
@@ -2992,5 +3261,571 @@ mod send_seam {
         }
         assert_eq!(h.sends.load(Relaxed), 1, "no second native submission");
         assert_eq!(h.allocs.load(Relaxed), 1, "no second allocation");
+    }
+
+    // ── Phase 7 frontend tests (reducer-driven send state machine) ──
+
+    /// A leaked no-op waker gives a `'static` context reusable across polls.
+    fn noop_cx() -> std::task::Context<'static> {
+        let waker = Box::leak(Box::new(futures::task::noop_waker()));
+        std::task::Context::from_waker(waker)
+    }
+
+    #[test]
+    fn reset_issues_one_clamped_reset_stream_via_seam() {
+        // reset submits exactly one native RESET_STREAM whose code is clamped to
+        // the varint max at/below/above the ceiling; a second reset is a no-op.
+        let max = (1u64 << 62) - 1;
+        for (input, expected) in [(max, max), (1u64 << 62, max), (u64::MAX, max)] {
+            let h = CountingHandle::default();
+            let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+            let (sctx, _ctx) = test_send_ctx();
+            let mut s = H3SendStream::with_exec(exec, sctx);
+
+            // Infallible: returns `()`, never panics.
+            SendStream::<Bytes>::reset(&mut s, input);
+            assert_eq!(h.resets.load(Relaxed), 1, "exactly one native reset");
+            assert_eq!(
+                h.reset_codes.lock().unwrap().as_slice(),
+                &[expected],
+                "submitted reset code must be clamped (input {input:#x})"
+            );
+            assert!(
+                !s.sctx.reducer.reset_submitting,
+                "the reset reservation is cleared"
+            );
+
+            // A second reset finds the terminal already recorded: no second op.
+            SendStream::<Bytes>::reset(&mut s, input);
+            assert_eq!(h.resets.load(Relaxed), 1, "no second native reset");
+        }
+    }
+
+    #[test]
+    fn sf2_finish_completion_survives_intervening_poll_ready() {
+        // SF-2: an intervening poll_ready after finish must NOT consume the queued
+        // finish completion; a later poll_finish still observes it (no hang/loss).
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        // Start finish on an idle stream: one graceful shutdown, then Pending.
+        assert!(matches!(
+            SendStream::<Bytes>::poll_finish(&mut s, &mut cx),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(h.gracefuls.load(Relaxed), 1);
+
+        // The native completion is queued on the single ordered channel.
+        stream_callback(
+            &mut ctx,
+            StreamEvent::SendShutdownComplete { graceful: true },
+        )
+        .unwrap();
+
+        // SF-2 guard: poll_ready returns WITHOUT polling (consuming) the channel.
+        assert!(
+            matches!(
+                SendStream::<Bytes>::poll_ready(&mut s, &mut cx),
+                std::task::Poll::Ready(Err(_))
+            ),
+            "poll_ready after finish is a non-consuming error"
+        );
+
+        // The finish completion was preserved: poll_finish still completes cleanly.
+        assert!(
+            matches!(
+                SendStream::<Bytes>::poll_finish(&mut s, &mut cx),
+                std::task::Poll::Ready(Ok(()))
+            ),
+            "queued finish completion must survive the intervening poll_ready"
+        );
+        assert_eq!(
+            h.gracefuls.load(Relaxed),
+            1,
+            "graceful submitted exactly once"
+        );
+    }
+
+    #[test]
+    fn poll_finish_is_idempotent_one_graceful() {
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        // First poll_finish submits the graceful shutdown.
+        assert!(matches!(
+            SendStream::<Bytes>::poll_finish(&mut s, &mut cx),
+            std::task::Poll::Pending
+        ));
+        // Second poll_finish BEFORE completion must not re-submit.
+        assert!(matches!(
+            SendStream::<Bytes>::poll_finish(&mut s, &mut cx),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(h.gracefuls.load(Relaxed), 1, "no second graceful shutdown");
+
+        // Complete the finish; subsequent polls are absorbing Ok, still one graceful.
+        stream_callback(
+            &mut ctx,
+            StreamEvent::SendShutdownComplete { graceful: true },
+        )
+        .unwrap();
+        assert!(matches!(
+            SendStream::<Bytes>::poll_finish(&mut s, &mut cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            SendStream::<Bytes>::poll_finish(&mut s, &mut cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert_eq!(h.gracefuls.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn peer_stop_sending_observable_without_send_in_flight() {
+        // SC-003: a peer STOP_SENDING with no send in flight is observable at both
+        // poll_ready and poll_finish as StreamTerminated{code}.
+        for use_finish in [false, true] {
+            let h = CountingHandle::default();
+            let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+            let (sctx, mut ctx) = test_send_ctx();
+            let mut s = H3SendStream::with_exec(exec, sctx);
+            let mut cx = noop_cx();
+
+            stream_callback(&mut ctx, StreamEvent::PeerReceiveAborted { error_code: 42 }).unwrap();
+
+            let got = if use_finish {
+                SendStream::<Bytes>::poll_finish(&mut s, &mut cx)
+            } else {
+                SendStream::<Bytes>::poll_ready(&mut s, &mut cx)
+            };
+            match got {
+                std::task::Poll::Ready(Err(StreamErrorIncoming::StreamTerminated {
+                    error_code,
+                })) => assert_eq!(error_code, 42),
+                other => panic!("expected StreamTerminated{{42}}, got {other:?}"),
+            }
+            assert_eq!(h.sends.load(Relaxed), 0, "no send was ever issued");
+        }
+    }
+
+    #[test]
+    fn reset_loses_to_published_peer_terminal_no_native_op() {
+        // Local reset racing peer STOP_SENDING, terminal-first order: the
+        // callback-published terminal wins, no native reset is issued.
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        stream_callback(&mut ctx, StreamEvent::PeerReceiveAborted { error_code: 9 }).unwrap();
+        SendStream::<Bytes>::reset(&mut s, 5); // infallible; sees the terminal
+        assert_eq!(
+            h.resets.load(Relaxed),
+            0,
+            "no native reset behind a terminal"
+        );
+        assert!(
+            !s.sctx.reducer.reset_submitting,
+            "no reservation left behind"
+        );
+
+        // The stable winner is the peer terminal, not the local reset code.
+        match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                assert_eq!(error_code, 9)
+            }
+            other => panic!("expected StreamTerminated{{9}}, got {other:?}"),
+        }
+        SendStream::<Bytes>::reset(&mut s, 5);
+        assert_eq!(h.resets.load(Relaxed), 0, "still no native reset");
+    }
+
+    #[test]
+    fn reset_loses_to_published_connection_terminal_no_native_op() {
+        // Local reset racing a connection shutdown, terminal-first order.
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        stream_callback(
+            &mut ctx,
+            StreamEvent::ShutdownComplete {
+                connection_shutdown: true,
+                app_close_in_progress: false,
+                connection_shutdown_by_app: true,
+                connection_closed_remotely: true,
+                connection_error_code: 7,
+                connection_close_status: Status::new(StatusCode::QUIC_STATUS_ABORTED),
+            },
+        )
+        .unwrap();
+        SendStream::<Bytes>::reset(&mut s, 5);
+        assert_eq!(
+            h.resets.load(Relaxed),
+            0,
+            "no native reset behind a terminal"
+        );
+        assert!(!s.sctx.reducer.reset_submitting);
+
+        match SendStream::<Bytes>::poll_finish(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            })) => assert_eq!(error_code, 7),
+            other => panic!("expected connection ApplicationClose{{7}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reset_first_stays_stable_winner_with_single_native_reset() {
+        // The other order: local reset genuinely completes first (empty slot), so
+        // it issues exactly one native reset and remains the stable winner even
+        // when a peer terminal is published afterwards (first-writer, non-provisional).
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        SendStream::<Bytes>::reset(&mut s, 5);
+        assert_eq!(h.resets.load(Relaxed), 1);
+        assert!(
+            !s.sctx.reducer.reset_submitting,
+            "the reset reservation is cleared after ResetSubmitted"
+        );
+
+        // A later peer STOP_SENDING cannot overwrite the specific LocalReset winner
+        // nor trigger a second native reset.
+        stream_callback(&mut ctx, StreamEvent::PeerReceiveAborted { error_code: 9 }).unwrap();
+        match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(_))) => {}
+            other => panic!("expected Unknown(LocalStreamReset), got {other:?}"),
+        }
+        assert_eq!(h.resets.load(Relaxed), 1, "still exactly one native reset");
+    }
+
+    #[test]
+    fn reset_first_stays_stable_winner_over_connection_shutdown() {
+        // Item 3(b): the reset-first vs CONNECTION-shutdown race (connection variant
+        // of the peer race above). Local reset completes first (empty slot), so it
+        // issues exactly one native reset and remains the stable winner even when a
+        // connection shutdown is published afterwards; the reservation is cleared.
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        SendStream::<Bytes>::reset(&mut s, 5);
+        assert_eq!(h.resets.load(Relaxed), 1);
+        assert!(
+            !s.sctx.reducer.reset_submitting,
+            "the reset reservation is cleared after ResetSubmitted"
+        );
+
+        // A later connection shutdown cannot overwrite the specific LocalReset
+        // winner nor trigger a second native reset.
+        stream_callback(
+            &mut ctx,
+            StreamEvent::ShutdownComplete {
+                connection_shutdown: true,
+                app_close_in_progress: false,
+                connection_shutdown_by_app: true,
+                connection_closed_remotely: true,
+                connection_error_code: 7,
+                connection_close_status: Status::new(StatusCode::QUIC_STATUS_ABORTED),
+            },
+        )
+        .unwrap();
+        match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(_))) => {}
+            other => panic!("expected Unknown(LocalStreamReset), got {other:?}"),
+        }
+        assert_eq!(h.resets.load(Relaxed), 1, "still exactly one native reset");
+    }
+
+    /// Submit one non-empty send through the seam and drive it in-progress, then
+    /// replay a *cancelled* native `SendComplete` through the PRODUCTION callback
+    /// (reconstruct+drop the retained `client_context`). Leaves the cancelled
+    /// completion queued on the single ordered channel, an outstanding-send seam.
+    fn submit_then_cancel(h: &CountingHandle, s: &mut H3SendStream, ctx: &mut StreamSendCtx) {
+        SendStream::<Bytes>::send_data(s, Frame::Data(Bytes::from_static(b"payload"))).unwrap();
+        assert_eq!(h.sends.load(Relaxed), 1, "one native submission");
+        let cc = h.client_ctx.lock().unwrap().pop_front().unwrap();
+        stream_callback(
+            ctx,
+            StreamEvent::SendComplete {
+                cancelled: true,
+                client_context: cc as *const std::ffi::c_void,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mf2_cancellation_first_refines_to_peer_stop_before_observation() {
+        // Item 3(a): cancellation-FIRST order with an outstanding send. The cancelled
+        // completion is processed BEFORE the paired peer cause; the provisional stays
+        // UNOBSERVED (Pending), then the peer cause published before observation is the
+        // caller's FIRST observed terminal, and it is stable afterwards.
+        // FIRST observation is the refined specific cause, never Failed(ABORTED).
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        submit_then_cancel(&h, &mut s, &mut ctx);
+
+        // Process the cancelled completion with NO cause yet: unobserved, Pending.
+        assert!(
+            matches!(
+                SendStream::<Bytes>::poll_ready(&mut s, &mut cx),
+                std::task::Poll::Pending
+            ),
+            "a no-cause cancellation must NOT freeze/return a provisional abort"
+        );
+
+        // The paired peer cause is published before the caller observes anything.
+        stream_callback(&mut ctx, StreamEvent::PeerReceiveAborted { error_code: 9 }).unwrap();
+
+        // FIRST observation is the refined specific cause, never Failed(ABORTED).
+        match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                assert_eq!(error_code, 9)
+            }
+            other => panic!("expected refined StreamTerminated{{9}}, got {other:?}"),
+        }
+        // Stable after observation (frozen): the same class every later poll.
+        match SendStream::<Bytes>::poll_finish(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                assert_eq!(error_code, 9)
+            }
+            other => panic!("expected stable StreamTerminated{{9}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mf2_cancellation_first_refines_to_connection_before_observation() {
+        // Item 3(a), connection variant: cancellation-FIRST, then a connection
+        // shutdown refines the unobserved provisional to the connection cause.
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        submit_then_cancel(&h, &mut s, &mut ctx);
+
+        assert!(
+            matches!(
+                SendStream::<Bytes>::poll_ready(&mut s, &mut cx),
+                std::task::Poll::Pending
+            ),
+            "unobserved provisional cancellation waits for the closure point"
+        );
+
+        // Connection shutdown publishes Connection(reason) then closes the channel.
+        stream_callback(
+            &mut ctx,
+            StreamEvent::ShutdownComplete {
+                connection_shutdown: true,
+                app_close_in_progress: false,
+                connection_shutdown_by_app: true,
+                connection_closed_remotely: true,
+                connection_error_code: 7,
+                connection_close_status: Status::new(StatusCode::QUIC_STATUS_ABORTED),
+            },
+        )
+        .unwrap();
+
+        match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            })) => assert_eq!(error_code, 7),
+            other => panic!("expected refined connection ApplicationClose{{7}}, got {other:?}"),
+        }
+        // Stable after observation.
+        assert!(matches!(
+            SendStream::<Bytes>::poll_ready(&mut s, &mut cx),
+            std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming { .. }))
+        ));
+    }
+
+    #[test]
+    fn mf2_terminal_first_peer_stop_with_outstanding_send() {
+        // The other callback order (terminal-FIRST) with an outstanding send: the
+        // peer cause is published before the cancelled completion is processed, so it
+        // is surfaced directly — the provisional is never even synthesized.
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        // Peer STOP_SENDING (publishes Stopped + TerminalWake) BEFORE the cancelled
+        // completion, mirroring MsQuic's documented PeerReceiveAborted ordering.
+        SendStream::<Bytes>::send_data(&mut s, Frame::Data(Bytes::from_static(b"payload")))
+            .unwrap();
+        stream_callback(&mut ctx, StreamEvent::PeerReceiveAborted { error_code: 4 }).unwrap();
+        let cc = h.client_ctx.lock().unwrap().pop_front().unwrap();
+        stream_callback(
+            &mut ctx,
+            StreamEvent::SendComplete {
+                cancelled: true,
+                client_context: cc as *const std::ffi::c_void,
+            },
+        )
+        .unwrap();
+
+        match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                assert_eq!(error_code, 4)
+            }
+            other => panic!("expected StreamTerminated{{4}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mf2_cancellation_only_closure_yields_authoritative_abort() {
+        // The truly no-cause case: a cancelled completion followed by the channel
+        // closing with NO published cause reaches the closure point and yields an
+        // authoritative Failed(ABORTED) (Unknown), never a hang.
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        submit_then_cancel(&h, &mut s, &mut ctx);
+        assert!(matches!(
+            SendStream::<Bytes>::poll_ready(&mut s, &mut cx),
+            std::task::Poll::Pending
+        ));
+
+        // Close the channel with no cause published (the closure point / stream drop).
+        ctx.send.take();
+        match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::Unknown(_))) => {}
+            other => panic!("expected authoritative Unknown(ABORTED) at closure, got {other:?}"),
+        }
+    }
+}
+
+/// Phase 7 downcall clamp tests: the recv-side `stop_sending` and the
+/// connection-side `OpenStreams::close` route their outgoing application codes
+/// through `clamp_application_code` before the native shutdown. Each is exercised
+/// through its executor seam so the *actual* submitted value is asserted at the
+/// varint boundary (`(1<<62)-1`, `1<<62`, `u64::MAX`) with no live stream and no
+/// native shutdown reaching the wire.
+#[cfg(test)]
+mod downcall_clamp {
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use h3::error::Code;
+    use h3::quic::{OpenStreams, RecvStream};
+
+    use crate::error::clamp_application_code;
+    use crate::msquic::{Connection, ConnectionEvent, ConnectionRef, RegistrationConfig, Status};
+    use crate::registration::RundownGuard;
+    use crate::{
+        ConnHandle, H3RecvStream, OpenExec, OpeningStream, RecvExec, Registration, StreamOpener,
+        new_conn_terminal_slot, stream_ctx_channel,
+    };
+
+    /// Recording recv-side seam: captures every clamped `stop_sending` code.
+    #[derive(Debug, Default)]
+    struct RecordingRecvExec {
+        codes: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl RecvExec for RecordingRecvExec {
+        fn submit_stop_sending(&self, code: u64) -> Result<(), Status> {
+            self.codes.lock().unwrap().push(code);
+            Ok(())
+        }
+    }
+
+    /// Recording open-side seam: captures every clamped `close` code; never opens.
+    #[derive(Debug, Default)]
+    struct RecordingOpenExec {
+        codes: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl OpenExec for RecordingOpenExec {
+        fn submit_open_start(
+            &self,
+            _conn: &ConnHandle,
+            _uni: bool,
+        ) -> Result<OpeningStream, Status> {
+            unimplemented!("close-clamp test never opens a stream")
+        }
+        fn submit_conn_shutdown(&self, _conn: &ConnHandle, code: u64) {
+            self.codes.lock().unwrap().push(code);
+        }
+    }
+
+    const BOUNDARY: [(u64, u64); 3] = [
+        ((1u64 << 62) - 1, (1u64 << 62) - 1),
+        (1u64 << 62, (1u64 << 62) - 1),
+        (u64::MAX, (1u64 << 62) - 1),
+    ];
+
+    #[test]
+    fn stop_sending_submits_clamped_code_via_seam() {
+        for (input, expected) in BOUNDARY {
+            let rec = RecordingRecvExec::default();
+            let codes = rec.codes.clone();
+            let id: h3::quic::StreamId = 0u64.try_into().unwrap();
+            let (_ctx, _sctx, rctx) = stream_ctx_channel(id);
+            let mut r = H3RecvStream::with_exec(Box::new(rec), rctx);
+
+            RecvStream::stop_sending(&mut r, input);
+            assert_eq!(
+                codes.lock().unwrap().as_slice(),
+                &[expected],
+                "stop_sending must submit the clamped code (input {input:#x})"
+            );
+            // Cross-check the clamp helper agrees with the submitted value.
+            assert_eq!(clamp_application_code(input), expected);
+        }
+    }
+
+    #[test]
+    fn open_streams_close_submits_clamped_code_via_seam() {
+        // A single real (unstarted) connection is reused; the recording seam
+        // records the clamped code without any native shutdown reaching the wire.
+        let reg = Registration::new(&RegistrationConfig::default()).unwrap();
+
+        for (input, expected) in BOUNDARY {
+            let inner =
+                Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
+            let guard = RundownGuard::new(reg.state().clone());
+            let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
+
+            let rec = RecordingOpenExec::default();
+            let codes = rec.codes.clone();
+            let mut opener = StreamOpener::with_open_exec(conn, Box::new(rec));
+
+            OpenStreams::<Bytes>::close(&mut opener, Code::from(input), b"");
+            assert_eq!(
+                codes.lock().unwrap().as_slice(),
+                &[expected],
+                "close must submit the clamped code (input {input:#x})"
+            );
+            assert_eq!(clamp_application_code(input), expected);
+            // Drop the opener (and its ConnHandle) before the next iteration so the
+            // native ConnectionClose runs while the registration is still alive.
+            drop(opener);
+        }
     }
 }
