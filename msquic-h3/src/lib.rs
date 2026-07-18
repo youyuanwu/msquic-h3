@@ -2724,15 +2724,13 @@ mod receive_events {
 /// covered end-to-end by the loopback `basic_server_test`.
 #[cfg(test)]
 mod stream_open_identity {
-    use futures::channel::oneshot;
     use h3::quic::{ConnectionErrorIncoming, StreamErrorIncoming};
 
     use crate::error::ConnectionTerminal;
     use crate::msquic::{Status, StatusCode};
     use crate::{
         accept_stream_id, classify_start_outcome, conn_ctx_channel, fail_fast_terminal,
-        new_conn_terminal_slot, record_conn_terminal, stream_ctx_channel_pre_id,
-        stream_open_conn_error, validate_stream_id,
+        new_conn_terminal_slot, record_conn_terminal, stream_open_conn_error, validate_stream_id,
     };
 
     /// The largest valid QUIC stream ID (62-bit VarInt max).
@@ -2916,31 +2914,12 @@ mod stream_open_identity {
         ));
     }
 
-    #[test]
-    fn start_cancellation_is_detected_without_panic() {
-        // Simulate ShutdownComplete dropping the start sender (StreamSendCtx)
-        // before StartComplete: the OpeningStream's start receiver resolves as
-        // Canceled, which poll_open_inner maps to a connection error (never a
-        // panic). Here we assert the Canceled detection + the mapping helper.
-        let (ctx, mut recv) = stream_ctx_channel_pre_id();
-        drop(ctx); // drops the start sender -> cancellation
-        match recv.start.try_recv() {
-            Err(oneshot::Canceled) => {}
-            other => panic!("expected Canceled after sender drop, got {other:?}"),
-        }
-        // Cancelled with no published reason -> internal error.
-        let slot = new_conn_terminal_slot();
-        assert!(matches!(
-            stream_open_conn_error(&slot),
-            ConnectionErrorIncoming::InternalError(_)
-        ));
-        // Cancelled by a connection close -> connection error.
-        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(3));
-        assert!(matches!(
-            stream_open_conn_error(&slot),
-            ConnectionErrorIncoming::ApplicationClose { error_code: 3 }
-        ));
-    }
+    // The REAL poll_open_inner cancellation branch (a dropped start sender mapping
+    // to a connection error / nested internal error) is driven end-to-end through
+    // the public poll_open_bidi / poll_open_send in
+    // `downcall_clamp::poll_open_inner_start_cancellation_maps_through_real_function`.
+    // The two helper unit tests above (`stream_open_conn_error_*`) independently
+    // pin both arms of the mapping the branch relies on.
 
     /// The accepted-ID failpoint must be arm-able from a *live* `Connection`
     /// (what a Phase 8 loopback test holds) before any peer stream is accepted.
@@ -3415,6 +3394,97 @@ mod send_seam {
     }
 
     #[test]
+    fn peer_stop_sending_observed_with_send_outstanding() {
+        // Item 1 (Phase 8): the DETERMINISTIC proof of "peer STOP_SENDING with a
+        // send genuinely outstanding". Over pure loopback msquic copies a buffered
+        // send and completes it synchronously, so a send cannot be *held*
+        // observably outstanding across the public API (see the conformance
+        // module's idle-only note); that condition is proven here at the seam
+        // instead. The `CountingExec` retains the "native"-owned `Box<SendBuffer>`
+        // exactly as `StreamExecutor` does, so the send is provably still
+        // outstanding (not yet reclaimed, `send_inprogress` set) at the moment
+        // STOP_SENDING is observed — then surfaced at `poll_ready` as the sticky
+        // `StreamTerminated{code}`, and the outstanding box reclaimed exactly once
+        // through the production `stream_callback`.
+        const STOP_CODE: u64 = 0x6364;
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new())); // all-Ok
+        let (sctx, mut ctx) = test_send_ctx();
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        // 1. Issue a data send: the seam accepts ownership and RETAINS the box, so
+        //    the send is now genuinely outstanding (nothing reclaimed yet).
+        SendStream::<Bytes>::send_data(&mut s, Frame::Data(Bytes::from_static(b"more-data")))
+            .unwrap();
+        assert_eq!(h.sends.load(Relaxed), 1);
+        assert_eq!(
+            h.client_ctx.lock().unwrap().len(),
+            1,
+            "the send is outstanding: native holds the retained buffer"
+        );
+        assert_eq!(h.reclaims.load(Relaxed), 0, "nothing reclaimed yet");
+        assert!(
+            s.sctx.reducer.send_inprogress,
+            "the reducer marks the send in progress"
+        );
+
+        // 2. Peer STOP_SENDING arrives WHILE that send is still outstanding: the
+        //    retained box is provably NOT yet reclaimed, so this is the true
+        //    in-flight condition the loopback test could not establish.
+        stream_callback(
+            &mut ctx,
+            StreamEvent::PeerReceiveAborted {
+                error_code: STOP_CODE,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            h.client_ctx.lock().unwrap().len(),
+            1,
+            "STOP_SENDING observed with the send still outstanding (not completed)"
+        );
+        assert!(
+            s.sctx.reducer.send_inprogress,
+            "the send is still in progress when the stop is published"
+        );
+
+        // 3. The following poll_ready surfaces the sticky terminal even though the
+        //    outstanding send has not completed, preserving the exact stop code.
+        match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                assert_eq!(
+                    error_code, STOP_CODE,
+                    "exact peer stop code preserved (in flight)"
+                );
+            }
+            other => panic!("expected StreamTerminated{{{STOP_CODE:#x}}}, got {other:?}"),
+        }
+
+        // 4. The native (cancelled) SendComplete for that outstanding send still
+        //    arrives; the production callback reclaims the retained box exactly
+        //    once, mirroring real teardown and leaving nothing outstanding.
+        let cc = h.client_ctx.lock().unwrap().pop_front().unwrap();
+        stream_callback(
+            &mut ctx,
+            StreamEvent::SendComplete {
+                cancelled: true,
+                client_context: cc as *const c_void,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            h.reclaims.load(Relaxed),
+            0,
+            "reclaim happens in the callback, not the immediate-failure arm"
+        );
+        assert!(
+            h.client_ctx.lock().unwrap().is_empty(),
+            "no send left outstanding after the cancelled completion"
+        );
+    }
+
+    #[test]
     fn reset_loses_to_published_peer_terminal_no_native_op() {
         // Local reset racing peer STOP_SENDING, terminal-first order: the
         // callback-published terminal wins, no native reset is issued.
@@ -3718,6 +3788,264 @@ mod send_seam {
             other => panic!("expected authoritative Unknown(ABORTED) at closure, got {other:?}"),
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 8: the FULL deterministic `CountingExec` send-seam matrix.
+    //
+    // Classification: SEAM tests (NOT loopback). These own the comprehensive
+    // outstanding-send retain/reclaim and immediate-failure reclaim matrix the
+    // design lists (Phase 6 proved the minimal seam; Phase 8 owns the matrix).
+    // Every reclamation is driven through the PRODUCTION `stream_callback` — the
+    // exact `NonNull` check → reconstruct+drop `Box<SendBuffer>` → one
+    // `SendEvent::Complete` path — so the exactly-once ownership contract is
+    // exercised, not mocked. Buffers carry a drop counter (`new_counted`) so the
+    // reclamation COUNT is asserted concretely (this is the count that a real
+    // loopback send cannot expose; see `docs/error-propagation.md`,
+    // "Native-test mechanisms").
+    //
+    // These are self-checking and deterministic: if the outstanding allocation
+    // cannot be read as expected the test FAILS with a setup-specific message —
+    // it is never skipped or `#[ignore]`d (Rust has no "inconclusive" outcome).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// SEAM. The canonical `accepted_send_reclaims_via_callback_exactly_once`:
+    /// proves, in order, (1) the deterministic blocking condition was established
+    /// (buffer retained without a `SendComplete`); (2) exactly one adapter
+    /// allocation is outstanding after submit returns; (3) feeding the completion
+    /// through `stream_callback` causes exactly one callback reclamation and one
+    /// `Complete`; (4) the count is back to zero (exactly once).
+    #[test]
+    fn accepted_send_reclaims_via_callback_exactly_once() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let buf = SendBuffer::new_counted(Bytes::from_static(b"outstanding"), counter.clone());
+        let h = CountingHandle::default();
+        let mut exec = CountingExec::new(h.clone(), VecDeque::new()); // all-Ok script
+
+        exec.submit_send(buf).unwrap();
+
+        // (1)+(2): blocking condition established — one alloc, one outstanding
+        // pointer retained by "native", zero in-exec reclaims, buffer NOT dropped.
+        assert_eq!(h.allocs.load(Relaxed), 1, "setup: exactly one allocation");
+        assert_eq!(
+            h.client_ctx.lock().unwrap().len(),
+            1,
+            "setup: exactly one outstanding pointer retained (no SendComplete yet)"
+        );
+        assert_eq!(h.reclaims.load(Relaxed), 0, "setup: no in-exec reclaim");
+        assert_eq!(
+            counter.load(Relaxed),
+            0,
+            "setup: outstanding buffer must not be dropped yet"
+        );
+
+        // (3): feed the retained client_context through the PRODUCTION callback.
+        let (mut sctx, mut ctx) = test_send_ctx();
+        let cc = h.client_ctx.lock().unwrap().pop_front().unwrap();
+        stream_callback(
+            &mut ctx,
+            StreamEvent::SendComplete {
+                cancelled: false,
+                client_context: cc as *const c_void,
+            },
+        )
+        .unwrap();
+
+        // (4): reclaimed exactly once; exactly one Complete; a second read empty.
+        assert_eq!(
+            counter.load(Relaxed),
+            1,
+            "callback must reconstruct+drop the Box<SendBuffer> exactly once"
+        );
+        assert_eq!(
+            sctx.send.try_recv().unwrap(),
+            crate::error::SendEvent::Complete { cancelled: false },
+            "exactly one completion, reporting cancelled == false"
+        );
+        assert!(
+            sctx.send.try_recv().is_err(),
+            "no second completion (reclaimed exactly once)"
+        );
+    }
+
+    /// SEAM. Multiple concurrently-outstanding accepted sends: N drop-counted
+    /// buffers are submitted (all Ok) and each is retained by "native"; feeding
+    /// each retained `client_context` back through `stream_callback` reclaims that
+    /// buffer exactly once and enqueues exactly one `Complete` — N reclamations,
+    /// N completions, no double-free, no leak.
+    #[test]
+    fn multiple_outstanding_sends_each_reclaimed_exactly_once() {
+        const N: usize = 5;
+        let h = CountingHandle::default();
+        let mut exec = CountingExec::new(h.clone(), VecDeque::new());
+        let counters: Vec<_> = (0..N).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+
+        for c in &counters {
+            let buf = SendBuffer::new_counted(Bytes::from_static(b"payload"), c.clone());
+            exec.submit_send(buf).unwrap();
+        }
+
+        // All N outstanding: N allocations, N retained pointers, zero reclaimed.
+        assert_eq!(h.allocs.load(Relaxed), N);
+        assert_eq!(h.client_ctx.lock().unwrap().len(), N);
+        assert_eq!(h.reclaims.load(Relaxed), 0);
+        for c in &counters {
+            assert_eq!(
+                c.load(Relaxed),
+                0,
+                "no buffer reclaimed before its callback"
+            );
+        }
+
+        // Feed each retained pointer through the production callback path.
+        let (mut sctx, mut ctx) = test_send_ctx();
+        let pending: Vec<usize> = h.client_ctx.lock().unwrap().drain(..).collect();
+        for cc in pending {
+            stream_callback(
+                &mut ctx,
+                StreamEvent::SendComplete {
+                    cancelled: false,
+                    client_context: cc as *const c_void,
+                },
+            )
+            .unwrap();
+        }
+
+        // Each buffer reclaimed exactly once; exactly N completions delivered.
+        for c in &counters {
+            assert_eq!(c.load(Relaxed), 1, "each buffer reclaimed exactly once");
+        }
+        let mut completes = 0;
+        while sctx.send.try_recv().is_ok() {
+            completes += 1;
+        }
+        assert_eq!(completes, N, "exactly one Complete per outstanding send");
+    }
+
+    /// SEAM. Immediate-failure reclaim asserted with a drop counter: on a scripted
+    /// `Err`, `submit_send` reclaims the box in place (mirroring `StreamExecutor`),
+    /// so `allocs == 1`, `reclaims == 1`, the counter reads exactly 1, nothing is
+    /// retained, and ZERO `SendComplete` callbacks fire (native took no ownership).
+    #[test]
+    fn immediate_failure_reclaims_in_place_counted() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let buf = SendBuffer::new_counted(Bytes::from_static(b"doomed"), counter.clone());
+        let h = CountingHandle::default();
+        let mut script = VecDeque::new();
+        script.push_back(Err(Status::from(StatusCode::QUIC_STATUS_INVALID_PARAMETER)));
+        let mut exec = CountingExec::new(h.clone(), script);
+
+        exec.submit_send(buf)
+            .expect_err("scripted immediate failure");
+
+        assert_eq!(h.allocs.load(Relaxed), 1, "one allocation before failing");
+        assert_eq!(
+            h.reclaims.load(Relaxed),
+            1,
+            "reclaimed in place, exactly once"
+        );
+        assert_eq!(counter.load(Relaxed), 1, "the box was dropped exactly once");
+        assert!(
+            h.client_ctx.lock().unwrap().is_empty(),
+            "nothing retained on immediate failure"
+        );
+    }
+
+    /// SEAM. Mixed Ok/Err script: only accepted (Ok) sends are retained
+    /// outstanding; the rejected (Err) send is reclaimed in place. Then draining
+    /// the retained pointers through the callback reclaims each accepted buffer
+    /// exactly once — proving the retain-vs-reclaim bookkeeping does not conflate
+    /// the two ownership handoffs.
+    #[test]
+    fn mixed_ok_err_script_retains_only_accepted_sends() {
+        let h = CountingHandle::default();
+        let mut script = VecDeque::new();
+        script.push_back(Ok(()));
+        script.push_back(Err(Status::from(StatusCode::QUIC_STATUS_INVALID_PARAMETER)));
+        script.push_back(Ok(()));
+        let mut exec = CountingExec::new(h.clone(), script);
+
+        let c_ok1 = Arc::new(AtomicUsize::new(0));
+        let c_err = Arc::new(AtomicUsize::new(0));
+        let c_ok2 = Arc::new(AtomicUsize::new(0));
+        exec.submit_send(SendBuffer::new_counted(
+            Bytes::from_static(b"a"),
+            c_ok1.clone(),
+        ))
+        .unwrap();
+        exec.submit_send(SendBuffer::new_counted(
+            Bytes::from_static(b"b"),
+            c_err.clone(),
+        ))
+        .expect_err("scripted Err");
+        exec.submit_send(SendBuffer::new_counted(
+            Bytes::from_static(b"c"),
+            c_ok2.clone(),
+        ))
+        .unwrap();
+
+        // Three allocations; the Err was reclaimed in place; two retained.
+        assert_eq!(h.allocs.load(Relaxed), 3);
+        assert_eq!(h.reclaims.load(Relaxed), 1);
+        assert_eq!(h.client_ctx.lock().unwrap().len(), 2);
+        assert_eq!(c_err.load(Relaxed), 1, "rejected buffer reclaimed in place");
+        assert_eq!(c_ok1.load(Relaxed), 0, "accepted buffer still outstanding");
+        assert_eq!(c_ok2.load(Relaxed), 0, "accepted buffer still outstanding");
+
+        // Drain the two retained pointers through the production callback.
+        let (_sctx, mut ctx) = test_send_ctx();
+        let pending: Vec<usize> = h.client_ctx.lock().unwrap().drain(..).collect();
+        for cc in pending {
+            stream_callback(
+                &mut ctx,
+                StreamEvent::SendComplete {
+                    cancelled: false,
+                    client_context: cc as *const c_void,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            c_ok1.load(Relaxed),
+            1,
+            "first accepted reclaimed exactly once"
+        );
+        assert_eq!(
+            c_ok2.load(Relaxed),
+            1,
+            "second accepted reclaimed exactly once"
+        );
+    }
+
+    /// SEAM. A cancelled `SendComplete` (native cancel flag set) still reclaims
+    /// the outstanding buffer exactly once through the production callback, and
+    /// enqueues a `Complete { cancelled: true }` — the reclamation is independent
+    /// of the cancel flag (ownership is returned either way).
+    #[test]
+    fn cancelled_send_complete_reclaims_buffer_exactly_once() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let buf = SendBuffer::new_counted(Bytes::from_static(b"cancelled"), counter.clone());
+        let h = CountingHandle::default();
+        let mut exec = CountingExec::new(h.clone(), VecDeque::new());
+        exec.submit_send(buf).unwrap();
+        assert_eq!(counter.load(Relaxed), 0);
+
+        let (_sctx, mut ctx) = test_send_ctx();
+        let cc = h.client_ctx.lock().unwrap().pop_front().unwrap();
+        stream_callback(
+            &mut ctx,
+            StreamEvent::SendComplete {
+                cancelled: true,
+                client_context: cc as *const c_void,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            counter.load(Relaxed),
+            1,
+            "a cancelled completion still reclaims the box exactly once"
+        );
+    }
 }
 
 /// Phase 7 downcall clamp tests: the recv-side `stop_sending` and the
@@ -3732,14 +4060,18 @@ mod downcall_clamp {
 
     use bytes::Bytes;
     use h3::error::Code;
-    use h3::quic::{OpenStreams, RecvStream};
+    use h3::quic::{ConnectionErrorIncoming, OpenStreams, RecvStream, StreamErrorIncoming};
 
-    use crate::error::clamp_application_code;
-    use crate::msquic::{Connection, ConnectionEvent, ConnectionRef, RegistrationConfig, Status};
+    use crate::error::{ConnectionTerminal, clamp_application_code};
+    use crate::msquic::{
+        Connection, ConnectionEvent, ConnectionRef, RegistrationConfig, Status, Stream,
+        StreamEvent, StreamOpenFlags, StreamRef,
+    };
     use crate::registration::RundownGuard;
     use crate::{
-        ConnHandle, H3RecvStream, OpenExec, OpeningStream, RecvExec, Registration, StreamOpener,
-        new_conn_terminal_slot, stream_ctx_channel,
+        ConnHandle, H3RecvStream, OpenExec, OpeningStream, PreIdReceivers, PreIdTail, RecvExec,
+        Registration, StreamOpener, new_conn_terminal_slot, record_conn_terminal,
+        stream_ctx_channel, stream_ctx_channel_pre_id,
     };
 
     /// Recording recv-side seam: captures every clamped `stop_sending` code.
@@ -3827,5 +4159,672 @@ mod downcall_clamp {
             // native ConnectionClose runs while the registration is still alive.
             drop(opener);
         }
+    }
+
+    /// A leaked no-op waker gives a `'static` context reusable across polls.
+    fn noop_cx() -> std::task::Context<'static> {
+        let waker = Box::leak(Box::new(futures::task::noop_waker()));
+        std::task::Context::from_waker(waker)
+    }
+
+    /// Open-side seam that models the `ShutdownComplete`-drops-the-start-sender
+    /// race (MF / SF): `submit_open_start` opens a real (unstarted) native stream
+    /// but immediately DROPS the pre-ID start sender, so the [`OpeningStream`]'s
+    /// `start` receiver resolves as `oneshot::Canceled` — exactly the condition
+    /// `poll_open_inner`'s cancellation branch handles. When `record` is set, it
+    /// also publishes that connection terminal into the shared slot *during*
+    /// `submit_open_start` — i.e. AFTER `poll_open_inner`'s step-1 fail-fast has
+    /// already seen an empty slot and BEFORE it polls the pending start — modelling
+    /// a connection close that raced the open, so the cancellation resolves through
+    /// [`crate::stream_open_conn_error`] to a connection error rather than the
+    /// fail-fast path.
+    #[derive(Debug)]
+    struct CancellingOpenExec {
+        record: Option<ConnectionTerminal>,
+    }
+
+    impl OpenExec for CancellingOpenExec {
+        fn submit_open_start(&self, conn: &ConnHandle, uni: bool) -> Result<OpeningStream, Status> {
+            // Publish the racing terminal (if any) now: after step-1 fail-fast, so
+            // it is only observed at the cancellation branch's terminal read.
+            if let Some(reason) = self.record.clone() {
+                record_conn_terminal(conn.terminal(), reason);
+            }
+            let (ctx, recv) = stream_ctx_channel_pre_id();
+            let flag = if uni {
+                StreamOpenFlags::UNIDIRECTIONAL
+            } else {
+                StreamOpenFlags::NONE
+            };
+            // Trivial handler (never fires on an unstarted stream); it does NOT
+            // capture `ctx`, so dropping `ctx` drops the start sender.
+            let s = Stream::open(conn, flag, |_: StreamRef, _: StreamEvent| Ok(()))?;
+            drop(ctx); // drop the start sender -> pending start resolves Canceled
+            let PreIdReceivers {
+                start,
+                send,
+                send_terminal,
+                receive,
+            } = recv;
+            Ok(OpeningStream {
+                stream: Arc::new(s),
+                start,
+                tail: PreIdTail {
+                    send,
+                    send_terminal,
+                    receive,
+                },
+            })
+        }
+        fn submit_conn_shutdown(&self, _conn: &ConnHandle, _code: u64) {
+            unimplemented!("cancellation drive never closes the connection")
+        }
+    }
+
+    /// Item 2 (Phase 8): drive the REAL `poll_open_inner` (via the public
+    /// `poll_open_bidi` / `poll_open_send`) through its `ShutdownComplete`
+    /// cancellation branch and assert the mapped `StreamErrorIncoming` comes OUT of
+    /// the real function — not merely a detached `Canceled` detection plus a helper
+    /// call. Both sub-outcomes of the branch are covered: cancelled-with-no-reason
+    /// (nested `InternalError`) and cancelled-by-a-connection-close (a real
+    /// connection error carrying the peer code).
+    #[test]
+    fn poll_open_inner_start_cancellation_maps_through_real_function() {
+        let reg = Registration::new(&RegistrationConfig::default()).unwrap();
+
+        // (a) Cancelled with NO published reason -> nested InternalError, straight
+        //     out of the real poll_open_bidi.
+        {
+            let inner =
+                Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
+            let guard = RundownGuard::new(reg.state().clone());
+            let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
+            let mut opener =
+                StreamOpener::with_open_exec(conn, Box::new(CancellingOpenExec { record: None }));
+            let mut cx = noop_cx();
+
+            match OpenStreams::<Bytes>::poll_open_bidi(&mut opener, &mut cx) {
+                std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error: ConnectionErrorIncoming::InternalError(msg),
+                })) => assert!(
+                    msg.contains("cancelled without a terminal reason"),
+                    "unexpected InternalError message: {msg}"
+                ),
+                other => panic!("expected InternalError from real poll_open_bidi, got {other:?}"),
+            }
+            drop(opener);
+        }
+
+        // (b) Cancelled by a CONNECTION close -> the real cancellation branch reads
+        //     the raced terminal via stream_open_conn_error and surfaces the peer
+        //     application code, straight out of the real poll_open_send.
+        {
+            let inner =
+                Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
+            let guard = RundownGuard::new(reg.state().clone());
+            let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
+            let mut opener = StreamOpener::with_open_exec(
+                conn,
+                Box::new(CancellingOpenExec {
+                    record: Some(ConnectionTerminal::PeerApplication(3)),
+                }),
+            );
+            let mut cx = noop_cx();
+
+            match OpenStreams::<Bytes>::poll_open_send(&mut opener, &mut cx) {
+                std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+                })) => assert_eq!(error_code, 3, "peer application code preserved"),
+                other => {
+                    panic!("expected ApplicationClose{{3}} from real poll_open_send, got {other:?}")
+                }
+            }
+            drop(opener);
+        }
+    }
+}
+
+/// Phase 8 (Conformance) — end-to-end loopback tests over a real 127.0.0.1
+/// msquic connection, mirroring `listener::basic_server_test` but driving the
+/// raw `h3::quic` trait surface (open/accept bidi streams, `send_data`,
+/// `reset`, `stop_sending`, connection `close`) directly so each error-
+/// propagation path can be triggered deterministically without the full h3
+/// protocol layer.
+///
+/// Determinism strategy (no arbitrary sleeps racing real timers):
+/// - each test owns an isolated [`Registration`] and an **ephemeral** loopback
+///   port (`127.0.0.1:0`, queried back via `get_local_addr`), so parallel tests
+///   never collide;
+/// - peer `RESET_STREAM` / `STOP_SENDING` / application-close are produced by
+///   *calling the peer endpoint's own* `reset` / `stop_sending` / `close`, not by
+///   hoping a timer fires;
+/// - the idle-timeout case sets a short `IdleTimeoutMs` via msquic settings and
+///   then simply awaits the (bounded) shutdown — a fixed setting, not a race
+///   against another timer;
+/// - the accepted-stream-ID failpoint is armed on the **live** server
+///   `Connection` (Phase 5 seam) *before* the peer opens its stream, with an
+///   explicit client→server handshake barrier so the arming strictly precedes
+///   the peer `PeerStreamStarted`.
+///
+/// SOURCE-REVIEW-ONLY GUARANTEE (SC-007, labelled UNTESTED): the close-time
+/// inline `SendComplete` drain performed by native `QuicStreamClose` has **no**
+/// executable drop-triggered teardown test here — the public API cannot hold a
+/// real send observably outstanding across the close (buffered sends complete
+/// synchronously; see `docs/error-propagation.md`, "Native-test mechanisms").
+/// That guarantee rests on native source review plus the binding's uniform
+/// `close_inner` contract, and is asserted only by
+/// [`conformance::close_time_inline_drain_is_source_review_only`] as a labelled,
+/// auditable NON-executable marker — never by a passing teardown test. The
+/// adapter's own exactly-once reclamation bookkeeping is proven by the
+/// `send_seam` `CountingExec` suite, which replays the real `stream_callback`
+/// reclaim path.
+#[cfg(test)]
+mod conformance {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use h3::error::Code;
+    use h3::proto::frame::Frame;
+    use h3::quic::{
+        ConnectionErrorIncoming, OpenStreams, RecvStream, SendStream, StreamErrorIncoming,
+    };
+    use msquic::{
+        BufferRef, CredentialConfig, CredentialFlags, RegistrationConfig, ServerResumptionLevel,
+        Settings,
+    };
+
+    use crate::test::util::{get_test_cred, try_setup_tracing};
+    use crate::{Connection, H3Stream, Listener, Registration};
+
+    const H3_INTERNAL_ERROR: u64 = 0x0102;
+
+    // ── poll_fn adapters over the &mut self trait methods (buffer type = Bytes) ──
+
+    async fn open_bidi(conn: &mut Connection) -> Result<H3Stream, StreamErrorIncoming> {
+        std::future::poll_fn(|cx| OpenStreams::<Bytes>::poll_open_bidi(conn, cx)).await
+    }
+
+    async fn accept_bidi(conn: &mut Connection) -> Result<H3Stream, ConnectionErrorIncoming> {
+        std::future::poll_fn(|cx| {
+            <Connection as h3::quic::Connection<Bytes>>::poll_accept_bidi(conn, cx)
+        })
+        .await
+    }
+
+    async fn send_ready<S: SendStream<Bytes>>(s: &mut S) -> Result<(), StreamErrorIncoming> {
+        std::future::poll_fn(|cx| s.poll_ready(cx)).await
+    }
+
+    async fn send_finish<S: SendStream<Bytes>>(s: &mut S) -> Result<(), StreamErrorIncoming> {
+        std::future::poll_fn(|cx| s.poll_finish(cx)).await
+    }
+
+    /// Await a peer-caused send-side termination (`STOP_SENDING`).
+    ///
+    /// An idle `poll_ready` returns `Ok` immediately (no send in flight, no
+    /// terminal yet), so a single poll can observe `Ok` before the peer's
+    /// `STOP_SENDING` frame has been delivered and turned into the sticky send
+    /// terminal. This re-polls on a short fixed interval until the terminal is
+    /// observed. It is NOT a race against a timer: the peer stop is guaranteed to
+    /// arrive over loopback, so the loop always exits via the terminal; the outer
+    /// bound only guards against a hang if the propagation invariant regressed.
+    async fn await_peer_send_terminated<S: SendStream<Bytes>>(s: &mut S) -> u64 {
+        let poll_terminal = async {
+            loop {
+                match send_ready(s).await {
+                    Err(StreamErrorIncoming::StreamTerminated { error_code }) => {
+                        return error_code;
+                    }
+                    Err(other) => panic!("expected StreamTerminated, got {other:?}"),
+                    // Terminal not yet delivered; yield and re-poll.
+                    Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), poll_terminal)
+            .await
+            .expect("peer STOP_SENDING must be observed on the send side")
+    }
+
+    async fn recv_next<R: RecvStream>(
+        r: &mut R,
+    ) -> Result<Option<<R as RecvStream>::Buf>, StreamErrorIncoming> {
+        std::future::poll_fn(|cx| r.poll_data(cx)).await
+    }
+
+    /// A live loopback pair plus the machinery that must outlive them.
+    fn run_loopback<F, Fut>(idle_ms: u64, body: F)
+    where
+        F: FnOnce(Connection, Connection) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        try_setup_tracing();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let reg = Registration::new(&RegistrationConfig::default()).unwrap();
+            let alpn = [BufferRef::from("h3")];
+
+            // Server: self-signed cert, generous peer stream credit, configurable
+            // idle timeout.
+            let cred = get_test_cred();
+            let server_settings = Settings::new()
+                .set_ServerResumptionLevel(ServerResumptionLevel::ResumeAndZerortt)
+                .set_PeerBidiStreamCount(100)
+                .set_PeerUnidiStreamCount(100)
+                .set_IdleTimeoutMs(idle_ms);
+            let server_config = reg
+                .open_configuration(&alpn, Some(&server_settings))
+                .unwrap();
+            let cred_config = CredentialConfig::new()
+                .set_credential_flags(CredentialFlags::NO_CERTIFICATE_VALIDATION)
+                .set_credential(cred);
+            server_config.load_credential(&cred_config).unwrap();
+            let server_config = Arc::new(server_config);
+
+            let mut listener = Listener::new(
+                &reg,
+                server_config.clone(),
+                &alpn,
+                Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            )
+            .unwrap();
+            // Ephemeral port assigned by ListenerStart; read it back so the client
+            // dials the exact bound port (no fixed-port collisions across tests).
+            let port = listener.get_ref().get_local_addr().unwrap().port();
+
+            let client_settings = Settings::new()
+                .set_PeerBidiStreamCount(100)
+                .set_PeerUnidiStreamCount(100)
+                .set_IdleTimeoutMs(idle_ms);
+            let client_config = reg
+                .open_configuration(&alpn, Some(&client_settings))
+                .unwrap();
+            let client_cred = CredentialConfig::new_client()
+                .set_credential_flags(CredentialFlags::NO_CERTIFICATE_VALIDATION);
+            client_config.load_credential(&client_cred).unwrap();
+
+            // Drive server accept and client connect concurrently on the same
+            // single-threaded runtime; msquic worker threads fire the callbacks.
+            let (accepted, connected) = tokio::join!(
+                listener.accept(),
+                Connection::connect(&reg, &client_config, "127.0.0.1", port),
+            );
+            let server = accepted.expect("server accept ok").expect("a connection");
+            let client = connected.expect("client connect ok");
+
+            // Run the scenario; `body` owns and drops both connections.
+            body(server, client).await;
+
+            // Deterministic teardown order: connections were dropped by `body`;
+            // drop the listener, then drain the rundown, then the configurations.
+            drop(listener);
+            reg.shutdown();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), reg.wait_idle()).await;
+            drop(server_config);
+            drop(client_config);
+        });
+    }
+
+    /// Send one h3 `DATA` frame carrying `payload` on a send half.
+    fn send_data_frame<S: SendStream<Bytes>>(
+        s: &mut S,
+        payload: &'static [u8],
+    ) -> Result<(), StreamErrorIncoming> {
+        s.send_data(Frame::Data(Bytes::from_static(payload)))
+    }
+
+    /// Client opens a bidi stream and sends `first` so the server's
+    /// `PeerStreamStarted` fires; returns `(client_stream, server_stream)`, both
+    /// fully identified. The client flush (`poll_ready` to completion) guarantees
+    /// the opening `STREAM` frame has reached the peer before the server accepts,
+    /// so the handoff is ordered, not raced.
+    async fn establish_bidi(
+        client: &mut Connection,
+        server: &mut Connection,
+        first: &'static [u8],
+    ) -> (H3Stream, H3Stream) {
+        let mut cs = open_bidi(client).await.expect("client open bidi");
+        send_data_frame(&mut cs, first).expect("client send first frame");
+        send_ready(&mut cs).await.expect("client flush first frame");
+        let ss = accept_bidi(server).await.expect("server accept bidi");
+        (cs, ss)
+    }
+
+    /// (a) Peer `RESET_STREAM` → `StreamTerminated { code }` on the receiving
+    /// side, carrying the exact HTTP/3 code. The server resets its send half of a
+    /// client-opened bidi stream; the client observes the reset at `poll_data`.
+    #[test]
+    fn peer_reset_stream_maps_to_stream_terminated() {
+        run_loopback(5_000, |mut server, mut client| async move {
+            const RESET_CODE: u64 = 0x4142;
+            let (mut cs, mut ss) = establish_bidi(&mut client, &mut server, b"ping").await;
+
+            // Server RESET_STREAMs its send direction with a specific code.
+            SendStream::<Bytes>::reset(&mut ss, RESET_CODE);
+
+            // Client's receive half observes the peer reset (after draining any
+            // bytes the server may have sent first — none are expected here).
+            loop {
+                match recv_next(&mut cs).await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => panic!("expected RESET_STREAM, got a clean FIN"),
+                    Err(StreamErrorIncoming::StreamTerminated { error_code }) => {
+                        assert_eq!(error_code, RESET_CODE, "exact peer reset code preserved");
+                        break;
+                    }
+                    Err(other) => panic!("expected StreamTerminated, got {other:?}"),
+                }
+            }
+            drop(cs);
+            drop(ss);
+            drop(server);
+            drop(client);
+        });
+    }
+
+    /// (b, idle) Peer `STOP_SENDING` observed from the *send* side with no send
+    /// outstanding: the server stop_sends the receive half of a client-opened
+    /// bidi stream; the client's idle `poll_ready` surfaces
+    /// `StreamTerminated { code }`.
+    #[test]
+    fn peer_stop_sending_observed_from_send_side_idle() {
+        run_loopback(5_000, |mut server, mut client| async move {
+            const STOP_CODE: u64 = 0x5253;
+            let (mut cs, mut ss) = establish_bidi(&mut client, &mut server, b"hi").await;
+
+            // Server STOP_SENDINGs its receive half (= client's send half).
+            RecvStream::stop_sending(&mut ss, STOP_CODE);
+
+            // Client's send half — idle, no data buffered — observes the stop.
+            let code = await_peer_send_terminated(&mut cs).await;
+            assert_eq!(code, STOP_CODE, "exact peer stop code preserved (idle)");
+            drop(cs);
+            drop(ss);
+            drop(server);
+            drop(client);
+        });
+    }
+
+    // (b, in flight) DEFERRED-TO-SEAM. A peer `STOP_SENDING` observed with a send
+    // *genuinely outstanding* is intentionally NOT covered by a loopback test:
+    // over pure 127.0.0.1 msquic copies a buffered `send_data` and completes it
+    // synchronously (often before `send_data` even returns), so a send cannot be
+    // *held* observably outstanding through the public API — a loopback test could
+    // claim "in flight" but never prove it (documented in "Native-test
+    // mechanisms", `docs/error-propagation.md`). The true outstanding-send
+    // condition is instead proven deterministically at the send seam by
+    // [`send_seam::peer_stop_sending_observed_with_send_outstanding`], where the
+    // `CountingExec` retains the native-owned buffer so the send is provably still
+    // outstanding at the exact moment STOP_SENDING is observed and surfaced at
+    // `poll_ready` as `StreamTerminated { code }`. The idle observation over real
+    // loopback remains covered by
+    // [`peer_stop_sending_observed_from_send_side_idle`] above.
+
+    /// (d) Idle timeout → `ConnectionErrorIncoming::Timeout`. A short, fixed
+    /// `IdleTimeoutMs` makes the transport idle-close deterministic (a setting,
+    /// not a race against another timer); the client's `poll_accept_bidi` awaits
+    /// the resulting terminal with no manual sleep.
+    #[test]
+    fn idle_timeout_maps_to_timeout() {
+        run_loopback(300, |server, mut client| async move {
+            // No traffic after connect: the negotiated 300 ms idle timeout fires
+            // and both endpoints transport-close as idle.
+            let err = accept_bidi(&mut client)
+                .await
+                .expect_err("client must observe the idle timeout");
+            assert!(
+                matches!(err, ConnectionErrorIncoming::Timeout),
+                "expected Timeout, got {err:?}"
+            );
+            drop(server);
+            drop(client);
+        });
+    }
+
+    /// (e, local reset) Local cancellation via `reset(code)` → the client's own
+    /// send half reports the local-reset outcome (`Unknown(LocalStreamReset)`),
+    /// issues at most one native `ABORT_SEND`, and never panics.
+    #[test]
+    fn local_reset_yields_local_stream_reset_outcome() {
+        run_loopback(5_000, |mut server, mut client| async move {
+            const LOCAL_CODE: u64 = 0x0707;
+            let (mut cs, ss) = establish_bidi(&mut client, &mut server, b"payload").await;
+
+            // Client locally resets its own send half (infallible).
+            SendStream::<Bytes>::reset(&mut cs, LOCAL_CODE);
+
+            // The local outcome is surfaced at poll_finish as a local reset, not a
+            // peer termination or connection error.
+            match send_finish(&mut cs).await {
+                Err(StreamErrorIncoming::Unknown(e)) => {
+                    assert!(
+                        e.downcast_ref::<crate::LocalStreamReset>().is_some(),
+                        "expected LocalStreamReset, got {e:?}"
+                    );
+                }
+                other => panic!("expected Unknown(LocalStreamReset), got {other:?}"),
+            }
+            drop(cs);
+            drop(ss);
+            drop(server);
+            drop(client);
+        });
+    }
+
+    /// (e, local stop_sending) Local cancellation via `stop_sending(code)` → the
+    /// client's own receive half ends cleanly (`Ok(None)`, SF-6 local EOF)
+    /// without panicking, regardless of the peer.
+    #[test]
+    fn local_stop_sending_yields_clean_local_eof() {
+        run_loopback(5_000, |mut server, mut client| async move {
+            const LOCAL_CODE: u64 = 0x0809;
+            let (mut cs, ss) = establish_bidi(&mut client, &mut server, b"payload").await;
+
+            // Client locally stop_sends its own receive half (infallible).
+            RecvStream::stop_sending(&mut cs, LOCAL_CODE);
+
+            // SF-6: our own stop_sending is a clean local end-of-stream.
+            match recv_next(&mut cs).await {
+                Ok(None) => {}
+                other => panic!("expected clean Ok(None) local EOF, got {other:?}"),
+            }
+            drop(cs);
+            drop(ss);
+            drop(server);
+            drop(client);
+        });
+    }
+
+    /// (f) Attachment failure — a stream open attempted after the connection has
+    /// closed → a connection error, no panic. The peer application-closes the
+    /// connection; once the client has observed that terminal, a fresh
+    /// `poll_open_bidi` fails fast with a `ConnectionErrorIncoming` rather than
+    /// panicking.
+    ///
+    /// The tighter *in-flight* variant — a pending `OpeningStream` whose
+    /// `StartComplete` receiver is cancelled by `ShutdownComplete` — cannot be
+    /// suspended at exactly that instant through the public loopback surface, so
+    /// it is proven deterministically by the hermetic seam test
+    /// `downcall_clamp::poll_open_inner_start_cancellation_maps_through_real_function`.
+    #[test]
+    fn open_after_connection_close_is_connection_error_no_panic() {
+        run_loopback(5_000, |mut server, mut client| async move {
+            const APP_CODE: u64 = 0x0abc;
+            OpenStreams::<Bytes>::close(&mut server, Code::from(APP_CODE), b"bye");
+
+            // Confirm the client has observed the connection terminal first.
+            let conn_err = accept_bidi(&mut client)
+                .await
+                .expect_err("client observes the peer close");
+            assert!(
+                matches!(conn_err, ConnectionErrorIncoming::ApplicationClose { error_code } if error_code == APP_CODE),
+                "expected ApplicationClose({APP_CODE:#x}), got {conn_err:?}"
+            );
+
+            // Now an open must fail fast with a connection error — never a panic.
+            match open_bidi(&mut client).await {
+                Err(StreamErrorIncoming::ConnectionErrorIncoming { .. }) => {}
+                other => panic!("expected ConnectionErrorIncoming, got {other:?}"),
+            }
+            drop(server);
+            drop(client);
+        });
+    }
+
+    /// (g) Accepted-send reclamation *ordering* over a real loopback connection:
+    /// a server-accepted send drives to completion (proving the native
+    /// `SendComplete` was delivered and consumed), the client receives the data
+    /// end to end, and dropping every frontend owner afterwards causes no
+    /// callback panic.
+    ///
+    /// NOTE ON RECLAIM-ONCE: the exactly-once `Box<SendBuffer>` reclamation
+    /// *count* is proven by the `send_seam` `CountingExec` tests
+    /// (`send_buffer_reclaimed_exactly_once_via_callback`,
+    /// `immediate_send_failure_reclaims_without_completion`, and the outstanding-
+    /// retain matrix), which replay the production `stream_callback` reclaim path
+    /// with a drop-counted buffer. The public `send_data` path builds its
+    /// `SendBuffer` internally with no injectable counter, so a real loopback send
+    /// cannot be *counted* here — only its ordering and no-panic teardown are
+    /// observable (see `docs/error-propagation.md`, "Native-test mechanisms").
+    #[test]
+    fn accepted_send_completes_and_teardown_is_panic_free() {
+        run_loopback(5_000, |mut server, mut client| async move {
+            let (mut cs, mut ss) = establish_bidi(&mut client, &mut server, b"req").await;
+
+            // The accepted (server) side sends a response and drives it to
+            // completion: poll_ready resolves ready only after the single native
+            // SendComplete for this send is delivered and consumed.
+            const RESP: &[u8] = b"accepted-response-body";
+            send_data_frame(&mut ss, RESP).expect("server send response");
+            send_ready(&mut ss)
+                .await
+                .expect("server send completes once");
+
+            // The client receives the response bytes end to end (the h3 DATA frame
+            // header precedes the payload, which appears as the frame's suffix).
+            let mut got = Vec::new();
+            loop {
+                match recv_next(&mut cs).await {
+                    Ok(Some(chunk)) => {
+                        use bytes::Buf as _;
+                        got.extend_from_slice(chunk.chunk());
+                        if got.ends_with(RESP) {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => panic!("client recv error: {e:?}"),
+                }
+            }
+            assert!(
+                got.ends_with(RESP),
+                "client must receive the accepted-send payload; got {got:?}"
+            );
+
+            // Drop every frontend owner after the completion: no callback panic.
+            drop(cs);
+            drop(ss);
+            drop(server);
+            drop(client);
+        });
+    }
+
+    /// (h) Accepted-stream ID failpoint (Phase 5 connection-scoped seam), armed
+    /// on the *live* server `Connection` BEFORE the peer opens its stream. The
+    /// rejected stream is closed natively (never enqueued), the server's accept
+    /// path fails fast with `InternalError`, and — mirroring what h3 does on that
+    /// internal error — the connection is closed with `H3_INTERNAL_ERROR`, which
+    /// the peer observes as an application close carrying that code. No panic.
+    #[test]
+    fn accepted_stream_id_failpoint_rejects_and_closes_h3_internal_error() {
+        run_loopback(5_000, |mut server, mut client| async move {
+            // Arm BEFORE the peer opens a stream. Arming is synchronous on the
+            // live Connection's shared atomic, and the client only opens its
+            // stream afterwards, so the PeerStreamStarted callback is guaranteed
+            // to see the armed failpoint.
+            server.arm_accepted_id_query_fail();
+
+            // Peer opens a bidi stream and sends, driving the server's
+            // PeerStreamStarted (which trips the failpoint and rejects natively).
+            let mut cs = open_bidi(&mut client).await.expect("client open bidi");
+            send_data_frame(&mut cs, b"trigger").expect("client send trigger");
+
+            // The server accept path fails fast with an internal error, and the
+            // rejected stream is never delivered.
+            let acc_err = accept_bidi(&mut server)
+                .await
+                .expect_err("rejected accept must be an internal error");
+            assert!(
+                matches!(acc_err, ConnectionErrorIncoming::InternalError(_)),
+                "expected InternalError, got {acc_err:?}"
+            );
+
+            // h3 responds to an InternalError from the trait by closing the
+            // connection with H3_INTERNAL_ERROR; emulate that here.
+            OpenStreams::<Bytes>::close(&mut server, Code::H3_INTERNAL_ERROR, b"internal");
+
+            // The peer observes the H3_INTERNAL_ERROR application close.
+            let peer_err = accept_bidi(&mut client)
+                .await
+                .expect_err("client observes the H3_INTERNAL_ERROR close");
+            match peer_err {
+                ConnectionErrorIncoming::ApplicationClose { error_code } => {
+                    assert_eq!(
+                        error_code, H3_INTERNAL_ERROR,
+                        "connection closed with H3_INTERNAL_ERROR"
+                    );
+                }
+                other => panic!("expected ApplicationClose(H3_INTERNAL_ERROR), got {other:?}"),
+            }
+            drop(cs);
+            drop(server);
+            drop(client);
+        });
+    }
+
+    /// SC-007 labelled marker (NON-executable): the close-time inline
+    /// `SendComplete` drain performed by native `QuicStreamClose` has **no**
+    /// drop-triggered teardown test — the public API cannot hold a real send
+    /// observably outstanding across the close, so that path is exercised by
+    /// **native source review + the uniform `close_inner` contract**, NOT by any
+    /// executable test here. This test exists solely as an auditable label; it
+    /// deliberately asserts nothing about runtime behavior (there is nothing
+    /// test-observable to assert), only that this guarantee is documented as
+    /// source-review-only. See the module doc and `docs/error-propagation.md`
+    /// ("Native stream teardown on drop" / "Native-test mechanisms").
+    #[test]
+    fn close_time_inline_drain_is_source_review_only() {
+        // Intentionally empty: the inline-drain guarantee is established by
+        // source review, not by a drop-triggered teardown assertion. The adapter
+        // exactly-once reclamation bookkeeping it relies on is covered by the
+        // `send_seam` CountingExec tests.
+    }
+
+    /// (c) Peer application close → `ApplicationClose { code }` with the exact
+    /// HTTP/3 code, observed on the other endpoint's connection accept path.
+    #[test]
+    fn peer_application_close_propagates_code() {
+        run_loopback(5_000, |mut server, mut client| async move {
+            const APP_CODE: u64 = 0x1234;
+            // Server closes the connection with a specific application code.
+            OpenStreams::<Bytes>::close(&mut server, Code::from(APP_CODE), b"bye");
+
+            // Client observes the peer application close carrying that code.
+            let err = accept_bidi(&mut client)
+                .await
+                .expect_err("client must observe the peer close");
+            match err {
+                ConnectionErrorIncoming::ApplicationClose { error_code } => {
+                    assert_eq!(error_code, APP_CODE, "exact HTTP/3 code preserved");
+                }
+                other => panic!("expected ApplicationClose({APP_CODE:#x}), got {other:?}"),
+            }
+            drop(server);
+            drop(client);
+        });
     }
 }

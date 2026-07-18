@@ -889,6 +889,152 @@ mod tests {
     fn max_quic_varint_value() {
         assert_eq!(MAX_QUIC_VARINT, (1u64 << 62) - 1);
     }
+
+    /// Error-mapping matrix (Phases 3–7): every adapter terminal → h3 result row
+    /// from the design's "Required mapping" conversion table, asserted through the
+    /// authoritative `convert_conn` / `convert_recv` / `convert_send` helpers.
+    /// These are the ONLY sites that mint h3 error values, so proving the table
+    /// here proves the whole propagation surface's terminal-to-h3 contract.
+    #[test]
+    fn convert_conn_matrix() {
+        // PeerApplication(code) → ApplicationClose { code }
+        match convert_conn(ConnectionTerminal::PeerApplication(0x42)) {
+            ConnectionErrorIncoming::ApplicationClose { error_code } => {
+                assert_eq!(error_code, 0x42)
+            }
+            other => panic!("PeerApplication → {other:?}"),
+        }
+        // Timeout → Timeout
+        assert!(matches!(
+            convert_conn(ConnectionTerminal::Timeout),
+            ConnectionErrorIncoming::Timeout
+        ));
+        // Transport { status, error_code } → Undefined(MsQuicTransportError)
+        match convert_conn(ConnectionTerminal::Transport {
+            status: Status::new(StatusCode::QUIC_STATUS_TLS_ERROR),
+            error_code: 7,
+        }) {
+            ConnectionErrorIncoming::Undefined(e) => {
+                let t = e
+                    .downcast_ref::<MsQuicTransportError>()
+                    .expect("Transport → MsQuicTransportError");
+                // Both the wire transport error code AND the accompanying QUIC
+                // status must be preserved verbatim through the conversion.
+                assert_eq!(t.error_code, 7, "transport error code preserved");
+                assert_eq!(
+                    t.status
+                        .try_as_status_code()
+                        .expect("known transport status"),
+                    StatusCode::QUIC_STATUS_TLS_ERROR,
+                    "transport status preserved verbatim"
+                );
+            }
+            other => panic!("Transport → {other:?}"),
+        }
+        // LocalClose → Undefined(LocalConnectionClose)
+        match convert_conn(ConnectionTerminal::LocalClose) {
+            ConnectionErrorIncoming::Undefined(e) => {
+                assert!(e.downcast_ref::<LocalConnectionClose>().is_some());
+            }
+            other => panic!("LocalClose → {other:?}"),
+        }
+        // Internal(msg) → InternalError(msg)
+        match convert_conn(ConnectionTerminal::Internal("boom")) {
+            ConnectionErrorIncoming::InternalError(m) => assert_eq!(m, "boom"),
+            other => panic!("Internal → {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_recv_matrix() {
+        // Fin → Ok(None)
+        assert!(matches!(convert_recv(ReceiveTerminal::Fin), Ok(None)));
+        // Reset(code) → StreamTerminated { code }
+        match convert_recv(ReceiveTerminal::Reset(0x55)) {
+            Err(StreamErrorIncoming::StreamTerminated { error_code }) => {
+                assert_eq!(error_code, 0x55)
+            }
+            other => panic!("Reset → {other:?}"),
+        }
+        // Connection(reason) → ConnectionErrorIncoming using the conn conversion
+        match convert_recv(ReceiveTerminal::Connection(ConnectionTerminal::Timeout)) {
+            Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
+                assert!(matches!(connection_error, ConnectionErrorIncoming::Timeout));
+            }
+            other => panic!("Connection → {other:?}"),
+        }
+        // Internal(msg) → ConnectionErrorIncoming(InternalError)
+        match convert_recv(ReceiveTerminal::Internal("recv-boom")) {
+            Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::InternalError(m),
+            }) => assert_eq!(m, "recv-boom"),
+            other => panic!("Internal → {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_send_matrix() {
+        // Stopped(code) → StreamTerminated { code }
+        match convert_send(SendTerminal::Stopped(0x66)) {
+            StreamErrorIncoming::StreamTerminated { error_code } => assert_eq!(error_code, 0x66),
+            other => panic!("Stopped → {other:?}"),
+        }
+        // Connection(reason) → ConnectionErrorIncoming using the conn conversion
+        match convert_send(SendTerminal::Connection(
+            ConnectionTerminal::PeerApplication(9),
+        )) {
+            StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            } => assert_eq!(error_code, 9),
+            other => panic!("Connection → {other:?}"),
+        }
+        // LocalReset(code) → Unknown(LocalStreamReset)
+        match convert_send(SendTerminal::LocalReset(0x77)) {
+            StreamErrorIncoming::Unknown(e) => {
+                let r = e
+                    .downcast_ref::<LocalStreamReset>()
+                    .expect("LocalReset → LocalStreamReset");
+                assert_eq!(r.code, 0x77);
+            }
+            other => panic!("LocalReset → {other:?}"),
+        }
+        // Failed(status) → Unknown(status), preserving the exact QUIC status.
+        match convert_send(SendTerminal::Failed(Status::new(
+            StatusCode::QUIC_STATUS_ABORTED,
+        ))) {
+            StreamErrorIncoming::Unknown(e) => {
+                let s = e.downcast_ref::<Status>().expect("Failed → Status");
+                assert_eq!(
+                    s.try_as_status_code().expect("known failed status"),
+                    StatusCode::QUIC_STATUS_ABORTED,
+                    "failed send status preserved verbatim"
+                );
+            }
+            other => panic!("Failed → {other:?}"),
+        }
+        // ProvisionalAbort → Unknown(aborted status) (defensive fallback); the
+        // synthesized status is the authoritative QUIC_STATUS_ABORTED.
+        match convert_send(SendTerminal::ProvisionalAbort) {
+            StreamErrorIncoming::Unknown(e) => {
+                let s = e
+                    .downcast_ref::<Status>()
+                    .expect("ProvisionalAbort → Status");
+                assert_eq!(
+                    s.try_as_status_code().expect("known provisional status"),
+                    StatusCode::QUIC_STATUS_ABORTED,
+                    "provisional abort maps to the aborted status"
+                );
+            }
+            other => panic!("ProvisionalAbort → {other:?}"),
+        }
+        // Internal(msg) → ConnectionErrorIncoming(InternalError)
+        match convert_send(SendTerminal::Internal("send-boom")) {
+            StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::InternalError(m),
+            } => assert_eq!(m, "send-boom"),
+            other => panic!("Internal → {other:?}"),
+        }
+    }
 }
 
 /// Table-driven tests for the pure send-side reducer (Phase 7).
