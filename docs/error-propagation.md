@@ -168,44 +168,72 @@ allocation is concrete:
 ```rust
 struct SendBuffer {
   buffers: [BufferRef; 1],
-  bytes: Bytes,
+  _bytes: Bytes,
 }
+
+// SAFETY: `_bytes` owns immutable, `Send` heap storage; `buffers` holds only
+// inert pointer/length metadata into that storage. The box is transferred to
+// MsQuic through `client_context` and reconstructed + dropped exactly once
+// after `SendComplete` (or reclaimed by the caller on immediate `Stream::send`
+// failure). No Rust code accesses the bytes while native code owns the box, so
+// dropping it on an MsQuic worker thread is sound.
+unsafe impl Send for SendBuffer {}
+// `SendBuffer` is transferred, never shared, so `Sync` is neither needed nor
+// implemented. A compile-time `assert_impl_all!(SendBuffer: Send)` guards this.
 ```
+
+`SendBuffer` is `!Send` by default because `BufferRef` is
+`#[repr(transparent)]` over `QUIC_BUFFER { Length: u32, Buffer: *mut u8 }` and a
+raw `*mut u8` is `!Send`. The eager `Box::into_raw` -> `client_context` ->
+`Box::from_raw` transfer launders the box through `*const c_void`, so the
+compiler cannot check the cross-thread drop; the `unsafe impl Send` above makes
+that transfer explicit and reviewable (the old `H3Buff` path relied on the same
+mechanism via `unsafe impl Send for BufPtr`).
 
 A single send request is capped at `u32::MAX` bytes by MsQuic itself:
 `MsQuicStreamSend` sums every `QUIC_BUFFER.Length` into a `u64 TotalLength` and
 returns `QUIC_STATUS_INVALID_PARAMETER` when that sum exceeds `UINT32_MAX`,
-before the request is queued. Partitioning a larger payload across multiple
-`BufferRef` entries therefore does not help — the whole request is rejected — so
-the design validates the complete length up front and keeps a single buffer:
+before the request is queued. Relying on that native limit alone is a poor
+ceiling for an *owned-copy* design: a near-`u32::MAX` `send_data` would allocate
+a second near-4 GiB buffer before MsQuic is called, and a Rust allocation
+failure there can abort the process rather than return an error. The adapter
+therefore imposes its own finite ceiling `MAX_ADAPTER_SEND` (initial decision:
+`16 * 1024 * 1024`, i.e. 16 MiB — comfortably above normal HTTP/3 frame sizes,
+well below any dangerous allocation), named separately from the native
+`u32::MAX` protocol maximum and tunable later. A `send_data` above the ceiling
+is rejected with `OversizedSend` **before** any allocation. Partitioning a
+larger payload across multiple `BufferRef` entries is intentionally not done —
+internal chunking would require the reducer to track multiple native sends per
+h3 `send_data` and is deferred as a separate future design. So the design
+validates the complete length up front and keeps a single buffer:
 
 ```text
-remaining == 0              -> successful no-op (no allocation, no native send,
-                               send_inprogress stays false)
-remaining > u32::MAX        -> Err(StreamErrorIncoming::Unknown(OversizedSend))
-                               before any allocation or native submission;
-                               finish/terminal state unchanged
-0 < remaining <= u32::MAX   -> materialize into owned Bytes, construct one
-                               BufferRef, submit one native send
+remaining == 0                     -> successful no-op (no allocation, no native
+                                      send, send_inprogress stays false)
+remaining > MAX_ADAPTER_SEND       -> Err(StreamErrorIncoming::Unknown(OversizedSend))
+                                      before any allocation or native submission;
+                                      finish/terminal state unchanged
+0 < remaining <= MAX_ADAPTER_SEND  -> materialize into owned Bytes, construct one
+                                      BufferRef, submit one native send
 ```
 
 `OversizedSend` is a small adapter-owned `Debug + Display + Error` type. An
 oversized send is a stream-operation limitation, not a connection failure or a
 peer termination, so `StreamErrorIncoming::Unknown` is the closest h3 class.
 
-Construct `bytes` first, then construct the `BufferRef` from its slice and put
+Construct `_bytes` first, then construct the `BufferRef` from its slice and put
 both in the box. Moving `Bytes` does not move its referenced byte storage, so
 the pointer remains stable. `SendBuffer` is therefore self-referential:
-`buffers[0]` points into the heap storage owned by `bytes`, not into the struct,
+`buffers[0]` points into the heap storage owned by `_bytes`, not into the struct,
 and stays valid for as long as the box lives. This invariant is load-bearing and
 warrants an explicit safety comment at the construction site. Put construction
 behind one function taking an already-validated non-zero `u32` length (the
 validation from finding 5's precedence table has already rejected empty and
-oversized), so `BufferRef::from(&bytes[..])` — whose binding impl casts `usize`
-length to `u32` — never truncates. The `bytes` field exists only to own storage;
-name it `_bytes` (or read it in a small invariant helper) so it survives the
-repository's `-D warnings` policy as an otherwise-unread private field. A test
-asserts the `BufferRef` pointer and length still match after the completed
+above-ceiling), so `BufferRef::from(&_bytes[..])` — whose binding impl casts
+`usize` length to `u32` — never truncates. The `_bytes` field exists only to own
+storage; its leading underscore keeps the repository's `-D warnings` policy happy
+for an otherwise-unread private field (or read it in a small invariant helper). A
+test asserts the `BufferRef` pointer and length still match after the completed
 `SendBuffer` is moved into its `Box`. Pass `Box::into_raw(send_buffer)` as
 `client_context`. On `SendComplete`, the callback reconstructs `Box<SendBuffer>`
 and drops it immediately before enqueueing the completion event. MsQuic
@@ -221,17 +249,17 @@ buffer type. The cost is one full wire-buffer materialization per non-empty
 every chunk (the frame header array plus the payload), then `freeze()`. This is
 an allocation and byte copy even when the inner payload `B` is a single
 contiguous `Bytes`; it is not a refcount split, and it doubles peak payload
-memory. Because the design accepts requests up to the native `u32::MAX` limit, a
-near-4 GiB send attempts a second near-4 GiB allocation before MsQuic is called,
-and a Rust allocation failure there may **abort** rather than produce
-`OversizedSend`/`StreamErrorIncoming`.
+memory. The `MAX_ADAPTER_SEND` ceiling (above) bounds that doubling and removes
+the near-4 GiB double-allocation / allocation-abort hazard: a request above the
+ceiling is rejected with `OversizedSend` before any allocation.
 
 This is a sound choice (it does not justify retaining the unsound generic
-`H3Buff` erasure), but its cost is a **release gate**, not optional: add a
-benchmark for header-only, small-body, and large contiguous-body sends, document
-peak-memory behavior, and make an explicit decision on the size ceiling — accept
-the native `u32::MAX` limit as-is, impose a lower adapter limit that rejects with
-`OversizedSend` before allocating, or later add internal chunking. The
+`H3Buff` erasure). The remaining **release-gate** work is measurement, not the
+ceiling decision: add a benchmark for header-only, small-body, and large
+contiguous-body sends up to the ceiling, document peak-memory behavior, and
+revisit `MAX_ADAPTER_SEND` if the benchmarks justify a different value or motivate
+internal chunking (a separate future design that would make the reducer track
+multiple native sends per `send_data`). The
 allocation crossing FFI contains only owned `Bytes` plus pointer metadata, and
 the callback knows its concrete destructor. The old generic `H3Buff` can be
 deleted after its remaining uses are removed.
@@ -856,7 +884,15 @@ a system library is not silently assumed supported:
   does not prove which shared library the test process actually loads at
   runtime. Make native version/platform an explicit CI matrix dimension, and
   before the conformance tests query MsQuic's runtime version and **fail** if it
-  differs from the matrix entry. Keep "compile compatibility" and "conformance
+  differs from the matrix entry. The query is `PARAM_GLOBAL_VERSION`
+  (`0x01000004`) against a null global handle, whose value is `[u32; 4]`
+  (`QUIC_PARAM_GLOBAL_LIBRARY_VERSION` is `uint32_t[4]`) — `get_param_auto::<u32>`
+  allocates only 4 bytes and returns `QUIC_STATUS_BUFFER_TOO_SMALL`, so the query
+  type must be `[u32; 4]`. Compare normalized numeric components (and optionally
+  `PARAM_GLOBAL_LIBRARY_GIT_HASH` when two builds share a semantic version), not
+  a loosely formatted string. Keep this in the conformance preflight, not in
+  `Registration::new` (which must still accept ABI-compatible libraries outside
+  the tested-support matrix). Keep "compile compatibility" and "conformance
   support" as separate claims.
 
 **Release gate.** Before release, record the exact supported native
@@ -907,12 +943,14 @@ enum SendPoll {
     Closed,
 }
 
-/// `send_data` payload classification, computed after conversion into
-/// `WriteBuf<B>` but before any owned bytes are materialized.
+/// `send_data` payload classification, computed from `remaining()` after
+/// conversion into `WriteBuf<B>` but before any owned bytes are materialized.
+/// The `NonEmpty`/`Oversized` split is against `MAX_ADAPTER_SEND`, not the raw
+/// native `u32::MAX`.
 enum SendPayload {
     Empty,
-    NonEmpty { len: u32 },
-    Oversized { len: usize },
+    NonEmpty { len: u32 },        // 0 < len <= MAX_ADAPTER_SEND
+    Oversized { len: usize },     // len > MAX_ADAPTER_SEND
 }
 
 enum SendInput {
@@ -1111,6 +1149,7 @@ Request and event inputs:
 | `PollFinish(Event(Complete{cancelled:false}))` | send pending, not finishing | `send_inprogress=false`, `finish_submitting=true` | `SubmitGraceful` |
 | `PollFinish(Event(Complete{cancelled:true}))` | send pending, not finishing | `send_inprogress=false` | `PublishTerminal{winner or Failed(ABORTED), PollFinish}` |
 | `PollFinish(Event(TerminalWake))` | any (not complete) | none | `PublishTerminal{winner or Internal, PollFinish}` |
+| `PollFinish(Pending)` | `send_inprogress`, not finishing | none | `Pending` (waiting for the in-flight data send; no graceful submit yet) |
 | `PollFinish(Pending)` | idle, not finishing | `finish_submitting=true` | `SubmitGraceful` |
 | `PollFinish(Event(FinishComplete{graceful:true}))` | `finish_started` | `finish_complete=true` | `ReturnFinished` |
 | `PollFinish(Event(FinishComplete{graceful:false}))` | `finish_started` | none | `PublishTerminal{winner or Failed(ABORTED), PollFinish}` |
@@ -1136,6 +1175,38 @@ unexpected or impossible event is adapter `Internal`, never a panic. Unit tests
 call the reducer and prove that repeated finish polls
 emit `SubmitGraceful` exactly once and reset emits exactly one
 `SubmitReset(code)` without a mock native stream abstraction.
+
+#### Command execution loop
+
+The reducer is pure; a per-method executor loop runs its commands against MsQuic
+(through the counting executor seam) and feeds results straight back into
+`transition`. The loop must make bounded progress within one poll — in
+particular `RepollFinish` performs one fresh channel poll in the **same**
+`poll_finish` call, never deferring to a later external invocation (that would
+recreate the lost-waker bug). Normative shape for `poll_finish`:
+
+```text
+loop {
+    let poll = poll_send_channel(cx);            // Pending | Event(e) | Closed
+    match transition(&mut state, PollFinish { poll, terminal: load_winner() }) {
+        Pending            => return Poll::Pending,        // waker already registered
+        ReturnFinished     => return Poll::Ready(Ok(())),
+        ReturnError(t)     => return Poll::Ready(Err(convert(t))),
+        SubmitGraceful     => feed(GracefulSubmitted { result: exec.graceful(), .. }),
+        PublishTerminal{..} => feed(TerminalPublished { winner: publish(..), .. }),
+        RepollFinish       => continue,           // re-poll the channel this call
+        _                  => unreachable_internal(),
+    }
+}
+```
+
+Only `Pending`, a return command, or an impossible-state `Internal` exits the
+loop; native-submission and terminal-publication results are fed back
+immediately, and `RepollFinish` iterates. `poll_ready`, `send_data`, and `reset`
+use the same immediate-feedback discipline for their own command sets. Test the
+real executor with a stubbed channel that queues `FinishComplete` during the
+native-call stub (proving same-call consumption) and one that stays pending
+(proving the waker is registered before `Pending`).
 
 
 Recommended structural changes:
@@ -1181,6 +1252,18 @@ obvious):
   loopback test asserts all three outcomes: the rejected stream is never
   enqueued, both acceptors observe the winning connection terminal, and the peer
   observes `H3_INTERNAL_ERROR` after h3 handles it.
+- **Connection-scoped controls (not thread-local / process-global).** MsQuic
+  callbacks run on worker threads and a connection may move between workers, so a
+  thread-local failpoint set by the test thread would never fire in the callback,
+  and a process-global one-shot flag or counter would race parallel tests. Put
+  test controls in state already cloned into the callback, behind `#[cfg(test)]`
+  or a private test-support feature: the accepted-ID failpoint is an
+  atomic action/counter in `ConnectionState` (fail the next or Nth query for
+  that connection, consuming itself atomically and identifying exactly which
+  stream is rejected), and the reclamation counter is an `Arc<AtomicUsize>` tied
+  to the conformance test's connection/stream family and retained by each test
+  `SendBuffer`. Tests must run correctly under the normal parallel harness;
+  serializing the whole suite is a weaker, explicitly-stated fallback.
 - **Command executor.** The pure reducer proves which `SendCommand` is emitted,
   but not that the executor calls MsQuic exactly once (or not at all). Route
   native `open`/`send`/`shutdown(GRACEFUL)`/`shutdown(ABORT_*)` through one
@@ -1284,6 +1367,14 @@ Required unit tests:
   `TerminalWake` through `poll_finish` becomes `Internal`;
 - `poll_ready` after `finish_started` returns nested `InternalError` and issues
   no native call;
+- `poll_finish` while a data send is in flight waits (`Pending`) with **no**
+  native shutdown call, and a following `Complete{cancelled:false}` then emits
+  exactly one `SubmitGraceful` in the same poll (both paths from the same
+  starting state);
+- terminal-first ordering (a `TerminalWake` observed before the corresponding
+  `Complete`) never triggers a second native call or a buffer leak, even though
+  `Complete` may remain queued and `send_inprogress` stays set until drop — the
+  sticky terminal is returned and the stream is an intentional dead state;
 - stream IDs are cached before exposure and remain available after native
   shutdown;
 - immediate graceful-shutdown failure is sticky and is not retried;
@@ -1308,32 +1399,41 @@ Required loopback tests:
   the send-allocation count back to zero (exactly-once `SendBuffer` reclamation)
   with no callback panic. This directly guards the close-time inline-drain
   assumption the ownership model relies on, against whichever `libmsquic` is
-  linked. The test must be made deterministically outstanding, because with
-  MsQuic send buffering the `SendComplete` usually fires inline during
-  `Stream::send`. Disabling send buffering is **not** possible through the
-  current `msquic` 2.5.1-beta safe API: `Settings::set_SendBufferingEnabled` is
-  generated by an enable-only bitflag macro with signature
-  `fn set_SendBufferingEnabled(self) -> Self` that always sets the value to `1`
-  (there is no `bool` argument, and no safe way to set it false). Before this
-  test — and therefore before the direct-drop ownership model can be considered
-  gated — pick and document one feasible mechanism:
-  1. extend the `msquic` binding with `set_SendBufferingEnabled(bool)`;
-  2. add a narrowly scoped, reviewed raw-settings helper that sets `IsSet` and a
-     `false` value; or
-  3. define another deterministic way to hold a send outstanding (e.g. withhold
-     peer flow-control credit) and prove it against every supported native build.
-  The test must **first prove buffering was actually disabled** (or that its
-  chosen mechanism produced an outstanding send), then increment an allocation
-  counter before native submission, assert it is exactly one immediately before
-  dropping the final frontend owner, and assert it returns to zero after drop and
-  callback completion. Because Rust's test harness has no "inconclusive"
-  outcome, make the setup deterministic and self-checking: retry the controlled
-  setup a bounded number of times, and if no live outstanding send can be
-  produced, **fail** with a setup-specific message (do not pass or `#[ignore]`,
-  since the compatibility requirement was not
-  exercised). With buffering disabled and flow-control credit withheld, a setup
-  failure indicates a real test-environment problem. Run it for every native
-  MsQuic configuration declared supported.
+  linked. The test must be made deterministically outstanding, because with send
+  buffering enabled `SendComplete` may occur too quickly for the test to retain
+  an observably outstanding allocation after `Stream::send` returns. (MsQuic does
+  **not** invoke recursive application callbacks for ordinary API down-calls by
+  default — that only happens with an explicit `QUIC_STREAM_SHUTDOWN_FLAG_INLINE`
+  shutdown, which this design does not use — but a completion can still be
+  processed on the connection worker before the caller's next observation, or
+  race a call from another thread.) Disabling send buffering is not possible
+  through the current `msquic` 2.5.1-beta safe API: `set_SendBufferingEnabled` is
+  an enable-only bitflag macro (`fn set_SendBufferingEnabled(self) -> Self` that
+  always sets the value to `1`). **Selected mechanism:** extend the `msquic`
+  binding with a `set_SendBufferingEnabled(bool)` setter that sets `IsSet` and
+  the given value — it exposes an existing native setting without adapter-local
+  `QUIC_SETTINGS` layout manipulation, and is the design's committed dependency
+  (not an implementation-time fork). If that upstream change is unavailable, the
+  fallback is a narrowly scoped, reviewed, test-only raw-settings helper that
+  documents the exact `QUIC_SETTINGS` field, `IsSet` bit, and platform ABI
+  assumptions.
+  The test must prove four distinct facts, in order: (1) buffering was actually
+  disabled (or another deterministic blocking condition was established);
+  (2) exactly one adapter allocation remained outstanding after `Stream::send`
+  returned; (3) final-owner drop caused exactly one callback reclamation; and
+  (4) the count returned to zero before native close returned / the test's
+  explicit completion point. Because Rust's test harness has no "inconclusive"
+  outcome, make the setup deterministic and self-checking: bounded retries may
+  tolerate scheduling variation only **after** the setup is proven — they must
+  not be the mechanism that occasionally creates the condition — and if no live
+  outstanding send can be produced, **fail** with a setup-specific message (do
+  not pass or `#[ignore]`). Run it for every native MsQuic configuration declared
+  supported;
+- native `SendComplete` ownership contract, both directions: an **accepted** send
+  returns its context in exactly one completion; a **rejected** send (controlled
+  immediate `Stream::send` failure) produces **no** completion. A callback
+  counter asserts the exactly-once allocation invariant across supported native
+  versions.
 
 ## Implementation order
 
