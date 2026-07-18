@@ -21,6 +21,9 @@ use msquic::{
 
 mod buffer;
 pub use buffer::*;
+mod error;
+use error::clamp_application_code;
+pub use error::{LocalConnectionClose, LocalStreamReset, MsQuicTransportError, OversizedSend};
 mod listener;
 pub use listener::Listener;
 mod registration;
@@ -352,8 +355,10 @@ impl<B: Buf> OpenStreams<B> for StreamOpener {
         tracing::instrument(skip_all, level = "trace", ret)
     )]
     fn close(&mut self, code: h3::error::Code, _reason: &[u8]) {
-        self.conn
-            .shutdown(ConnectionShutdownFlags::NONE, code.value());
+        self.conn.shutdown(
+            ConnectionShutdownFlags::NONE,
+            clamp_application_code(code.value()),
+        );
     }
 }
 
@@ -738,9 +743,10 @@ impl RecvStream for H3RecvStream {
     )]
     fn stop_sending(&mut self, error_code: u64) {
         // Close the send path.
-        let _ = self
-            .stream
-            .shutdown(StreamShutdownFlags::ABORT_RECEIVE, error_code);
+        let _ = self.stream.shutdown(
+            StreamShutdownFlags::ABORT_RECEIVE,
+            clamp_application_code(error_code),
+        );
     }
 
     fn recv_id(&self) -> h3::quic::StreamId {
