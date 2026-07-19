@@ -1288,6 +1288,20 @@ struct RecvBudget {
     state: Mutex<RecvState>,
 }
 
+/// Outcome of the callback-side [`RecvBudget::admit`] transition.
+enum Admit {
+    /// Bytes published and the stream is within budget: complete normally.
+    Accepted,
+    /// Bytes published and the stream is now at/over budget: the caller must
+    /// return `QUIC_STATUS_PENDING` (the indication is NOT completed yet).
+    Pend,
+    /// Publication failed (the frontend receive half was dropped). The
+    /// `RecvState` mutation was rolled back under the same lock, so accounting is
+    /// exactly as if the indication never arrived; the caller drops the sender
+    /// and issues no pend.
+    PublishFailed,
+}
+
 impl RecvBudget {
     /// Lock the receive state, recovering a poisoned lock rather than panicking
     /// (FFI callbacks must never unwind across the msquic boundary).
@@ -1296,15 +1310,24 @@ impl RecvBudget {
     }
 
     /// Callback-side single synchronized transition — **accounting BEFORE
-    /// drain-visibility**. Adds a full indication of `total` bytes, decides
-    /// whether the stream must pend (saving this indication's FULL length), and
-    /// then — still holding the lock, as the LAST step — runs `publish` to make
-    /// the bytes drain-visible. Returns `true` when the caller must return
-    /// `QUIC_STATUS_PENDING` (the budget is at/over `MAX_RECV_BUFFER`; the
-    /// indication is NOT completed yet). Because the publish is last, a
-    /// concurrent drain can never subtract before the increment lands.
-    fn admit(&self, total: usize, publish: impl FnOnce()) -> bool {
+    /// drain-visibility, publish and decision atomic under one lock**. Adds a
+    /// full indication of `total` bytes, decides whether the stream must pend
+    /// (saving this indication's FULL length), and then — still holding the
+    /// lock, as the LAST step — runs `publish` to make the bytes drain-visible.
+    /// `publish` returns `true` on a successful hand-off (or when there is
+    /// nothing to publish). On a failed hand-off (dropped frontend) the entire
+    /// mutation is **rolled back under the same lock** so a concurrent drain can
+    /// never observe stale accounting, and [`Admit::PublishFailed`] is returned.
+    /// Because the publish is the last step, a concurrent drain can never
+    /// subtract before the increment lands.
+    fn admit(&self, total: usize, publish: impl FnOnce() -> bool) -> Admit {
         let mut st = self.lock();
+        // Snapshot for exact rollback if the publication fails.
+        let prev_buffered = st.buffered;
+        let prev_peak = st.peak;
+        let prev_pend = st.pend_outstanding;
+        let prev_len = st.pending_indication_len;
+
         st.buffered += total;
         if st.buffered > st.peak {
             st.peak = st.buffered;
@@ -1314,8 +1337,18 @@ impl RecvBudget {
             st.pend_outstanding = true;
             st.pending_indication_len = total as u64;
         }
-        publish();
-        pend
+
+        if publish() {
+            if pend { Admit::Pend } else { Admit::Accepted }
+        } else {
+            // Roll the whole transition back: buffered, peak watermark, and the
+            // pend fields all return to their pre-indication values.
+            st.buffered = prev_buffered;
+            st.peak = prev_peak;
+            st.pend_outstanding = prev_pend;
+            st.pending_indication_len = prev_len;
+            Admit::PublishFailed
+        }
     }
 
     /// Drain-side single synchronized transition. Subtracts `len` drained bytes
@@ -1324,6 +1357,15 @@ impl RecvBudget {
     /// `receive_complete` (re-arming the stream). Returns `None` otherwise.
     fn on_drained(&self, len: usize) -> Option<u64> {
         let mut st = self.lock();
+        // The publish-last ordering in `admit` guarantees the increment for these
+        // bytes was committed before they became drain-visible, so this can never
+        // underflow. Catch a regression in debug/test builds rather than let
+        // `saturating_sub` silently clamp it.
+        debug_assert!(
+            st.buffered >= len,
+            "recv buffered underflow: buffered={} drained={len}",
+            st.buffered
+        );
         st.buffered = st.buffered.saturating_sub(len);
         if st.pend_outstanding && st.buffered < MAX_RECV_BUFFER {
             st.pend_outstanding = false;
@@ -1710,26 +1752,32 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
                     }
                 }
                 let b = b.freeze();
-                let mut send_failed = false;
                 // ONE synchronized transition: increment → decide-pend (saving
-                // this indication's FULL length) → THEN publish under the lock.
-                pend = ctx.recv_budget.admit(total, || {
+                // this indication's FULL length) → publish under the lock. On a
+                // failed publication the whole mutation is rolled back inside
+                // `admit`, so a dropped frontend leaves accounting untouched.
+                match ctx.recv_budget.admit(total, || {
                     // An empty, non-FIN notification produces NO event (Finding
-                    // 8): a zero-length receive is not by itself end-of-stream.
-                    if !b.is_empty()
-                        && let Some(receive) = ctx.receive.as_ref()
-                        && receive.unbounded_send(ReceiveEvent::Data(b)).is_err()
-                    {
-                        send_failed = true;
+                    // 8): a zero-length receive is not by itself end-of-stream,
+                    // and counts as a successful (no-op) publication.
+                    if b.is_empty() {
+                        true
+                    } else if let Some(receive) = ctx.receive.as_ref() {
+                        receive.unbounded_send(ReceiveEvent::Data(b)).is_ok()
+                    } else {
+                        false
                     }
-                });
-                if send_failed {
-                    // Failed delivery (frontend `H3RecvStream` dropped): drop the
-                    // sender so no further receive events are attempted, and issue
-                    // NO pend — no receiver means no stuck window, and the stream
-                    // is being torn down regardless.
-                    ctx.receive.take();
-                    pend = false;
+                }) {
+                    Admit::Pend => pend = true,
+                    Admit::Accepted => {}
+                    Admit::PublishFailed => {
+                        // Failed delivery (frontend `H3RecvStream` dropped): drop
+                        // the sender so no further receive events are attempted,
+                        // and issue NO pend — no receiver means no stuck window,
+                        // and the stream is being torn down regardless. Accounting
+                        // was already rolled back under the lock inside `admit`.
+                        ctx.receive.take();
+                    }
                 }
             }
             // A FIN flag is a clean end-of-stream marker (peer finished sending).
@@ -3327,190 +3375,290 @@ mod receive_events {
         matches!(res, Err(s) if s.try_as_status_code() == Ok(StatusCode::QUIC_STATUS_PENDING))
     }
 
-    /// SC-004 primary (hermetic, per-stream): a stalled drain keeps the adapter's
-    /// per-stream buffered peak bounded even when the peer offers ≥ 8× the bound
-    /// on ONE stream. The seam models native msquic: once the callback returns
-    /// `QUIC_STATUS_PENDING`, no further indication is delivered on that stream
-    /// until `receive_complete` is issued by the drain. Also proves the
-    /// completion uses the FULL SAVED pended-indication length (not the drained
-    /// length) by making the first-drained indication a different size.
+    /// SC-004 primary (hermetic, per-stream, faithful flood): a slow ("stalled")
+    /// consumer that lags the sender. The peer genuinely offers ≥ 8× the
+    /// per-stream bound THROUGH the real receive callback/seam on ONE stream;
+    /// every over-budget indication returns `QUIC_STATUS_PENDING` (modelling
+    /// native pausing the stream until `receive_complete`), and the lagging
+    /// consumer drains just enough to re-arm. Across the entire flood the
+    /// measured buffered PEAK stays ≤ `MAX_RECV_BUFFER` + one indication — the
+    /// peak comes from REAL offers that returned PENDING, not from a counter.
     #[test]
     fn stalled_receive_is_bounded() {
-        // A distinctly-sized FIRST indication so the first-drained `Data` differs
-        // in size from the (later) pended indication.
-        const FIRST: usize = 700 * 1024;
-        const REST: usize = 300 * 1024;
+        const CHUNK: usize = 300 * 1024; // 300 KiB indications
 
         let (mut ctx, _sctx, rctx) = stream_ctx_channel(0u64.try_into().unwrap());
         let rec = RecordingRecvExec::default();
         let completes = rec.completes.clone();
         let mut recv = H3RecvStream::with_exec(Box::new(rec), rctx);
+        let mut cx = noop_context();
 
-        let offered_target = 8 * MAX_RECV_BUFFER; // peer offers >= 8x the bound
-        let big = vec![0xA1u8; FIRST];
-        let small = vec![0xB2u8; REST];
+        let offer_target = 8 * MAX_RECV_BUFFER; // >= 8 MiB genuinely offered
+        let data = vec![0xC3u8; CHUNK];
 
-        let mut attempted = 0usize;
-        let mut first = true;
-        let mut pend_seen = false;
-        while attempted < offered_target {
-            // Native pauses THIS stream once it has pended: the peer's further
-            // offered indications are NOT delivered (no re-enqueue).
+        let mut offered = 0usize;
+        let mut peak = 0usize;
+        let mut pend_returns = 0usize;
+        while offered < offer_target {
             if recv.rctx.recv_budget.pend_outstanding() {
-                attempted += REST;
+                // Native has paused THIS stream (the callback returned PENDING and
+                // will not be called again until re-armed): no further indication
+                // is delivered. The lagging consumer drains exactly ONE buffered
+                // indication, which re-arms the window via the RecvExec seam.
+                match recv.poll_data(&mut cx) {
+                    Poll::Ready(Ok(Some(_))) => {}
+                    other => panic!("expected buffered data while stalled, got {other:?}"),
+                }
                 continue;
             }
-            let (data, sz): (&[u8], usize) = if first {
-                (&big, FIRST)
-            } else {
-                (&small, REST)
-            };
-            first = false;
-            let res = feed_receive_result(&mut ctx, data, ReceiveFlags::NONE);
-            attempted += sz;
+            // A REAL offer through the real receive callback/seam.
+            let res = feed_receive_result(&mut ctx, &data, ReceiveFlags::NONE);
+            offered += CHUNK;
+            peak = peak.max(recv.rctx.recv_budget.buffered());
             if is_pending(&res) {
-                pend_seen = true;
+                pend_returns += 1;
+                assert!(recv.rctx.recv_budget.pend_outstanding());
+                // The saved length is this FULL indication (never a drained one).
+                assert_eq!(recv.rctx.recv_budget.pending_indication_len() as usize, CHUNK);
             } else {
-                assert!(res.is_ok(), "sub-bound indication must be Ok, got {res:?}");
+                assert!(res.is_ok(), "sub-bound offer must be Ok, got {res:?}");
             }
         }
 
-        // (a) the stream pended once its buffered reached the bound.
-        assert!(pend_seen, "stream must return PENDING at the bound");
-        assert!(recv.rctx.recv_budget.pend_outstanding());
-
-        // (b) bounded peak, independent of total offered, <= MAX + one indication.
-        let peak = recv.rctx.recv_budget.peak();
+        // Genuinely offered >= 8x the bound, and the peer really hit the bound.
+        assert!(offered >= offer_target);
+        assert!(pend_returns > 0, "over-budget offers must return PENDING");
+        // The flood may end on a PENDING offer; drain the remaining buffered data
+        // so that final pend is completed too (each pend gets exactly one
+        // completion). This never exceeds the peak already measured.
+        while recv.rctx.recv_budget.pend_outstanding() {
+            match recv.poll_data(&mut cx) {
+                Poll::Ready(Ok(Some(_))) => {}
+                other => panic!("expected buffered data while draining final pend, got {other:?}"),
+            }
+        }
         println!(
-            "stalled_receive_is_bounded: offered_target={offered_target} peak={peak} \
-             bound={MAX_RECV_BUFFER} max_indication={FIRST}"
+            "stalled_receive_is_bounded: offered={offered} bound={MAX_RECV_BUFFER} \
+             chunk={CHUNK} peak={peak} pend_returns={pend_returns} completes={}",
+            completes.lock().unwrap().len()
         );
+        // Bounded peak: it reached the bound but never exceeded bound + one
+        // in-flight indication, independent of how much was offered.
+        assert!(peak >= MAX_RECV_BUFFER, "peak {peak} should reach the bound");
         assert!(
-            peak >= MAX_RECV_BUFFER,
-            "peak {peak} should reach the bound {MAX_RECV_BUFFER}"
-        );
-        assert!(
-            peak <= MAX_RECV_BUFFER + FIRST,
+            peak <= MAX_RECV_BUFFER + CHUNK,
             "peak {peak} must stay <= bound + one indication ({})",
-            MAX_RECV_BUFFER + FIRST
+            MAX_RECV_BUFFER + CHUNK
         );
+        // Each PENDING was completed exactly once via the seam, always with the
+        // FULL saved indication length.
+        let c = completes.lock().unwrap();
+        assert_eq!(c.len(), pend_returns, "exactly one receive_complete per pend");
+        assert!(
+            c.iter().all(|&l| l as usize == CHUNK),
+            "completions must use the FULL saved indication length"
+        );
+    }
 
-        // The saved pended length is the FULL length of the crossing indication.
-        assert_eq!(recv.rctx.recv_budget.pending_indication_len() as usize, REST);
-        // (c) no completion while stalled.
-        assert!(completes.lock().unwrap().is_empty());
+    /// Single-transition race, faithfully interleaved (finding 2): models a drain
+    /// that runs BEFORE the callback's PENDING return path completes, exercising
+    /// the real receive channel AND the real `RecvExec` seam. Sequence:
+    ///
+    /// 1. pre-fill just below the bound (sub-bound offers, left undrained);
+    /// 2. the callback's locked transition for the crossing indication runs —
+    ///    increment + decide-pend committed and the bytes PUBLISHED under the
+    ///    lock (via `admit`), yielding the not-yet-acted-on pend outcome;
+    /// 3. the drain INTERLEAVES HERE, before the callback returns PENDING:
+    ///    `poll_data` observes the committed state, subtracts, and issues exactly
+    ///    one `receive_complete` through the seam with the FULL SAVED length
+    ///    (distinct from the drained length);
+    /// 4. only then does the callback's return path resolve to PENDING.
+    ///
+    /// Asserts: no counter underflow, the pend is not lost (exactly one completion
+    /// with the FULL saved length), and buffered accounting is exact.
+    #[test]
+    fn recv_state_transition_no_underflow_no_lost_pend() {
+        use crate::{Admit, ReceiveEvent};
 
-        // Drain: first `Data` is FIRST bytes; dropping below the bound triggers
-        // exactly one `receive_complete` with the FULL SAVED length (REST), never
-        // the drained length (FIRST).
+        const PRE: usize = 340 * 1024; // 3 pre-fill chunks = 1020 KiB (< bound)
+        const RACE: usize = 200 * 1024; // the crossing indication (distinct size)
+
+        let (mut ctx, _sctx, rctx) = stream_ctx_channel(0u64.try_into().unwrap());
+        let rec = RecordingRecvExec::default();
+        let completes = rec.completes.clone();
+        let mut recv = H3RecvStream::with_exec(Box::new(rec), rctx);
         let mut cx = noop_context();
+
+        // (1) Pre-fill to just below the bound WITHOUT draining.
+        let pre = vec![0u8; PRE];
+        for _ in 0..3 {
+            assert!(feed_receive_result(&mut ctx, &pre, ReceiveFlags::NONE).is_ok());
+        }
+        assert_eq!(recv.rctx.recv_budget.buffered(), 3 * PRE);
+        assert!(!recv.rctx.recv_budget.pend_outstanding());
+
+        // (2) The callback's locked transition for the crossing indication:
+        // exactly what the Receive arm does — `admit` commits the increment +
+        // pend and PUBLISHES the bytes under the lock, returning the pend outcome
+        // the callback has NOT yet acted on.
+        let racing = Bytes::from(vec![0xEEu8; RACE]);
+        let outcome = recv.rctx.recv_budget.admit(RACE, || {
+            ctx.receive
+                .as_ref()
+                .expect("frontend live")
+                .unbounded_send(ReceiveEvent::Data(racing))
+                .is_ok()
+        });
+        assert!(matches!(outcome, Admit::Pend));
+        assert!(recv.rctx.recv_budget.pend_outstanding());
+        assert_eq!(recv.rctx.recv_budget.pending_indication_len() as usize, RACE);
+        assert_eq!(recv.rctx.recv_budget.buffered(), 3 * PRE + RACE);
+
+        // (3) INTERLEAVE: the drain runs NOW, before the callback's PENDING return
+        // path completes. It observes the committed pend, subtracts the FIRST
+        // buffered indication (PRE bytes), and — via the real `RecvExec` seam —
+        // issues exactly one `receive_complete` with the FULL SAVED length (RACE),
+        // NOT the drained length (PRE).
         match recv.poll_data(&mut cx) {
-            Poll::Ready(Ok(Some(b))) => assert_eq!(b.len(), FIRST),
-            other => panic!("expected first data of {FIRST}, got {other:?}"),
+            Poll::Ready(Ok(Some(b))) => {
+                assert_eq!(b.len(), PRE, "FIFO: the first buffered chunk drains first")
+            }
+            other => panic!("expected first buffered chunk, got {other:?}"),
         }
         assert_eq!(
             completes.lock().unwrap().as_slice(),
-            &[REST as u64],
-            "completion must use the FULL saved pended length, not the drained length"
+            &[RACE as u64],
+            "pend not lost: one completion with the FULL saved length, not the drained length"
         );
-        assert!(
-            !recv.rctx.recv_budget.pend_outstanding(),
-            "pend cleared and window reopened after completion"
-        );
+        // No underflow, exact accounting: buffered decreased by exactly PRE.
+        assert_eq!(recv.rctx.recv_budget.buffered(), 3 * PRE + RACE - PRE);
+        assert!(!recv.rctx.recv_budget.pend_outstanding(), "window reopened");
 
-        // Draining the remainder issues no further completion (no double-complete)
-        // and returns buffered toward 0.
-        while let Poll::Ready(Ok(Some(_))) = recv.poll_data(&mut cx) {}
+        // (4) The callback's return path now resolves to PENDING (asserted via
+        // `outcome` above); the early completion from (3) is absorbed — draining
+        // the rest issues no further completion and never underflows.
+        let mut drained = PRE;
+        while let Poll::Ready(Ok(Some(b))) = recv.poll_data(&mut cx) {
+            drained += b.len();
+        }
+        assert_eq!(drained, 3 * PRE + RACE, "all bytes drained exactly, no loss");
         assert_eq!(recv.rctx.recv_budget.buffered(), 0);
-        assert_eq!(
-            completes.lock().unwrap().len(),
-            1,
-            "exactly one completion for the single pended indication"
-        );
+        assert_eq!(completes.lock().unwrap().len(), 1, "exactly one completion total");
     }
 
-    /// Single-transition race invariant: the buffered counter never underflows
-    /// and a just-published pend is never lost by an interleaving drain (the
-    /// stream is never left PENDING with `buffered` below the bound and no
-    /// completion pending). Exercised directly against the `RecvBudget` seam.
-    #[test]
-    fn recv_state_transition_no_underflow_no_lost_pend() {
-        let budget = RecvBudget::default();
-
-        // A sub-bound admit does not pend; a matching drain returns to 0 with no
-        // completion and no underflow.
-        assert!(!budget.admit(4096, || {}));
-        assert_eq!(budget.on_drained(4096), None);
-        assert_eq!(budget.buffered(), 0);
-
-        // A big (2x bound) indication pends, saving its FULL length.
-        let big = 2 * MAX_RECV_BUFFER;
-        assert!(budget.admit(big, || {}));
-        assert!(budget.pend_outstanding());
-        assert_eq!(budget.pending_indication_len() as usize, big);
-
-        // A partial drain that keeps buffered at/above the bound must NOT complete
-        // (and must NOT lose the pend): the pend is preserved.
-        assert_eq!(budget.on_drained(MAX_RECV_BUFFER), None);
-        assert!(
-            budget.pend_outstanding(),
-            "pend must be preserved while buffered stays at/above the bound"
-        );
-        assert_eq!(budget.buffered(), MAX_RECV_BUFFER);
-
-        // The drain that finally drops below the bound completes with the FULL
-        // saved length exactly once — the pend is neither lost nor duplicated.
-        assert_eq!(budget.on_drained(MAX_RECV_BUFFER), Some(big as u64));
-        assert!(!budget.pend_outstanding());
-        assert_eq!(budget.buffered(), 0);
-
-        // A redundant drain never underflows and never re-completes.
-        assert_eq!(budget.on_drained(4096), None);
-        assert_eq!(budget.buffered(), 0);
-    }
-
-    /// Drain-runs-before-callback-return race (publication-order fix): a drain
-    /// that reaches the lock BEFORE the callback commits its accounting observes
-    /// no pend and issues NO completion; because the enqueue is the LAST step of
-    /// the callback's locked transition (accounting first), the drain can never
-    /// subtract before the increment lands, so the counter cannot underflow.
-    /// After the pend is committed, the drain issues exactly one completion for
-    /// the FULL saved length; a completion issued while the callback is still
-    /// "active" is absorbed (never stranded, never lost). Asserted against the
-    /// seam call log, not timing.
+    /// Genuine concurrent race (finding 2): a writer thread runs the callback's
+    /// `admit` publish-last transition while a reader thread drains and completes,
+    /// hammering the single `RecvState` lock. Because the publish is the LAST step
+    /// of `admit` (accounting first), a reader can never observe bytes before the
+    /// increment lands — the `debug_assert!` in `on_drained` would fire on any
+    /// underflow (this test would panic if the ordering regressed). Confirms the
+    /// invariants under a real thread race: every published byte is eventually
+    /// drained (buffered returns to exactly 0), no underflow, and pends are never
+    /// stranded.
     #[test]
     fn drain_before_pend_return_is_absorbed() {
-        let budget = RecvBudget::default();
+        use std::sync::mpsc;
+        use std::thread;
 
-        // (1) A drain racing AHEAD of the callback's accounting: no pend is
-        // committed yet, so no completion is issued and the counter stays at 0
-        // (saturating decrement can never underflow).
-        assert_eq!(budget.on_drained(0), None);
-        assert_eq!(budget.buffered(), 0);
-        assert!(!budget.pend_outstanding());
+        const ITERS: usize = 20_000;
+        const CHUNK: usize = 4096;
 
-        // The callback's locked transition commits the increment and the pend
-        // BEFORE publishing the bytes (drain-visibility is the last step). The
-        // publish closure below stands in for `unbounded_send` and runs only
-        // after `buffered += total` and the pend decision are committed.
-        let published = std::cell::Cell::new(false);
-        let pend = budget.admit(MAX_RECV_BUFFER, || published.set(true));
-        assert!(pend, "reaching the bound pends");
-        assert!(published.get(), "publish runs as the last step of the transition");
-        assert!(budget.pend_outstanding(), "pend committed under the lock");
+        let budget = Arc::new(RecvBudget::default());
+        let (tx, rx) = mpsc::channel::<usize>();
 
-        // (2) A drain that runs AFTER the committed pend completes it exactly once
-        // with the FULL saved length — the pend is neither stranded nor lost.
-        assert_eq!(
-            budget.on_drained(MAX_RECV_BUFFER),
-            Some(MAX_RECV_BUFFER as u64)
+        let writer = {
+            let budget = budget.clone();
+            thread::spawn(move || {
+                for _ in 0..ITERS {
+                    // Exactly the callback's transition: the publish (channel send)
+                    // is the LAST step, under the lock, after the increment.
+                    budget.admit(CHUNK, || tx.send(CHUNK).is_ok());
+                }
+                drop(tx);
+            })
+        };
+        let reader = {
+            let budget = budget.clone();
+            thread::spawn(move || {
+                let mut completes = 0usize;
+                let mut drained = 0usize;
+                // Drain concurrently as bytes are published; a drain that raced
+                // ahead of an increment would underflow (caught by debug_assert).
+                while let Ok(len) = rx.recv() {
+                    if budget.on_drained(len).is_some() {
+                        completes += 1;
+                    }
+                    drained += len;
+                }
+                (completes, drained)
+            })
+        };
+
+        writer.join().unwrap();
+        let (completes, drained) = reader.join().unwrap();
+
+        // Every published byte drained exactly; the counter never underflowed.
+        assert_eq!(drained, ITERS * CHUNK);
+        assert_eq!(budget.buffered(), 0, "buffered returns to exactly 0 after the race");
+        // The stream is never left stranded PENDING with buffered below the bound.
+        assert!(!budget.pend_outstanding(), "no pend left outstanding after the race");
+        println!(
+            "drain_before_pend_return_is_absorbed: completes={completes} drained={drained}"
         );
-        assert!(!budget.pend_outstanding());
-        assert_eq!(budget.buffered(), 0);
+    }
 
-        // (3) A completion "issued while the callback is still active" analogue: a
-        // further drain after completion is absorbed — no duplicate completion.
-        assert_eq!(budget.on_drained(0), None);
+    /// Rollback-on-failed-publication (finding 1): if the frontend receiver is
+    /// gone, the over-budget indication's locked transition PUBLISHES (send) and
+    /// fails; the whole `RecvState` mutation (buffered, pend, saved length, peak)
+    /// must be rolled back UNDER THE SAME LOCK, leaving accounting exactly as if
+    /// the indication never arrived — and the callback must NOT return PENDING
+    /// (a dropped frontend can never leave a stream stranded PENDING).
+    #[test]
+    fn dropped_frontend_rolls_back_recv_state() {
+        let (mut ctx, _sctx, rctx) = stream_ctx_channel(0u64.try_into().unwrap());
+
+        // A prior sub-bound indication succeeds, establishing non-zero baseline
+        // accounting (buffered and peak) that MUST survive a later failed publish.
+        let small = vec![0u8; 4096];
+        assert!(feed_receive_result(&mut ctx, &small, ReceiveFlags::NONE).is_ok());
+        let buffered_before = ctx.recv_budget.buffered();
+        let peak_before = ctx.recv_budget.peak();
+        assert_eq!(buffered_before, 4096);
+        assert!(!ctx.recv_budget.pend_outstanding());
+
+        // Drop the frontend receiver: every subsequent publication (send) fails.
+        drop(rctx);
+
+        // An over-bound indication whose publish fails: without rollback the buggy
+        // path would leave buffered = 4096 + big, pend_outstanding = true and
+        // pending_indication_len = big. With the fix, `admit` reverts all of it.
+        let big = vec![0xABu8; MAX_RECV_BUFFER];
+        let res = feed_receive_result(&mut ctx, &big, ReceiveFlags::NONE);
+        assert!(
+            res.is_ok(),
+            "a dropped frontend must NOT strand the stream PENDING, got {res:?}"
+        );
+        assert_eq!(
+            ctx.recv_budget.buffered(),
+            buffered_before,
+            "buffered rolled back exactly to the pre-indication value"
+        );
+        assert_eq!(
+            ctx.recv_budget.peak(),
+            peak_before,
+            "peak rolled back exactly (no phantom growth)"
+        );
+        assert!(
+            !ctx.recv_budget.pend_outstanding(),
+            "no pend left outstanding after a failed publish"
+        );
+        assert_eq!(
+            ctx.recv_budget.pending_indication_len(),
+            0,
+            "saved indication length rolled back"
+        );
+        // The dropped frontend is observed: the sender half is taken.
+        assert!(ctx.receive.is_none(), "dropped frontend detaches the sender");
     }
 
     /// SC-005 no regression: a promptly-draining consumer sees identical data,
