@@ -1,4 +1,10 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use futures::ready;
 use futures::{
@@ -8,6 +14,10 @@ use futures::{
 use msquic::{BufferRef, ListenerEvent, ListenerRef, Status};
 
 use crate::registration::{RundownGuard, RundownState};
+use crate::{
+    CbClass, NoShutdown, PoisonFlag, ShutdownSeam, guard_callback, internal_error_status,
+    report_contained_panic,
+};
 
 pub struct Listener {
     inner: msquic::Listener,
@@ -20,6 +30,18 @@ pub struct Listener {
 struct ListenerCtxSender {
     conn: Option<mpsc::UnboundedSender<Option<crate::Connection>>>,
     shutdown: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    /// Set by [`listener_recover`] after a contained callback panic (SF-E), so
+    /// [`guard_callback`] short-circuits every subsequent event on this ctx.
+    /// Interior-mutable because the listener callback is an `Fn` closure holding
+    /// the ctx by shared reference.
+    poisoned: AtomicBool,
+    /// Whether the current callback invocation has taken Rust ownership of the
+    /// accepted connection via `from_raw`. RESET to `false` at the start of every
+    /// invocation (so it never reflects a stale prior attempt) and set `true` the
+    /// instant ownership transfers. Read by [`listener_recover`] to stay
+    /// ownership-aware: an unwind after ownership already dropped (closed) the
+    /// owned connection, so msquic must not also reject it.
+    ownership_taken: AtomicBool,
 }
 struct ListenerCtxReceiver {
     conn: mpsc::UnboundedReceiver<Option<crate::Connection>>,
@@ -34,12 +56,53 @@ fn listener_ctx_channel() -> (ListenerCtxSender, ListenerCtxReceiver) {
         ListenerCtxSender {
             conn: Some(tx),
             shutdown: std::sync::Mutex::new(Some(sh_tx)),
+            poisoned: AtomicBool::new(false),
+            ownership_taken: AtomicBool::new(false),
         },
         ListenerCtxReceiver {
             conn: rx,
             shutdown: std::sync::Mutex::new(Some(sh_rx)),
         },
     )
+}
+
+impl PoisonFlag for &ListenerCtxSender {
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Relaxed)
+    }
+}
+
+/// Event-aware poison disposition for the listener callback (SF-E). Once the ctx
+/// is poisoned, a `NewConnection` (ownership-bearing) is rejected with
+/// `INTERNAL_ERROR` so msquic performs the single reject without the adapter
+/// attempting `from_raw`; a `StopComplete` (teardown) is a safe `Ok(())` no-op.
+fn listener_poison_disp(ev: &ListenerEvent) -> Result<(), Status> {
+    match ev {
+        ListenerEvent::StopComplete { .. } => Ok(()),
+        _ => Err(internal_error_status()),
+    }
+}
+
+/// Ownership-aware panic-recovery action for the listener callback (SF-E). The
+/// listener never force-closes (its seam is a no-op): it mirrors the
+/// `ConfigFailedClose` close-or-reject contract. If ownership was already taken
+/// (`ownership_taken == true`), the unwind's `Drop` already closed the owned
+/// connection, so returning `Ok(())` prevents msquic from also rejecting it (a
+/// double-close). Otherwise ownership never transferred, so returning
+/// `Err(INTERNAL_ERROR)` lets msquic perform the single reject. Either branch
+/// yields exactly one close/reject with no leaked handle. Marks the ctx poisoned.
+fn listener_recover(ctx: &mut &ListenerCtxSender, _seam: &dyn ShutdownSeam) -> Result<(), Status> {
+    report_contained_panic(CbClass::Listener);
+    let ownership_taken = ctx.ownership_taken.load(Ordering::Relaxed);
+    ctx.poisoned.store(true, Ordering::Relaxed);
+    if ownership_taken {
+        // Ownership already transferred; the unwind's Drop closed the owned
+        // connection. Do NOT also reject (avoids the native double-close assert).
+        Ok(())
+    } else {
+        // Ownership never transferred; msquic performs the single reject/close.
+        Err(internal_error_status())
+    }
 }
 
 /// The single-outcome decision for a listener `NewConnection` event, factored
@@ -101,6 +164,9 @@ fn listener_callback(
     config: &Arc<msquic::Configuration>,
     state: &Arc<RundownState>,
 ) -> Result<(), Status> {
+    // Reset the ownership flag at the START of every invocation so it reflects
+    // only the current event, never a stale value from a prior attempt (SF-E).
+    ctx.ownership_taken.store(false, Ordering::Relaxed);
     match ev {
         ListenerEvent::NewConnection {
             info: _,
@@ -119,8 +185,12 @@ fn listener_callback(
             // no `from_raw` and no Rust-side close — native `listener.c` performs
             // the single close on our returned `Err`.
             let decision = decide_new_connection(config, move || {
-                // `set_configuration` succeeded: only NOW take ownership.
+                // `set_configuration` succeeded: only NOW take ownership. Mark the
+                // ctx ownership-taken the instant it transfers, so a subsequent
+                // panic's `listener_recover` knows the unwind's Drop already closed
+                // the owned connection (and must not also reject it).
                 let inner = unsafe { msquic::Connection::from_raw(connection.as_raw()) };
+                ctx.ownership_taken.store(true, Ordering::Relaxed);
                 let conn = crate::Connection::attach(inner, guard);
                 match ctx.conn.as_ref() {
                     Some(tx) => match tx.unbounded_send(Some(conn)) {
@@ -169,8 +239,20 @@ impl Listener {
     ) -> Result<Self, Status> {
         let (tx, rx) = listener_ctx_channel();
         let state = reg.state().clone();
-        let handler =
-            move |_: ListenerRef, ev: ListenerEvent| listener_callback(&tx, ev, &config, &state);
+        let handler = move |_: ListenerRef, ev: ListenerEvent| {
+            let disp = listener_poison_disp(&ev);
+            // `C = &ListenerCtxSender`: the listener callback is an `Fn` closure,
+            // so the ctx is held (and mutated via interior atomics) through a
+            // shared reference. `guard_callback` still takes `&mut C` uniformly.
+            let mut ctx_ref: &ListenerCtxSender = &tx;
+            guard_callback(
+                &mut ctx_ref,
+                &NoShutdown,
+                disp,
+                |c| listener_callback(c, ev, &config, &state),
+                listener_recover,
+            )
+        };
         // Reserve the listener's guard BEFORE opening the native handle:
         // `ListenerOpen` acquires the registration rundown before it returns, so
         // reserving first ensures an in-flight construction is always counted.
@@ -509,5 +591,125 @@ mod new_conn_decision {
     fn delivery_failure_reports_drop_owned() {
         let decision = decide_new_connection(Ok(()), || false);
         assert!(matches!(decision, NewConnDecision::DeliveryFailedDropOwned));
+    }
+}
+
+/// FFI callback panic containment (SF-E / FR-007) for the listener class.
+/// HERMETIC: a native `ConnectionRef` cannot be forged, so the ownership-aware
+/// [`listener_recover`] is exercised through [`guard_callback`] with a body that
+/// mirrors [`listener_callback`]'s `ownership_taken` handling (reset at the start
+/// of the invocation, set the instant `from_raw` would take ownership). The
+/// listener never force-closes, so `Err(INTERNAL_ERROR)` models msquic performing
+/// exactly one reject and `Ok(())` models the owned-connection `Drop` performing
+/// the single close (never both — no double-close, no leak).
+#[cfg(test)]
+mod callback_safety {
+    use std::sync::atomic::Ordering;
+
+    use msquic::{ListenerEvent, Status, StatusCode};
+
+    use super::{ListenerCtxSender, listener_ctx_channel, listener_poison_disp, listener_recover};
+    use crate::{NoShutdown, guard_callback};
+
+    fn is_internal_err(r: &Result<(), Status>) -> bool {
+        matches!(r, Err(s) if s.0 == Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR).0)
+    }
+
+    #[test]
+    fn listener_callback_panic_before_from_raw_rejects() {
+        let (tx, _rx) = listener_ctx_channel();
+        let mut ctx_ref: &ListenerCtxSender = &tx;
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |c| {
+                // Mirror listener_callback: reset at the start of the invocation.
+                c.ownership_taken.store(false, Ordering::Relaxed);
+                // Panic BEFORE taking ownership (from_raw never runs).
+                panic!("boom before from_raw");
+            },
+            listener_recover,
+        );
+        // Ownership never transferred → exactly one reject (Err); nothing to leak.
+        assert!(is_internal_err(&got));
+        assert!(tx.poisoned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn listener_callback_panic_after_from_raw_does_not_reject() {
+        let (tx, _rx) = listener_ctx_channel();
+        let mut ctx_ref: &ListenerCtxSender = &tx;
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |c| {
+                c.ownership_taken.store(false, Ordering::Relaxed);
+                // Emulate from_raw taking ownership, then panic (the unwind's Drop
+                // closes the owned connection).
+                c.ownership_taken.store(true, Ordering::Relaxed);
+                panic!("boom after from_raw");
+            },
+            listener_recover,
+        );
+        // Ownership already taken + dropped → msquic must NOT reject (Ok): the
+        // owned-connection Drop performed the single close (no double-close).
+        assert!(got.is_ok());
+        assert!(tx.poisoned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn listener_ownership_taken_reset_per_invocation() {
+        let (tx, _rx) = listener_ctx_channel();
+        // A stale post-ownership flag from a prior attempt.
+        tx.ownership_taken.store(true, Ordering::Relaxed);
+        let mut ctx_ref: &ListenerCtxSender = &tx;
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |c| {
+                // The start-of-invocation reset clears the stale `true`.
+                c.ownership_taken.store(false, Ordering::Relaxed);
+                panic!("boom before from_raw on a later attempt");
+            },
+            listener_recover,
+        );
+        // The reset makes this a single reject, not a misclassified stale Ok.
+        assert!(is_internal_err(&got));
+    }
+
+    #[test]
+    fn listener_poison_short_circuit_is_event_aware() {
+        let (tx, _rx) = listener_ctx_channel();
+        tx.poisoned.store(true, Ordering::Relaxed);
+        let mut ctx_ref: &ListenerCtxSender = &tx;
+
+        // Teardown (StopComplete) → Ok, body not run.
+        let teardown = ListenerEvent::StopComplete {
+            app_close_in_progress: false,
+        };
+        assert!(listener_poison_disp(&teardown).is_ok());
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            listener_poison_disp(&teardown),
+            |_c| panic!("body must NOT run when poisoned"),
+            listener_recover,
+        );
+        assert!(got.is_ok());
+
+        // Ownership-bearing / non-teardown disposition → Err, body not run.
+        // `NewConnection` carries a native `ConnectionRef` and cannot be forged
+        // hermetically; its Err mapping is the `_ => Err` catch-all modeled here.
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c| panic!("body must NOT run when poisoned"),
+            listener_recover,
+        );
+        assert!(is_internal_err(&got));
     }
 }

@@ -66,6 +66,151 @@ pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+// ---------------------------------------------------------------------------
+// FFI callback panic containment (SF-E / FR-007).
+//
+// The upstream msquic `extern "C"` trampolines contain no `catch_unwind`, so a
+// panic raised inside one of this crate's adapter callback bodies would unwind
+// across the C boundary and abort the process. [`guard_callback`] is a
+// defense-in-depth backstop that wraps each adapter body in
+// `catch_unwind(AssertUnwindSafe(..))` and, on a caught panic, runs a
+// class-specific `recover` action that force-closes the affected native handle,
+// wakes the affected terminal waiters (msquic ignores the callback return status
+// for many events, so a returned `Err` alone cannot be relied upon), and marks
+// the ctx poisoned so any subsequent teardown event short-circuits. It contains
+// only panics raised inside the crate's own closure bodies; a panic raised
+// inside the upstream trampoline itself (before this frame is entered) is out of
+// scope per FR-007.
+// ---------------------------------------------------------------------------
+
+/// The HTTP/3 `H3_INTERNAL_ERROR` application error code, conveyed to the peer
+/// as the abort cause on a panic-contained connection/stream force-close.
+pub(crate) const H3_INTERNAL_ERROR: u64 = 0x0102;
+
+/// Build the internal-error status returned to msquic on a contained panic.
+pub(crate) fn internal_error_status() -> Status {
+    Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)
+}
+
+/// The callback class a contained panic originated in. Retained only as a label
+/// for the structured error event (`report_contained_panic`); the
+/// class-appropriate recovery behavior lives in the `recover` closure passed at
+/// each registration site, not in a `match` on this label inside the guard.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CbClass {
+    Connection,
+    Stream,
+    Listener,
+}
+
+/// The native force-close a panic-recovery action requests through the
+/// injectable [`ShutdownSeam`]. The exact flags are carried here (chosen by the
+/// class `recover`) so the `callback_safety` unit-test double can assert them
+/// without a real native handle: streams abort (`StreamShutdownFlags::ABORT`);
+/// connections have no `ABORT` flag, so the abort is conveyed by the application
+/// `code` alongside `ConnectionShutdownFlags::NONE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForceShutdown {
+    Connection(ConnectionShutdownFlags),
+    Stream(StreamShutdownFlags),
+}
+
+/// Injectable seam for the native force-close performed during callback panic
+/// recovery. In production the seam is the callback-time BORROWED handle ref
+/// (`ConnectionRef`/`StreamRef`), whose `force_shutdown` delegates to the real
+/// FFI `shutdown`; the `callback_safety` unit tests inject a no-op double that
+/// records the request without any native handle. The listener class does not
+/// force-close, so it is wired with [`NoShutdown`].
+pub(crate) trait ShutdownSeam {
+    /// Perform the requested native force-close with the given application code.
+    fn force_shutdown(&self, request: ForceShutdown, code: u64);
+}
+
+/// Production connection seam: the borrowed `ConnectionRef` (auto-derefs to
+/// `Connection`). Acts only on a `Connection` request; a mismatched request
+/// never occurs (the connection `recover` only ever asks for a connection
+/// shutdown) and is a safe no-op.
+impl ShutdownSeam for ConnectionRef {
+    fn force_shutdown(&self, request: ForceShutdown, code: u64) {
+        if let ForceShutdown::Connection(flags) = request {
+            self.shutdown(flags, code);
+        }
+    }
+}
+
+/// Production stream seam: the borrowed `StreamRef` (auto-derefs to `Stream`).
+/// Acts only on a `Stream` request; the fallible native `shutdown` result is
+/// discarded (the handle is being abandoned regardless).
+impl ShutdownSeam for StreamRef {
+    fn force_shutdown(&self, request: ForceShutdown, code: u64) {
+        if let ForceShutdown::Stream(flags) = request {
+            let _ = self.shutdown(flags, code);
+        }
+    }
+}
+
+/// A no-op shutdown seam. Used by the listener registration site (the listener
+/// recover is ownership-aware and never force-closes) and available to tests.
+pub(crate) struct NoShutdown;
+
+impl ShutdownSeam for NoShutdown {
+    fn force_shutdown(&self, _request: ForceShutdown, _code: u64) {}
+}
+
+/// A callback context carrying a panic-poison flag. Once a contained panic has
+/// poisoned the ctx, [`guard_callback`] short-circuits every later event with
+/// the caller-precomputed event-aware disposition instead of dispatching the
+/// body again.
+pub(crate) trait PoisonFlag {
+    fn is_poisoned(&self) -> bool;
+}
+
+/// Emit a structured error event for a contained callback panic. A no-op unless
+/// the `tracing` feature is enabled (no logging dependency is required
+/// otherwise).
+#[cfg(feature = "tracing")]
+pub(crate) fn report_contained_panic(class: CbClass) {
+    tracing::error!(?class, "FFI callback panic contained (SF-E)");
+}
+
+#[cfg(not(feature = "tracing"))]
+pub(crate) fn report_contained_panic(_class: CbClass) {}
+
+/// Run an adapter callback `body` under panic containment (SF-E / FR-007).
+///
+/// BORROW DISCIPLINE (must compile): `body` holds the ONLY `&mut ctx` borrow
+/// while it runs inside `catch_unwind(AssertUnwindSafe(..))`. That borrow ENDS
+/// when `catch_unwind` returns, so `recover` — called only on the `Err` path,
+/// AFTER `catch_unwind` returns — legally re-borrows `&mut ctx`. There is no
+/// overlapping borrow, so neither the (non-`Clone`/`Copy`) handle nor the
+/// ctx-owned senders are captured by value; both the `&mut ctx` and the
+/// callback-time borrowed handle ref are passed as PARAMETERS.
+///
+/// - Already poisoned by a prior contained panic → return the caller-precomputed
+///   event-aware `poisoned_result` (teardown/terminal events → `Ok(())`;
+///   ownership-bearing events → `Err(INTERNAL_ERROR)` so msquic rejects them).
+/// - A real `Err` from the body (e.g. the Phase 2 receive `PENDING`) flows
+///   through unchanged; `recover` is NOT run.
+/// - A caught panic → run `recover(ctx, handle)` (force-close + wake waiters +
+///   poison) and return its status.
+pub(crate) fn guard_callback<C: PoisonFlag>(
+    ctx: &mut C,
+    handle: &dyn ShutdownSeam,
+    poisoned_result: Result<(), Status>,
+    body: impl FnOnce(&mut C) -> Result<(), Status>,
+    recover: impl FnOnce(&mut C, &dyn ShutdownSeam) -> Result<(), Status>,
+) -> Result<(), Status> {
+    if ctx.is_poisoned() {
+        return poisoned_result;
+    }
+    // `body(&mut *ctx)` is a reborrow that lives only for the `catch_unwind`
+    // call; after it returns the borrow is released and `ctx` is free again.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut *ctx))) {
+        Ok(r) => r,
+        Err(_) => recover(ctx, handle),
+    }
+}
+
 /// Shared, thread-safe slot recording *why* a connection terminated.
 ///
 /// Shared between the connection FFI callback (the writer) and the accept
@@ -330,6 +475,9 @@ struct ConnCtxSender {
     uni: Option<mpsc::UnboundedSender<Option<crate::H3Stream>>>,
     /// Shared connection terminal-reason slot (writer side).
     terminal: ConnTerminalSlot,
+    /// Set by [`connection_recover`] after a contained callback panic (SF-E), so
+    /// [`guard_callback`] short-circuits every subsequent event on this ctx.
+    poisoned: bool,
     /// Connection-scoped test seam that forces an accepted-stream ID resolution
     /// to fail exactly once. Shares its atomic with
     /// [`ConnCtxReceiver::accepted_id_failpoint`] (created once in
@@ -376,6 +524,7 @@ fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
             bidi: Some(bidi_tx),
             uni: Some(uni_tx),
             terminal: terminal.clone(),
+            poisoned: false,
             #[cfg(test)]
             accepted_id_failpoint: accepted_id_failpoint.clone(),
         },
@@ -597,8 +746,54 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
     Ok(())
 }
 
+impl PoisonFlag for ConnCtxSender {
+    fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+}
+
+/// Event-aware poison disposition for the connection callback (SF-E). Once the
+/// ctx is poisoned, a `PeerStreamStarted` (ownership-bearing) or any non-teardown
+/// event is rejected with `INTERNAL_ERROR` so msquic does not expect the adapter
+/// to have taken ownership; a `ShutdownComplete` (teardown) is a safe `Ok(())`
+/// no-op (the handle is already force-closed and its waiters already woken).
+fn conn_poison_disp(ev: &ConnectionEvent) -> Result<(), Status> {
+    match ev {
+        ConnectionEvent::ShutdownComplete { .. } => Ok(()),
+        _ => Err(internal_error_status()),
+    }
+}
+
+/// Panic-recovery action for the connection callback (SF-E). Runs only after a
+/// caught panic, once the body's `&mut ctx` borrow has ended. Force-closes the
+/// connection (no `ABORT` flag exists; the abort is conveyed by `code`), records
+/// an internal connection terminal, wakes every connection waiter (connect
+/// one-shot, both accept frontends, the shutdown waiter) so nothing hangs, marks
+/// the ctx poisoned, and returns `INTERNAL_ERROR`.
+fn connection_recover(ctx: &mut ConnCtxSender, seam: &dyn ShutdownSeam) -> Result<(), Status> {
+    report_contained_panic(CbClass::Connection);
+    seam.force_shutdown(
+        ForceShutdown::Connection(ConnectionShutdownFlags::NONE),
+        H3_INTERNAL_ERROR,
+    );
+    record_conn_terminal(
+        &ctx.terminal,
+        ConnectionTerminal::Internal("connection callback panicked"),
+    );
+    if let Some(tx) = ctx.connected.take() {
+        let _ = tx.send(Err(internal_error_status()));
+    }
+    // Drop both accept-frontend senders so a parked acceptor observes the
+    // published internal terminal instead of hanging.
+    wake_acceptors(ctx);
+    if let Some(shutdown) = ctx.shutdown.take() {
+        let _ = shutdown.send(());
+    }
+    ctx.poisoned = true;
+    Err(internal_error_status())
+}
+
 impl Connection {
-    /// Connects to the server.
     ///
     /// The rundown count is reserved synchronously when this is called (before
     /// the returned future is polled), so even a queued/unpolled connect is
@@ -615,8 +810,16 @@ impl Connection {
         let guard = RundownGuard::new(reg.state().clone());
         async move {
             let (mut ctx, mut crx) = conn_ctx_channel();
-            let handler =
-                move |_: ConnectionRef, ev: ConnectionEvent| connection_callback(&mut ctx, ev);
+            let handler = move |conn_ref: ConnectionRef, ev: ConnectionEvent| {
+                let disp = conn_poison_disp(&ev);
+                guard_callback(
+                    &mut ctx,
+                    &conn_ref,
+                    disp,
+                    |c| connection_callback(c, ev),
+                    connection_recover,
+                )
+            };
             // Build the ordered handle immediately after `open`, before `start`
             // and before the first await, so every success/error/cancellation
             // path uses ConnHandle's proven ConnectionClose-then-guard drop
@@ -648,8 +851,16 @@ impl Connection {
     /// attach to an accepted connection
     pub(crate) fn attach(inner: msquic::Connection, guard: RundownGuard) -> Self {
         let (mut ctx, crx) = conn_ctx_channel();
-        let handler =
-            move |_: ConnectionRef, ev: ConnectionEvent| connection_callback(&mut ctx, ev);
+        let handler = move |conn_ref: ConnectionRef, ev: ConnectionEvent| {
+            let disp = conn_poison_disp(&ev);
+            guard_callback(
+                &mut ctx,
+                &conn_ref,
+                disp,
+                |c| connection_callback(c, ev),
+                connection_recover,
+            )
+        };
         inner.set_callback_handler(handler);
         let conn = Arc::new(ConnHandle::new(inner, guard, crx.terminal.clone()));
 
@@ -1438,6 +1649,9 @@ struct StreamSendCtx {
     /// suppressed (e.g. the usual `Receive { FIN }` then `PeerSendShutdown`
     /// sequence must not enqueue a duplicate FIN).
     receive_terminal_sent: bool,
+    /// Set by [`stream_recover`] after a contained callback panic (SF-E), so
+    /// [`guard_callback`] short-circuits every subsequent event on this ctx.
+    poisoned: bool,
 }
 
 /// ctx for receiving data on frontend.
@@ -1609,6 +1823,7 @@ fn stream_ctx_channel_pre_id(conn_terminal: ConnTerminalSlot) -> (StreamSendCtx,
             receive: Some(receive_tx),
             recv_budget: recv_budget.clone(),
             receive_terminal_sent: false,
+            poisoned: false,
         },
         PreIdReceivers {
             start: start_rx,
@@ -1859,6 +2074,62 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
     Ok(())
 }
 
+impl PoisonFlag for StreamSendCtx {
+    fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+}
+
+/// Event-aware poison disposition for the stream callback (SF-E). Once the ctx
+/// is poisoned, a `ShutdownComplete` (teardown) is a safe `Ok(())` no-op — the
+/// handle is already force-closed and its waiters woken, and re-running teardown
+/// could only double-complete the Phase 2 receive state — while any other event
+/// is conservatively rejected with `INTERNAL_ERROR`.
+fn stream_poison_disp(ev: &StreamEvent) -> Result<(), Status> {
+    match ev {
+        StreamEvent::ShutdownComplete { .. } => Ok(()),
+        _ => Err(internal_error_status()),
+    }
+}
+
+/// Panic-recovery action for the stream callback (SF-E). Runs only after a
+/// caught panic, once the body's `&mut ctx` borrow has ended. Force-closes the
+/// stream (`StreamShutdownFlags::ABORT`), publishes an internal send terminal and
+/// an internal receive terminal and wakes both halves (plus any pending
+/// `StartComplete` opener), so no send/receive/open waiter hangs; the `poisoned`
+/// short-circuit then prevents a follow-up teardown callback from re-touching the
+/// Phase 2 receive state. Marks the ctx poisoned and returns `INTERNAL_ERROR`.
+fn stream_recover(ctx: &mut StreamSendCtx, seam: &dyn ShutdownSeam) -> Result<(), Status> {
+    report_contained_panic(CbClass::Stream);
+    seam.force_shutdown(
+        ForceShutdown::Stream(StreamShutdownFlags::ABORT),
+        H3_INTERNAL_ERROR,
+    );
+    // Wake the send half: publish an internal send terminal, wake it through the
+    // single ordered channel, then close the channel.
+    publish_send(
+        &ctx.send_terminal,
+        SendTerminal::Internal("stream callback panicked"),
+    );
+    if let Some(send) = ctx.send.as_ref() {
+        let _ = send.unbounded_send(SendEvent::TerminalWake);
+    }
+    ctx.send.take();
+    // Wake the receive half with an internal terminal (first-writer-wins; a real
+    // terminal already published wins, in which case this is a no-op).
+    publish_recv_terminal(
+        ctx,
+        ReceiveEvent::Connection(ConnectionTerminal::Internal("stream callback panicked")),
+    );
+    // Resolve a still-pending `StartComplete` opener so `poll_open_inner` fails
+    // fast instead of hanging.
+    if let Some(start) = ctx.start.take() {
+        let _ = start.send(Err(internal_error_status()));
+    }
+    ctx.poisoned = true;
+    Err(internal_error_status())
+}
+
 /// Publish a receive-side terminal event under first-writer-wins.
 ///
 /// The first `Fin`/`Reset`/`Connection` wins and suppresses later receive
@@ -1890,7 +2161,16 @@ impl H3Stream {
         conn_terminal: ConnTerminalSlot,
     ) -> Self {
         let (mut ctx, recv) = stream_ctx_channel_pre_id(conn_terminal);
-        let handler = move |_: StreamRef, ev: StreamEvent| stream_callback(&mut ctx, ev);
+        let handler = move |stream_ref: StreamRef, ev: StreamEvent| {
+            let disp = stream_poison_disp(&ev);
+            guard_callback(
+                &mut ctx,
+                &stream_ref,
+                disp,
+                |c| stream_callback(c, ev),
+                stream_recover,
+            )
+        };
         stream.set_callback_handler(handler);
         // The ID is known, so finalize straight away. An accepted stream never
         // receives `StartComplete`, so its `start` receiver simply drops.
@@ -1917,7 +2197,16 @@ impl H3Stream {
     )]
     fn open_and_start(conn: &ConnHandle, uni: bool) -> Result<OpeningStream, Status> {
         let (mut ctx, recv) = stream_ctx_channel_pre_id(conn.terminal().clone());
-        let handler = move |_: StreamRef, ev: StreamEvent| stream_callback(&mut ctx, ev);
+        let handler = move |stream_ref: StreamRef, ev: StreamEvent| {
+            let disp = stream_poison_disp(&ev);
+            guard_callback(
+                &mut ctx,
+                &stream_ref,
+                disp,
+                |c| stream_callback(c, ev),
+                stream_recover,
+            )
+        };
 
         let flag = match uni {
             true => StreamOpenFlags::UNIDIRECTIONAL,
@@ -2719,6 +3008,304 @@ mod callback_safety {
         // Recover without panicking and observe the value written before poison.
         let g = lock_recover(&m);
         assert_eq!(*g, 42);
+    }
+
+    // ── FFI callback panic containment (SF-E / FR-007) ──────────────────────
+    //
+    // These are HERMETIC: no `Registration`, no port, no native endpoint. The
+    // native force-close is routed through the injectable [`ShutdownSeam`], so a
+    // recording no-op double stands in for the real `StreamRef`/`ConnectionRef`.
+
+    use std::cell::RefCell;
+
+    use crate::error::{ConnectionTerminal, SendEvent, SendTerminal};
+    use crate::msquic::{ConnectionShutdownFlags, Status, StatusCode, StreamShutdownFlags};
+    use crate::{
+        ForceShutdown, H3_INTERNAL_ERROR, PoisonFlag, ReceiveEvent, ShutdownSeam, conn_poison_disp,
+        connection_recover, guard_callback, load_winner, new_conn_terminal_slot,
+        stream_ctx_channel_pre_id, stream_poison_disp, stream_recover,
+    };
+
+    fn is_internal_err(r: &Result<(), Status>) -> bool {
+        matches!(r, Err(s) if s.0 == Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR).0)
+    }
+
+    fn is_status(r: &Result<(), Status>, code: StatusCode) -> bool {
+        matches!(r, Err(s) if s.0 == Status::new(code).0)
+    }
+
+    /// A no-op [`ShutdownSeam`] double recording every force-close request, so a
+    /// unit test can assert the exact flags/code without a native handle.
+    #[derive(Default)]
+    struct RecordingSeam {
+        calls: RefCell<Vec<(ForceShutdown, u64)>>,
+    }
+
+    impl ShutdownSeam for RecordingSeam {
+        fn force_shutdown(&self, request: ForceShutdown, code: u64) {
+            self.calls.borrow_mut().push((request, code));
+        }
+    }
+
+    /// A minimal poison-carrying ctx for direct `guard_callback` unit tests.
+    struct TestCtx {
+        poisoned: bool,
+    }
+    impl PoisonFlag for TestCtx {
+        fn is_poisoned(&self) -> bool {
+            self.poisoned
+        }
+    }
+
+    #[test]
+    fn guard_callback_passes_through_results_without_recovering() {
+        // Ok flows through; recover never runs, ctx never poisoned.
+        let mut ctx = TestCtx { poisoned: false };
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            Ok(()),
+            |_c| Ok(()),
+            |_c, _s| panic!("recover must NOT run for a real body result"),
+        );
+        assert!(got.is_ok());
+        assert!(!ctx.poisoned);
+
+        // A real Err (INTERNAL) flows through unchanged.
+        let mut ctx = TestCtx { poisoned: false };
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            Ok(()),
+            |_c| Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c, _s| panic!("recover must NOT run for a real body result"),
+        );
+        assert!(is_internal_err(&got));
+        assert!(!ctx.poisoned);
+
+        // The Phase 2 receive PENDING is a real Err and flows through unchanged.
+        let mut ctx = TestCtx { poisoned: false };
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            Ok(()),
+            |_c| Err(Status::new(StatusCode::QUIC_STATUS_PENDING)),
+            |_c, _s| panic!("recover must NOT run for a real body result"),
+        );
+        assert!(is_status(&got, StatusCode::QUIC_STATUS_PENDING));
+        assert!(!ctx.poisoned);
+    }
+
+    #[test]
+    fn guard_callback_runs_recover_once_on_panic() {
+        let mut ctx = TestCtx { poisoned: false };
+        let ran = RefCell::new(0u32);
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            Ok(()),
+            |_c| panic!("boom in body"),
+            |c: &mut TestCtx, _s| {
+                *ran.borrow_mut() += 1;
+                c.poisoned = true;
+                Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR))
+            },
+        );
+        assert!(is_internal_err(&got), "recover status is surfaced");
+        assert_eq!(*ran.borrow(), 1, "recover runs exactly once");
+        assert!(ctx.poisoned);
+    }
+
+    #[test]
+    fn guard_callback_poisoned_returns_disposition_without_body() {
+        // Poisoned + teardown disposition Ok → Ok, body not run.
+        let mut ctx = TestCtx { poisoned: true };
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            Ok(()),
+            |_c| panic!("body must NOT run when poisoned"),
+            |_c, _s| panic!("recover must NOT run when poisoned"),
+        );
+        assert!(got.is_ok());
+
+        // Poisoned + ownership-bearing disposition Err → Err, body not run.
+        let mut ctx = TestCtx { poisoned: true };
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c| panic!("body must NOT run when poisoned"),
+            |_c, _s| panic!("recover must NOT run when poisoned"),
+        );
+        assert!(is_internal_err(&got));
+    }
+
+    #[test]
+    fn connection_callback_panic_is_contained() {
+        let (mut ctx, mut crx) = conn_ctx_channel();
+        let seam = RecordingSeam::default();
+        // A panicking body is contained: process survives (test completes), the
+        // connection is force-closed via the seam, and Err(INTERNAL_ERROR) returns.
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            conn_poison_disp(&ConnectionEvent::Connected {
+                session_resumed: false,
+                negotiated_alpn: &[],
+            }),
+            |_c| panic!("boom in connection callback"),
+            connection_recover,
+        );
+        assert!(is_internal_err(&got));
+        assert_eq!(
+            *seam.calls.borrow(),
+            vec![(
+                ForceShutdown::Connection(ConnectionShutdownFlags::NONE),
+                H3_INTERNAL_ERROR
+            )],
+            "connection force-close uses NONE + H3_INTERNAL_ERROR"
+        );
+        assert!(ctx.poisoned, "ctx is poisoned after a contained panic");
+        // Waiter-wake regression: the connect one-shot is resolved with a failure
+        // rather than left hanging.
+        let mut woken = crx.connected.take().expect("connect waiter present");
+        match woken.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("connect waiter should observe a failure, got {other:?}"),
+        }
+        // Both accept frontends were dropped (a parked acceptor observes closure).
+        assert!(ctx.bidi.is_none() && ctx.uni.is_none());
+    }
+
+    #[test]
+    fn connection_poison_short_circuit_is_event_aware() {
+        // After a contained panic poisons the ctx, a teardown event short-circuits
+        // to Ok (no-op) and a non-teardown (ownership-bearing) event to Err.
+        let (mut ctx, _crx) = conn_ctx_channel();
+        let _ = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            conn_poison_disp(&ConnectionEvent::Connected {
+                session_resumed: false,
+                negotiated_alpn: &[],
+            }),
+            |_c| panic!("boom"),
+            connection_recover,
+        );
+        assert!(ctx.poisoned);
+
+        // Teardown (ShutdownComplete) → Ok, body not run.
+        let teardown = ConnectionEvent::ShutdownComplete {
+            handshake_completed: false,
+            peer_acknowledged_shutdown: false,
+            app_close_in_progress: false,
+        };
+        assert!(conn_poison_disp(&teardown).is_ok());
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            conn_poison_disp(&teardown),
+            |_c| panic!("body must NOT run when poisoned"),
+            connection_recover,
+        );
+        assert!(got.is_ok());
+
+        // Non-teardown event → Err (msquic rejects). `PeerStreamStarted` cannot be
+        // forged hermetically (it carries a native `StreamRef`); its Err mapping is
+        // the same `_ => Err` catch-all exercised here via `Connected`.
+        let ownership_like = ConnectionEvent::Connected {
+            session_resumed: false,
+            negotiated_alpn: &[],
+        };
+        assert!(is_internal_err(&conn_poison_disp(&ownership_like)));
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            conn_poison_disp(&ownership_like),
+            |_c| panic!("body must NOT run when poisoned"),
+            connection_recover,
+        );
+        assert!(is_internal_err(&got));
+    }
+
+    #[test]
+    fn stream_callback_panic_is_contained() {
+        let (mut ctx, mut recv) = stream_ctx_channel_pre_id(new_conn_terminal_slot());
+        let seam = RecordingSeam::default();
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            stream_poison_disp(&StreamEvent::PeerSendShutdown),
+            |_c| panic!("boom in stream callback"),
+            stream_recover,
+        );
+        assert!(is_internal_err(&got));
+        assert_eq!(
+            *seam.calls.borrow(),
+            vec![(
+                ForceShutdown::Stream(StreamShutdownFlags::ABORT),
+                H3_INTERNAL_ERROR
+            )],
+            "stream force-close uses ABORT + H3_INTERNAL_ERROR"
+        );
+        assert!(ctx.poisoned);
+        // Send half woken with an internal terminal (waiter-wake regression).
+        match load_winner(&recv.send_terminal) {
+            Some(SendTerminal::Internal(_)) => {}
+            other => panic!("send terminal should be Internal, got {other:?}"),
+        }
+        match recv.send.try_recv() {
+            Ok(SendEvent::TerminalWake) => {}
+            other => panic!("send half should be woken, got {other:?}"),
+        }
+        // Receive half woken with an internal connection terminal.
+        match recv.receive.try_recv() {
+            Ok(ReceiveEvent::Connection(ConnectionTerminal::Internal(_))) => {}
+            _ => panic!("receive half should be woken with a Connection(Internal) terminal"),
+        }
+        // Pending open (StartComplete) waiter resolved with a failure, not hung.
+        match recv.start.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("open waiter should observe a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_poison_short_circuit_is_event_aware() {
+        let (mut ctx, _recv) = stream_ctx_channel_pre_id(new_conn_terminal_slot());
+        let _ = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            stream_poison_disp(&StreamEvent::PeerSendShutdown),
+            |_c| panic!("boom"),
+            stream_recover,
+        );
+        assert!(ctx.poisoned);
+
+        // Teardown (ShutdownComplete) → Ok, body not run.
+        let teardown = StreamEvent::ShutdownComplete {
+            connection_shutdown: false,
+            app_close_in_progress: false,
+            connection_shutdown_by_app: false,
+            connection_closed_remotely: false,
+            connection_error_code: 0,
+            connection_close_status: Status::new(StatusCode::QUIC_STATUS_SUCCESS),
+        };
+        assert!(stream_poison_disp(&teardown).is_ok());
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            stream_poison_disp(&teardown),
+            |_c| panic!("body must NOT run when poisoned"),
+            stream_recover,
+        );
+        assert!(got.is_ok());
+
+        // Non-teardown event → Err.
+        assert!(is_internal_err(&stream_poison_disp(
+            &StreamEvent::PeerSendShutdown
+        )));
     }
 }
 
@@ -6127,9 +6714,7 @@ mod conformance {
     };
 
     use crate::test::util::{get_test_cred, try_setup_tracing};
-    use crate::{Connection, H3Stream, Listener, Registration};
-
-    const H3_INTERNAL_ERROR: u64 = 0x0102;
+    use crate::{Connection, H3_INTERNAL_ERROR, H3Stream, Listener, Registration};
 
     // ── poll_fn adapters over the &mut self trait methods (buffer type = Bytes) ──
 
