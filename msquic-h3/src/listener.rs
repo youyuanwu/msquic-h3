@@ -755,63 +755,89 @@ mod callback_safety {
     }
 
     /// F-B: the close-or-reject decision is INVOCATION-LOCAL. msquic runs listener
-    /// callbacks in parallel, so ownership must be tracked in a per-call token,
-    /// never a shared ctx bit. Two interleaved invocation tokens are driven so
-    /// each keeps its own decision with zero cross-talk: invocation A takes
-    /// ownership then panics → Ok/one close; interleaved invocation B panics
-    /// pre-ownership → Err/one reject. If ownership were shared, B's reset (or A's
-    /// set) would corrupt the other's outcome.
+    /// callbacks in PARALLEL, one per accepted connection, so ownership must be
+    /// tracked in a per-call token, never a shared ctx bit. This models two
+    /// concurrent callbacks with TWO SEPARATE listener contexts (mirroring
+    /// msquic's real per-connection parallel callbacks) so neither invocation's
+    /// poison can short-circuit the other: invocation A takes ownership then
+    /// panics → Ok / exactly one close; invocation B panics pre-ownership → Err /
+    /// exactly one reject / zero close. BOTH recovery paths genuinely run (each
+    /// ctx is poisoned only by its own `listener_recover`), and each keeps its own
+    /// decision with zero cross-talk. If ownership were a shared bit, A's set or
+    /// B's reset would corrupt the other's outcome.
     #[test]
     fn listener_ownership_decision_is_invocation_local() {
-        let (tx, _rx) = listener_ctx_channel();
+        // Two INDEPENDENT contexts: A's recovery poisons only ctx A, so B's
+        // guard_callback poison check never short-circuits B — both bodies panic
+        // and both recovery paths run to completion.
+        let (tx_a, _rx_a) = listener_ctx_channel();
+        let (tx_b, _rx_b) = listener_ctx_channel();
 
-        // Two independent per-invocation tokens and close counters.
+        // Independent per-invocation tokens and close counters.
         let owned_a = Cell::new(false);
         let owned_b = Cell::new(false);
         let closes_a = Arc::new(AtomicUsize::new(0));
+        let closes_b = Arc::new(AtomicUsize::new(0));
 
-        // Interleave: START A (take ownership), START B (pre-ownership), then let
-        // each panic through its own guard_callback. Because each token is a
-        // distinct local `Cell`, A setting true cannot flip B, and B staying false
-        // cannot flip A.
-        owned_a.set(true); // A took ownership (from_raw ran)
-        // B never takes ownership.
-
-        // A panics after ownership → its stand-in Drop performs the single close.
-        let mut ctx_a: &ListenerCtxSender = &tx;
+        // Invocation A: takes ownership (from_raw ran) then panics → its owned
+        // stand-in Drop performs the single close.
+        let mut ctx_a: &ListenerCtxSender = &tx_a;
         let got_a = guard_callback(
             &mut ctx_a,
             &NoShutdown,
             Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
             |_c| {
                 let _owned_standin = OwnedStandIn(closes_a.clone());
+                owned_a.set(true);
                 panic!("A panics after ownership");
             },
             |c, seam| listener_recover(c, seam, &owned_a),
         );
 
-        // B panics before ownership → msquic performs the single reject.
-        let mut ctx_b: &ListenerCtxSender = &tx;
+        // Invocation B: never takes ownership, then panics → msquic performs the
+        // single reject and no owned stand-in is ever constructed (close == 0).
+        let mut ctx_b: &ListenerCtxSender = &tx_b;
         let got_b = guard_callback(
             &mut ctx_b,
             &NoShutdown,
             Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
-            |_c| panic!("B panics before ownership"),
+            |_c| {
+                let _keep_alive = &closes_b;
+                panic!("B panics before ownership");
+            },
             |c, seam| listener_recover(c, seam, &owned_b),
         );
 
-        // A: Ok (no reject) + exactly one close via the owned Drop.
+        // BOTH recovery paths actually executed: `poisoned` is set ONLY inside
+        // `listener_recover`, so each ctx being poisoned proves its recover ran
+        // (B was NOT masked by A's poison).
+        assert!(
+            tx_a.poisoned.load(Ordering::Relaxed),
+            "A's recover ran (ctx A poisoned)"
+        );
+        assert!(
+            tx_b.poisoned.load(Ordering::Relaxed),
+            "B's recover ran (ctx B poisoned) — not short-circuited by A"
+        );
+
+        // A: Ok (no reject) + exactly one close via the owned Drop, zero rejects.
         assert!(got_a.is_ok(), "A took ownership → Ok (no msquic reject)");
         assert_eq!(
             closes_a.load(Ordering::Relaxed),
             1,
             "A's owned stand-in closed exactly once"
         );
-        // B: Err (single reject) — B saw its OWN false token, never A's true.
+        // B: Err (single reject) + zero close — B saw its OWN false token, not A's.
         assert!(
             is_internal_err(&got_b),
             "B never took ownership → Err (single msquic reject), unaffected by A"
         );
+        assert_eq!(
+            closes_b.load(Ordering::Relaxed),
+            0,
+            "B constructed no owned stand-in, so zero close (msquic rejects instead)"
+        );
+
         // Tokens are independent: neither invocation mutated the other's.
         assert!(owned_a.get(), "A token stayed true");
         assert!(!owned_b.get(), "B token stayed false");
