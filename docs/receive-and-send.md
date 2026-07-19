@@ -37,10 +37,14 @@ than per-connection. The resulting connection memory bound is approximately
 `(MAX_RECV_BUFFER + one in-flight indication) × max concurrent streams`, with the
 unit count similarly bounded by `max_recv_units × max concurrent streams`.
 
-Frames of at least `F = 128` bytes bind on the **byte** budget first — the byte
-total reaches `max_recv_bytes` before the unit count reaches `max_recv_units`, so
-the unit cap never becomes the binding limit for realistic frame sizes and there
-is no behavior change for frames ≥ F.
+With the **default** `1 MiB` / `16384`-unit pair, frames of at least `F = 128`
+bytes bind on the **byte** budget first — the byte total reaches
+`max_recv_bytes` before the unit count reaches `max_recv_units`, so the unit cap
+never becomes the binding limit for realistic frame sizes and there is no
+behavior change for frames ≥ F. This "byte-budget-binds-first" property is a
+consequence of the default pair (`16384 × 128 > 1 MiB`), **not** an unconditional
+guarantee: a custom configuration such as `max_recv_units = 1` with a large
+`max_recv_bytes` would deliberately bind on the unit cap instead.
 
 ### The budget state machine
 

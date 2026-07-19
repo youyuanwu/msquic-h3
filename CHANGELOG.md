@@ -8,9 +8,12 @@ where every `0.0.z` bump may contain breaking changes.
 
 ## [Unreleased]
 
-Post-`0.0.7` crate-review fixes. No public API break: the adapter surface is
-unchanged and these are behavioral/robustness corrections plus test and
-packaging hardening.
+Post-`0.0.7` crate-review fixes. No breaking public API change: existing
+constructors and the adapter surface keep their signatures and behavior. This
+release does **add** an additive public configuration API (see **Added** —
+`H3Config` plus two `*_with_config` constructors); the additions are opt-in and
+existing call sites are unaffected. The remaining changes are behavioral/
+robustness corrections plus test and packaging hardening.
 
 ### Fixed
 

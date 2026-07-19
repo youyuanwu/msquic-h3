@@ -11,7 +11,7 @@ use msquic::{
 };
 
 use crate::test::util::{get_test_cred, try_setup_tracing};
-use crate::{Connection, H3_INTERNAL_ERROR, H3Stream, Listener, Registration};
+use crate::{Connection, H3_INTERNAL_ERROR, H3Config, H3Stream, Listener, Registration};
 
 // ── poll_fn adapters over the &mut self trait methods (buffer type = Bytes) ──
 
@@ -73,6 +73,23 @@ where
     F: FnOnce(Connection, Connection) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    run_loopback_with_configs(idle_ms, H3Config::default(), H3Config::default(), body)
+}
+
+/// Like [`run_loopback`] but threads an explicit server-side ([`Listener`]) and
+/// client-side ([`Connection`]) [`H3Config`] through the REAL public
+/// constructors (`Listener::with_config` / `Connection::connect_with_config`),
+/// so a test can assert the configured caps emerge on live peer-accepted and
+/// locally-opened streams after the actual hand-off chain.
+fn run_loopback_with_configs<F, Fut>(
+    idle_ms: u64,
+    server_h3: H3Config,
+    client_h3: H3Config,
+    body: F,
+) where
+    F: FnOnce(Connection, Connection) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     try_setup_tracing();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -99,11 +116,12 @@ where
         server_config.load_credential(&cred_config).unwrap();
         let server_config = Arc::new(server_config);
 
-        let mut listener = Listener::new(
+        let mut listener = Listener::with_config(
             &reg,
             server_config.clone(),
             &alpn,
             Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            server_h3,
         )
         .unwrap();
         // Ephemeral port assigned by ListenerStart; read it back so the client
@@ -125,7 +143,7 @@ where
         // single-threaded runtime; msquic worker threads fire the callbacks.
         let (accepted, connected) = tokio::join!(
             listener.accept(),
-            Connection::connect(&reg, &client_config, "127.0.0.1", port),
+            Connection::connect_with_config(&reg, &client_config, "127.0.0.1", port, client_h3),
         );
         let server = accepted.expect("server accept ok").expect("a connection");
         let client = connected.expect("client connect ok");
@@ -460,7 +478,108 @@ fn accepted_stream_id_failpoint_rejects_and_closes_h3_internal_error() {
     });
 }
 
-/// SC-007 labelled marker (NON-executable): the close-time inline
+/// SC-006 / FR-009 / FR-010 (end-to-end): a custom `H3Config` threaded through
+/// the REAL public constructors (`Listener::with_config` +
+/// `Connection::connect_with_config`) reaches BOTH a peer-accepted stream on the
+/// server and a locally-opened stream on the client — executing the actual
+/// `PeerStreamStarted` → `H3Stream::attach` → `finalize` (accepted) and
+/// `open_and_start` (locally-opened) hand-offs, not just the shared seam helper.
+/// The live stream budgets are read straight off each stream's `RecvBudget` /
+/// send ceiling via the crate-private test accessors.
+#[test]
+fn custom_config_threads_through_real_loopback() {
+    let custom = H3Config::builder()
+        .with_max_send_bytes(1 << 20) // 1 MiB (!= 16 MiB default)
+        .with_max_recv_bytes(512 * 1024) // 512 KiB (!= 1 MiB default)
+        .with_max_recv_units(4096) // (!= 16384 default)
+        .build()
+        .unwrap();
+
+    run_loopback_with_configs(5_000, custom, custom, |mut server, mut client| async move {
+        let (cs, ss) = establish_bidi(&mut client, &mut server, b"ping").await;
+
+        // Peer-ACCEPTED stream on the server inherits the listener's config.
+        assert_eq!(
+            ss.recv_budget_caps(),
+            (custom.max_recv_bytes(), custom.max_recv_units()),
+            "accepted stream must carry the listener's custom recv caps"
+        );
+        assert_eq!(
+            ss.max_send_bytes(),
+            custom.max_send_bytes(),
+            "accepted stream must carry the listener's custom send ceiling"
+        );
+
+        // Locally-OPENED stream on the client inherits the connection's config.
+        assert_eq!(
+            cs.recv_budget_caps(),
+            (custom.max_recv_bytes(), custom.max_recv_units()),
+            "locally-opened stream must carry the connection's custom recv caps"
+        );
+        assert_eq!(
+            cs.max_send_bytes(),
+            custom.max_send_bytes(),
+            "locally-opened stream must carry the connection's custom send ceiling"
+        );
+
+        drop(cs);
+        drop(ss);
+        drop(server);
+        drop(client);
+    });
+}
+
+/// SC-006 isolation: two connections built with DIFFERENT configs (the server
+/// listener vs. the client) produce streams that carry their OWN respective caps
+/// — no cross-talk. The server's peer-accepted stream reflects the server
+/// config; the client's locally-opened stream reflects the (distinct) client
+/// config.
+#[test]
+fn distinct_connection_configs_do_not_cross_talk() {
+    let server_h3 = H3Config::builder()
+        .with_max_send_bytes(2 << 20)
+        .with_max_recv_bytes(256 * 1024)
+        .with_max_recv_units(1024)
+        .build()
+        .unwrap();
+    let client_h3 = H3Config::builder()
+        .with_max_send_bytes(5 << 20)
+        .with_max_recv_bytes(768 * 1024)
+        .with_max_recv_units(2048)
+        .build()
+        .unwrap();
+    assert_ne!(server_h3, client_h3, "the two configs must differ");
+
+    run_loopback_with_configs(
+        5_000,
+        server_h3,
+        client_h3,
+        |mut server, mut client| async move {
+            let (cs, ss) = establish_bidi(&mut client, &mut server, b"ping").await;
+
+            // Server accepted stream → server config only.
+            assert_eq!(
+                ss.recv_budget_caps(),
+                (server_h3.max_recv_bytes(), server_h3.max_recv_units()),
+                "accepted stream must reflect ONLY the server config"
+            );
+            assert_eq!(ss.max_send_bytes(), server_h3.max_send_bytes());
+
+            // Client local stream → client config only (no cross-talk).
+            assert_eq!(
+                cs.recv_budget_caps(),
+                (client_h3.max_recv_bytes(), client_h3.max_recv_units()),
+                "locally-opened stream must reflect ONLY the client config"
+            );
+            assert_eq!(cs.max_send_bytes(), client_h3.max_send_bytes());
+
+            drop(cs);
+            drop(ss);
+            drop(server);
+            drop(client);
+        },
+    );
+}
 /// `SendComplete` drain performed by native `QuicStreamClose` has **no**
 /// drop-triggered teardown test — the public API cannot hold a real send
 /// observably outstanding across the close, so that path is exercised by

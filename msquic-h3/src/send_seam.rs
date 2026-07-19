@@ -10,9 +10,10 @@ use h3::quic::{SendStream, StreamErrorIncoming};
 use crate::error::{ConnectionTerminal, MAX_ADAPTER_SEND};
 use crate::msquic::{Status, StatusCode, StreamEvent};
 use crate::{
-    ConnTerminalSlot, ConnectionErrorIncoming, H3SendStream, OversizedSend, SendBuffer, SendExec,
-    SendStreamReceiveCtx, StreamSendCtx, new_conn_terminal_slot, record_conn_terminal,
-    stream_callback, stream_ctx_channel, stream_ctx_channel_with_conn,
+    ConnTerminalSlot, ConnectionErrorIncoming, H3Config, H3SendStream, OversizedSend, SendBuffer,
+    SendExec, SendStreamReceiveCtx, StreamSendCtx, new_conn_terminal_slot, record_conn_terminal,
+    stream_callback, stream_ctx_channel, stream_ctx_channel_with_config,
+    stream_ctx_channel_with_conn,
 };
 
 /// Shared, inspectable counters + `client_context` slots. A clone is kept by
@@ -117,6 +118,23 @@ fn test_send_ctx_with_conn(
     let id: h3::quic::StreamId = 0u64.try_into().expect("valid StreamId");
     let (ctx, sctx, _rctx) = stream_ctx_channel_with_conn(id, conn_terminal);
     (sctx, ctx)
+}
+
+/// Like [`test_send_ctx`] but with an explicit [`H3Config`], so a send-seam
+/// test can drive the real `send_data` classification against a **custom**
+/// per-send-size ceiling (`config.max_send_bytes()`) instead of the default.
+fn test_send_ctx_with_config(config: H3Config) -> (SendStreamReceiveCtx, StreamSendCtx) {
+    let id: h3::quic::StreamId = 0u64.try_into().expect("valid StreamId");
+    let (ctx, sctx, _rctx) = stream_ctx_channel_with_config(id, new_conn_terminal_slot(), config);
+    (sctx, ctx)
+}
+
+/// A validated [`H3Config`] with only the per-send-size ceiling overridden.
+fn cfg_with_ceiling(ceiling: u64) -> H3Config {
+    H3Config::builder()
+        .with_max_send_bytes(ceiling)
+        .build()
+        .expect("valid custom send ceiling")
 }
 
 /// A connection-caused stream `ShutdownComplete` whose derived fallback is the
@@ -424,6 +442,101 @@ fn oversized_send_rejected_before_allocation() {
     assert_eq!(h.sends.load(Relaxed), 0);
     assert_eq!(h.allocs.load(Relaxed), 0);
     assert!(s.sctx.send.try_recv().is_err());
+}
+
+/// SC-001 / SC-004 (send): the real `send_data` path honors a **custom reduced**
+/// per-send-size ceiling `C`. The ceiling bounds the full copied frame length
+/// (`WriteBuf::remaining()` = the h3 DATA header + payload), so the test sizes
+/// its payload so the *framed* length is exactly `C + 1`: it is rejected up
+/// front as `OversizedSend` — which now reports the configured ceiling in
+/// `max_bytes` and the framed length in `len` — with ZERO copies and ZERO native
+/// submissions. This proves `send_data` classifies against
+/// `self.sctx.max_send_bytes` (the configured ceiling), not `MAX_ADAPTER_SEND`.
+#[test]
+fn custom_ceiling_send_data_rejects_oversized_before_allocation() {
+    use bytes::Buf;
+    const C: u64 = 4096;
+
+    // The h3 DATA framing overhead (`remaining()` - payload) is constant for
+    // payload sizes in this magnitude; measure it so the framed length lands on
+    // an exact boundary rather than hardcoding the varint header width.
+    let framed_len = |payload: Bytes| -> usize {
+        let wb: h3::quic::WriteBuf<Bytes> = Frame::Data(payload).into();
+        wb.remaining()
+    };
+    let header = framed_len(Bytes::from(vec![0u8; C as usize - 100])) - (C as usize - 100);
+    // Payload whose framed length is exactly C + 1 (one byte over the ceiling).
+    let over_payload = Bytes::from(vec![0u8; (C as usize + 1) - header]);
+    assert_eq!(framed_len(over_payload.clone()), C as usize + 1);
+
+    let h = CountingHandle::default();
+    let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+    let (sctx, _ctx) = test_send_ctx_with_config(cfg_with_ceiling(C));
+    let mut s = H3SendStream::with_exec(exec, sctx);
+
+    let err = SendStream::<Bytes>::send_data(&mut s, Frame::Data(over_payload))
+        .expect_err("oversized send must be rejected at the custom ceiling");
+
+    match err {
+        StreamErrorIncoming::Unknown(e) => {
+            let os = e
+                .downcast_ref::<OversizedSend>()
+                .expect("expected OversizedSend");
+            assert_eq!(
+                os.len,
+                C as usize + 1,
+                "reported the rejected (framed) length"
+            );
+            assert_eq!(
+                os.max_bytes, C,
+                "OversizedSend must report the CONFIGURED ceiling, not MAX_ADAPTER_SEND"
+            );
+            assert_ne!(
+                os.max_bytes, MAX_ADAPTER_SEND,
+                "the custom ceiling must not be the default"
+            );
+        }
+        other => panic!("expected Unknown(OversizedSend), got {other:?}"),
+    }
+    // Rejected before any copy or native submission, and no send in flight.
+    assert_eq!(h.sends.load(Relaxed), 0);
+    assert_eq!(h.allocs.load(Relaxed), 0);
+    assert!(s.sctx.send.try_recv().is_err());
+}
+
+/// Complement to the rejection test: a send whose framed length is EXACTLY the
+/// custom ceiling `C` is accepted and submitted (one copy, one native
+/// submission), confirming the classifier admits `remaining <= C` rather than
+/// rejecting at the boundary.
+#[test]
+fn custom_ceiling_send_data_accepts_payload_at_the_ceiling() {
+    use bytes::Buf;
+    const C: u64 = 4096;
+
+    let framed_len = |payload: Bytes| -> usize {
+        let wb: h3::quic::WriteBuf<Bytes> = Frame::Data(payload).into();
+        wb.remaining()
+    };
+    let header = framed_len(Bytes::from(vec![0u8; C as usize - 100])) - (C as usize - 100);
+    // Payload whose framed length is exactly C (right at the ceiling).
+    let at_payload = Bytes::from(vec![0u8; C as usize - header]);
+    assert_eq!(framed_len(at_payload.clone()), C as usize);
+
+    let h = CountingHandle::default();
+    // A single scripted Ok so the native side "accepts ownership" of the copy.
+    let mut script = VecDeque::new();
+    script.push_back(Ok(()));
+    let exec = Box::new(CountingExec::new(h.clone(), script));
+    let (sctx, _ctx) = test_send_ctx_with_config(cfg_with_ceiling(C));
+    let mut s = H3SendStream::with_exec(exec, sctx);
+
+    SendStream::<Bytes>::send_data(&mut s, Frame::Data(at_payload))
+        .expect("a send exactly at the custom ceiling must be accepted");
+
+    // Exactly one copy and one native submission occurred.
+    assert_eq!(h.sends.load(Relaxed), 1);
+    assert_eq!(h.allocs.load(Relaxed), 1);
+    assert_eq!(h.client_ctx.lock().unwrap().len(), 1);
 }
 
 #[test]

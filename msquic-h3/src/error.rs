@@ -23,9 +23,8 @@ use crate::msquic::{Status, StatusCode};
 /// encode. See [`clamp_application_code`].
 pub const MAX_QUIC_VARINT: u64 = (1 << 62) - 1;
 
-/// Maximum single `send_data` payload the adapter will accept before rejecting
-/// with [`OversizedSend`]. Provisional value (16 MiB); enforced by the send-length
-/// classification in [`crate::buffer`] and the `send_data` rejection site.
+/// Default maximum single `send_data` payload the adapter will accept before
+/// rejecting with [`OversizedSend`] (16 MiB). Configurable via [`H3Config`](crate::H3Config).
 pub const MAX_ADAPTER_SEND: u64 = 16 * 1024 * 1024;
 
 /// Clamp an outgoing application error code to the QUIC 62-bit varint maximum.
@@ -52,14 +51,16 @@ pub(crate) fn clamp_application_code(code: u64) -> u64 {
 pub struct OversizedSend {
     /// Requested payload length in bytes (the `remaining()` that was rejected).
     pub len: usize,
+    /// The connection's configured send-size ceiling that was exceeded.
+    pub max_bytes: u64,
 }
 
 impl fmt::Display for OversizedSend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "send_data payload of {} bytes exceeds MAX_ADAPTER_SEND ({} bytes)",
-            self.len, MAX_ADAPTER_SEND
+            "send_data payload of {} bytes exceeds configured ceiling ({} bytes)",
+            self.len, self.max_bytes
         )
     }
 }
@@ -372,14 +373,14 @@ pub(crate) enum SendPoll {
 pub(crate) enum SendPayload {
     Empty,
     NonEmpty { len: u32 },
-    Oversized { len: usize },
+    Oversized { len: usize, ceiling: u64 },
 }
 
 /// One-shot, non-sticky adapter error for `send_data`. Never stored in the
 /// shared slot; a later `poll_ready` is unaffected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SendOperationError {
-    OversizedSend { len: usize },
+    OversizedSend { len: usize, ceiling: u64 },
     Misuse(&'static str),
 }
 
@@ -477,8 +478,11 @@ pub(crate) enum SendCommand {
 /// returns. Never stored in the shared slot.
 pub(crate) fn convert_send_op(e: SendOperationError) -> StreamErrorIncoming {
     match e {
-        SendOperationError::OversizedSend { len } => {
-            StreamErrorIncoming::Unknown(Box::new(OversizedSend { len }))
+        SendOperationError::OversizedSend { len, ceiling } => {
+            StreamErrorIncoming::Unknown(Box::new(OversizedSend {
+                len,
+                max_bytes: ceiling,
+            }))
         }
         SendOperationError::Misuse(msg) => StreamErrorIncoming::ConnectionErrorIncoming {
             connection_error: ConnectionErrorIncoming::InternalError(msg.to_string()),
@@ -635,8 +639,8 @@ pub(crate) fn transition(state: &mut SendState, input: SendInput) -> SendCommand
             match payload {
                 // idle, no winner
                 SendPayload::Empty => ReturnSent, // no-op, no reservation
-                SendPayload::Oversized { len } => {
-                    ReturnImmediateError(SendOperationError::OversizedSend { len }) // state unchanged
+                SendPayload::Oversized { len, ceiling } => {
+                    ReturnImmediateError(SendOperationError::OversizedSend { len, ceiling }) // state unchanged
                 }
                 SendPayload::NonEmpty { .. } => {
                     state.send_submitting = true;
@@ -1437,13 +1441,19 @@ mod reducer_tests {
         let cmd = step(
             &mut st,
             SendInput::SendRequested {
-                payload: SendPayload::Oversized { len: 999 },
+                payload: SendPayload::Oversized {
+                    len: 999,
+                    ceiling: 4096,
+                },
                 terminal: None,
             },
         );
         assert!(matches!(
             cmd,
-            SendCommand::ReturnImmediateError(SendOperationError::OversizedSend { len: 999 })
+            SendCommand::ReturnImmediateError(SendOperationError::OversizedSend {
+                len: 999,
+                ceiling: 4096
+            })
         ));
         assert_eq!(
             st,

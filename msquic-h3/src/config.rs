@@ -4,10 +4,13 @@
 //! receive-byte budget, and the per-stream receive-unit (allocation/message)
 //! cap. Its fields are **private** and can only be produced via [`Default`] or
 //! the validated [`H3ConfigBuilder`], so no invalid configuration is ever
-//! constructible by a literal or a field mutation. The defaults equal the
-//! adapter's historical hard-coded ceilings ([`MAX_ADAPTER_SEND`] for sends and
-//! [`MAX_RECV_BUFFER`] for receive bytes), so a default-configured adapter
-//! behaves exactly as before.
+//! constructible by a literal or a field mutation. The defaults preserve the
+//! adapter's historical send ceiling ([`MAX_ADAPTER_SEND`]) and receive-**byte**
+//! budget ([`MAX_RECV_BUFFER`]) while **adding** a protective receive-unit cap
+//! ([`DEFAULT_MAX_RECV_UNITS`], 16384). A default-configured adapter therefore
+//! keeps the prior send and receive-byte behavior, but the new unit cap does
+//! bound highly fragmented tiny-frame input that was previously unbounded — that
+//! is the point of the cap.
 //!
 //! The send side is bounded by `max_send_bytes × concurrent streams` (there is
 //! no aggregate/per-connection send budget — the h3 trait contract calls the

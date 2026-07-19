@@ -1134,6 +1134,28 @@ impl H3Stream {
     }
 }
 
+/// Test-only accessors that read the LIVE per-stream budgets a fully-constructed
+/// stream is actually enforcing, so an end-to-end loopback test can confirm the
+/// connection's [`H3Config`] threaded all the way through the real
+/// `PeerStreamStarted`/`attach`/`finalize` (accepted) and `open_and_start`
+/// (locally-opened) hand-offs — not just through the shared seam helper.
+#[cfg(test)]
+impl H3Stream {
+    /// The live per-stream receive caps `(max_recv_bytes, max_recv_units)` this
+    /// stream's `RecvBudget` is enforcing.
+    pub(crate) fn recv_budget_caps(&self) -> (usize, usize) {
+        (
+            self.recv.rctx.recv_budget.max_bytes(),
+            self.recv.rctx.recv_budget.max_units(),
+        )
+    }
+
+    /// The live per-stream `send_data` ceiling this stream is enforcing.
+    pub(crate) fn max_send_bytes(&self) -> u64 {
+        self.send.sctx.max_send_bytes
+    }
+}
+
 impl<B: Buf> SendStream<B> for H3SendStream {
     // h3 calls `poll_ready` after `send_data` to await the in-flight send.
     #[cfg_attr(
@@ -1452,7 +1474,10 @@ impl SendStreamReceiveCtx {
 fn classify_payload(remaining: usize, ceiling: u64) -> SendPayload {
     match classify_send_len(remaining, ceiling) {
         SendLen::Empty => SendPayload::Empty,
-        SendLen::Oversized => SendPayload::Oversized { len: remaining },
+        SendLen::Oversized => SendPayload::Oversized {
+            len: remaining,
+            ceiling,
+        },
         SendLen::NonEmpty => SendPayload::NonEmpty {
             len: remaining as u32,
         },
@@ -2439,17 +2464,29 @@ mod receive_events {
     use crate::config::DEFAULT_MAX_RECV_UNITS;
 
     /// SC-002 (the key regression): a PENDING-honoring paced driver offers ≥
-    /// 100,000 ONE-BYTE frames one at a time to a stream whose application does
-    /// NOT consume, and — modelling msquic's single-receive-mode semantics —
-    /// STOPS offering after a `QUIC_STATUS_PENDING` until a recorded drain
-    /// (`receive_complete` via the seam) re-arms the stream. The peak buffered
-    /// UNIT count must stay ≤ `max_recv_units` (16384) and peak bytes ≤
+    /// 100,000 ONE-BYTE frames one at a time on a **drain-one-per-pend cyclic**
+    /// model. It offers frames until the callback returns `QUIC_STATUS_PENDING`
+    /// (native has paused THIS stream); it then STOPS offering and drains
+    /// EXACTLY ONE buffered unit, which must produce EXACTLY ONE recorded native
+    /// `receive_complete` (the re-arm) through the `RecvExec` seam before any
+    /// further offer. The application never gets ahead of the flood — it only
+    /// consumes the single unit needed to re-open the window — so the peak
+    /// buffered UNIT count stays ≤ `max_recv_units` (16384) and peak bytes ≤
     /// `max_recv_bytes` + one indication. (Old behaviour would have buffered
     /// ~1,048,576 units.)
+    ///
+    /// Retaining the `RecordingRecvExec` completion log lets the driver assert
+    /// the seam actually fired `receive_complete` once per pend, rather than
+    /// merely observing an internal flag clear: if `poll_data` cleared the pend
+    /// state without invoking the native `receive_complete`, a real MsQuic
+    /// stream would stay permanently paused, and this test now fails.
     #[test]
     fn paced_tiny_frames_are_bounded_by_the_unit_cap() {
         let (mut ctx, _sctx, rctx) = stream_ctx_channel(0u64.try_into().unwrap());
         let rec = RecordingRecvExec::default();
+        // RETAIN the completion log so we can assert each pend is re-armed by
+        // exactly one recorded native `receive_complete`.
+        let completes = rec.completes.clone();
         let mut recv = H3RecvStream::with_exec(Box::new(rec), rctx);
         let mut cx = noop_context();
 
@@ -2458,15 +2495,37 @@ mod receive_events {
         let mut peak_units = 0usize;
         let mut peak_bytes = 0usize;
         let mut pend_returns = 0usize;
+        let mut completions = 0usize;
+
+        // Drain exactly one buffered unit and require exactly one NEW recorded
+        // `receive_complete` (the re-arm). Returns after asserting the pend
+        // cleared.
+        let drain_one_and_require_rearm =
+            |recv: &mut H3RecvStream, cx: &mut Context<'_>, completions: &mut usize| {
+                let before = completes.lock().unwrap().len();
+                match recv.poll_data(cx) {
+                    Poll::Ready(Ok(Some(_))) => {}
+                    other => panic!("expected buffered data while paced-stalled, got {other:?}"),
+                }
+                let after = completes.lock().unwrap().len();
+                assert_eq!(
+                    after,
+                    before + 1,
+                    "each pend must be re-armed by exactly ONE recorded receive_complete"
+                );
+                assert!(
+                    !recv.rctx.recv_budget.pend_outstanding(),
+                    "draining one unit below the cap must clear the pend"
+                );
+                *completions += 1;
+            };
+
         while offered < OFFER_TARGET {
             if recv.rctx.recv_budget.pend_outstanding() {
                 // Native has paused THIS stream after PENDING: no further
                 // indication is delivered until the app drains one buffered unit,
-                // which re-arms the window via the RecvExec seam.
-                match recv.poll_data(&mut cx) {
-                    Poll::Ready(Ok(Some(_))) => {}
-                    other => panic!("expected buffered data while paced-stalled, got {other:?}"),
-                }
+                // which must re-arm the window via a recorded `receive_complete`.
+                drain_one_and_require_rearm(&mut recv, &mut cx, &mut completions);
                 continue;
             }
             // A REAL one-byte offer through the real receive callback/seam.
@@ -2482,8 +2541,25 @@ mod receive_events {
             }
         }
 
+        // Drain a final outstanding pend (if the last offer pended) so the
+        // recorded-completion count matches the pend count exactly.
+        if recv.rctx.recv_budget.pend_outstanding() {
+            drain_one_and_require_rearm(&mut recv, &mut cx, &mut completions);
+        }
+
         assert!(offered >= OFFER_TARGET);
         assert!(pend_returns > 0, "the unit cap must engage backpressure");
+        // Exactly one recorded native `receive_complete` per pend (the seam
+        // genuinely re-armed the stream every time it paused).
+        assert_eq!(
+            completions, pend_returns,
+            "exactly one drain-driven re-arm per pend"
+        );
+        assert_eq!(
+            completes.lock().unwrap().len(),
+            pend_returns,
+            "the native receive_complete seam fired exactly once per pend"
+        );
         // The unit count is bounded by the cap — never the ~1M it would reach
         // without unit accounting.
         assert_eq!(

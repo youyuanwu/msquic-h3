@@ -23,10 +23,10 @@ use crate::{
 pub struct Listener {
     inner: msquic::Listener,
     conn: ListenerCtxReceiver,
-    /// Per-connection memory budget applied to every connection this listener
-    /// accepts (threaded into `Connection::attach`).
-    #[allow(dead_code)]
-    config: crate::H3Config,
+    // The listener-wide `H3Config` is not stored here: it is captured by `Copy`
+    // into the accept callback closure (see `with_config`), which is the single
+    // source of truth passed to every accepted `Connection::attach`. Keeping a
+    // second copy on the struct would be dead, drift-prone state.
     // Dropped last: `inner`'s ListenerClose releases the native rundown ref
     // before this guard decrements and wakes `wait_idle` waiters.
     _guard: RundownGuard,
@@ -318,7 +318,6 @@ impl Listener {
         let listener = Self {
             inner,
             conn: rx,
-            config: h3config,
             _guard: guard,
         };
         listener.inner.start(alpn, addr.as_ref())?;
