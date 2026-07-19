@@ -91,9 +91,25 @@ fn listener_poison_disp(ev: &ListenerEvent) -> Result<(), Status> {
 /// double-close). Otherwise ownership never transferred, so returning
 /// `Err(INTERNAL_ERROR)` lets msquic perform the single reject. Either branch
 /// yields exactly one close/reject with no leaked handle. Marks the ctx poisoned.
+///
+/// It ALSO wakes both listener terminal waiters — mirroring [`StopComplete`
+/// handling in `listener_callback`] — so a pending `accept()` and a pending
+/// `shutdown()` cannot hang after the panic. This is essential because once the
+/// ctx is poisoned a later `StopComplete` is short-circuited to a no-op `Ok(())`
+/// by [`listener_poison_disp`] and would never signal them.
 fn listener_recover(ctx: &mut &ListenerCtxSender, _seam: &dyn ShutdownSeam) -> Result<(), Status> {
     report_contained_panic(CbClass::Listener);
     let ownership_taken = ctx.ownership_taken.load(Ordering::Relaxed);
+    // Wake both terminal paths so no waiter hangs: signal end-of-connections to
+    // any pending `accept()`, and resolve the `shutdown()`/StopComplete waiter.
+    // Mirrors the `StopComplete` arm of `listener_callback`.
+    if let Some(tx) = ctx.conn.as_ref() {
+        let _ = tx.unbounded_send(None);
+    }
+    let sh = crate::lock_recover(&ctx.shutdown).take();
+    if let Some(sh) = sh {
+        let _ = sh.send(());
+    }
     ctx.poisoned.store(true, Ordering::Relaxed);
     if ownership_taken {
         // Ownership already transferred; the unwind's Drop closed the owned
@@ -608,16 +624,38 @@ mod callback_safety {
 
     use msquic::{ListenerEvent, Status, StatusCode};
 
-    use super::{ListenerCtxSender, listener_ctx_channel, listener_poison_disp, listener_recover};
+    use super::{
+        ListenerCtxReceiver, ListenerCtxSender, listener_ctx_channel, listener_poison_disp,
+        listener_recover,
+    };
     use crate::{NoShutdown, guard_callback};
 
     fn is_internal_err(r: &Result<(), Status>) -> bool {
         matches!(r, Err(s) if s.0 == Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR).0)
     }
 
+    /// Assert both listener terminal waiters were signalled by `listener_recover`,
+    /// so a pending `accept()` and a pending `shutdown()` cannot hang after a
+    /// contained panic. `accept()` must observe the end-of-connections sentinel
+    /// (`None`) and `shutdown()`'s one-shot must be resolved.
+    fn assert_both_waiters_woken(rx: &mut ListenerCtxReceiver) {
+        match rx.conn.try_recv() {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("accept received a connection, expected end sentinel"),
+            Err(_) => panic!("accept waiter not woken (channel empty) — would hang"),
+        }
+        let mut lk = crate::lock_recover(&rx.shutdown);
+        let sh = lk.as_mut().expect("shutdown receiver present");
+        match sh.try_recv() {
+            Ok(Some(())) => {}
+            Ok(None) => panic!("shutdown waiter not resolved — would hang"),
+            Err(_) => panic!("shutdown sender dropped without resolving"),
+        }
+    }
+
     #[test]
     fn listener_callback_panic_before_from_raw_rejects() {
-        let (tx, _rx) = listener_ctx_channel();
+        let (tx, mut rx) = listener_ctx_channel();
         let mut ctx_ref: &ListenerCtxSender = &tx;
         let got = guard_callback(
             &mut ctx_ref,
@@ -634,11 +672,13 @@ mod callback_safety {
         // Ownership never transferred → exactly one reject (Err); nothing to leak.
         assert!(is_internal_err(&got));
         assert!(tx.poisoned.load(Ordering::Relaxed));
+        // Both terminal waiters are woken so accept()/shutdown() cannot hang.
+        assert_both_waiters_woken(&mut rx);
     }
 
     #[test]
     fn listener_callback_panic_after_from_raw_does_not_reject() {
-        let (tx, _rx) = listener_ctx_channel();
+        let (tx, mut rx) = listener_ctx_channel();
         let mut ctx_ref: &ListenerCtxSender = &tx;
         let got = guard_callback(
             &mut ctx_ref,
@@ -657,6 +697,9 @@ mod callback_safety {
         // owned-connection Drop performed the single close (no double-close).
         assert!(got.is_ok());
         assert!(tx.poisoned.load(Ordering::Relaxed));
+        // Even on the owned-connection close path, both terminal waiters are woken
+        // so accept()/shutdown() cannot hang.
+        assert_both_waiters_woken(&mut rx);
     }
 
     #[test]
@@ -711,5 +754,46 @@ mod callback_safety {
             listener_recover,
         );
         assert!(is_internal_err(&got));
+    }
+
+    #[test]
+    fn listener_teardown_body_panic_is_contained_and_wakes_waiters() {
+        // A panic while handling a TEARDOWN event (StopComplete) is contained:
+        // recover wakes both terminal waiters and poisons the ctx, so a pending
+        // accept()/shutdown() cannot hang. A subsequent StopComplete then
+        // short-circuits to a no-op Ok without re-running the body.
+        let (tx, mut rx) = listener_ctx_channel();
+        let mut ctx_ref: &ListenerCtxSender = &tx;
+        let teardown = ListenerEvent::StopComplete {
+            app_close_in_progress: false,
+        };
+        // First event: ctx not yet poisoned, so the body runs and panics.
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            listener_poison_disp(&teardown),
+            |c| {
+                c.ownership_taken.store(false, Ordering::Relaxed);
+                panic!("boom while handling StopComplete");
+            },
+            listener_recover,
+        );
+        // No ownership taken during teardown → recover returns Err (harmless for a
+        // teardown, whose return msquic ignores). The key guarantees follow.
+        assert!(is_internal_err(&got));
+        assert!(tx.poisoned.load(Ordering::Relaxed));
+        // Both terminal waiters woken so nothing hangs after a teardown-body panic.
+        assert_both_waiters_woken(&mut rx);
+
+        // A subsequent StopComplete short-circuits to a no-op Ok without running
+        // the body (poison short-circuit), so waiters are not signalled twice.
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            listener_poison_disp(&teardown),
+            |_c| panic!("body must NOT run on teardown after poison"),
+            listener_recover,
+        );
+        assert!(got.is_ok());
     }
 }

@@ -3230,6 +3230,64 @@ mod callback_safety {
     }
 
     #[test]
+    fn connection_teardown_body_panic_is_contained_and_wakes_waiters() {
+        // A panic while handling a TEARDOWN event (ShutdownComplete) is still
+        // contained: recover force-closes, wakes the connect waiter, and poisons
+        // the ctx — so a task parked on the connect one-shot cannot hang. A
+        // subsequent teardown then short-circuits to Ok WITHOUT re-running the
+        // body, so Phase 2 terminal state is never double-completed.
+        let (mut ctx, mut crx) = conn_ctx_channel();
+        let seam = RecordingSeam::default();
+        let teardown = ConnectionEvent::ShutdownComplete {
+            handshake_completed: false,
+            peer_acknowledged_shutdown: false,
+            app_close_in_progress: false,
+        };
+        // First event: ctx not yet poisoned, so the body runs and panics.
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            conn_poison_disp(&teardown),
+            |_c| panic!("boom while handling ShutdownComplete"),
+            connection_recover,
+        );
+        assert!(is_internal_err(&got));
+        assert_eq!(
+            *seam.calls.borrow(),
+            vec![(
+                ForceShutdown::Connection(ConnectionShutdownFlags::NONE),
+                H3_INTERNAL_ERROR
+            )],
+            "teardown-body panic still force-closes once"
+        );
+        assert!(
+            ctx.poisoned,
+            "ctx is poisoned after a contained teardown panic"
+        );
+        // Waiter-wake: the connect one-shot is resolved with a failure, not hung.
+        let mut woken = crx.connected.take().expect("connect waiter present");
+        match woken.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("connect waiter should observe a failure, got {other:?}"),
+        }
+        // A subsequent teardown short-circuits to Ok WITHOUT running the body or
+        // recover again — no double force-close, no double-completion.
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            conn_poison_disp(&teardown),
+            |_c| panic!("body must NOT run on teardown after poison"),
+            connection_recover,
+        );
+        assert!(got.is_ok());
+        assert_eq!(
+            seam.calls.borrow().len(),
+            1,
+            "no second force-close after poison short-circuit"
+        );
+    }
+
+    #[test]
     fn stream_callback_panic_is_contained() {
         let (mut ctx, mut recv) = stream_ctx_channel_pre_id(new_conn_terminal_slot());
         let seam = RecordingSeam::default();
@@ -3306,6 +3364,67 @@ mod callback_safety {
         assert!(is_internal_err(&stream_poison_disp(
             &StreamEvent::PeerSendShutdown
         )));
+    }
+
+    #[test]
+    fn stream_teardown_body_panic_is_contained_and_wakes_waiters() {
+        // A panic while handling a TEARDOWN event (ShutdownComplete) is contained:
+        // recover force-aborts, wakes both the send half and the pending open
+        // waiter, and poisons the ctx — so no waiter hangs. A subsequent teardown
+        // then short-circuits to Ok without re-running the body (no double
+        // completion of Phase 2 send/receive terminal state).
+        let (mut ctx, mut recv) = stream_ctx_channel_pre_id(new_conn_terminal_slot());
+        let seam = RecordingSeam::default();
+        let teardown = StreamEvent::ShutdownComplete {
+            connection_shutdown: false,
+            app_close_in_progress: false,
+            connection_shutdown_by_app: false,
+            connection_closed_remotely: false,
+            connection_error_code: 0,
+            connection_close_status: Status::new(StatusCode::QUIC_STATUS_SUCCESS),
+        };
+        // First event: ctx not yet poisoned, so the body runs and panics.
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            stream_poison_disp(&teardown),
+            |_c| panic!("boom while handling stream ShutdownComplete"),
+            stream_recover,
+        );
+        assert!(is_internal_err(&got));
+        assert_eq!(
+            *seam.calls.borrow(),
+            vec![(
+                ForceShutdown::Stream(StreamShutdownFlags::ABORT),
+                H3_INTERNAL_ERROR
+            )],
+            "teardown-body panic still force-aborts once"
+        );
+        assert!(ctx.poisoned);
+        // Waiter-wake: send half woken with a terminal, open waiter with a failure.
+        match recv.send.try_recv() {
+            Ok(SendEvent::TerminalWake) => {}
+            other => panic!("send half should be woken, got {other:?}"),
+        }
+        match recv.start.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("open waiter should observe a failure, got {other:?}"),
+        }
+        // A subsequent teardown short-circuits to Ok WITHOUT re-running the body
+        // or recover — no double force-abort, no double-completion.
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            stream_poison_disp(&teardown),
+            |_c| panic!("body must NOT run on teardown after poison"),
+            stream_recover,
+        );
+        assert!(got.is_ok());
+        assert_eq!(
+            seam.calls.borrow().len(),
+            1,
+            "no second force-abort after poison short-circuit"
+        );
     }
 }
 
