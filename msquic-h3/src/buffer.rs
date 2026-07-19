@@ -1,30 +1,32 @@
 use bytes::{Buf, Bytes};
 use msquic::BufferRef;
 
-use crate::error::MAX_ADAPTER_SEND;
-
 /// Classification of a `send_data` payload's `remaining()` length against the
-/// adapter's owned-copy ceiling ([`MAX_ADAPTER_SEND`]).
+/// adapter's owned-copy ceiling (a configured `max_send_bytes`, default
+/// [`MAX_ADAPTER_SEND`](crate::error::MAX_ADAPTER_SEND)).
 ///
-/// The split is against the ceiling, **not** the raw `u32` protocol maximum, so
-/// the adapter never materializes a near-`u32::MAX` owned buffer just to have
-/// MsQuic reject the aggregate. The classification is performed up front, before
-/// any allocation, so an oversized request is rejected without a copy.
+/// The split is against the configured ceiling, **not** the raw `u32` protocol
+/// maximum, so the adapter never materializes a near-`u32::MAX` owned buffer
+/// just to have MsQuic reject the aggregate. The classification is performed up
+/// front, before any allocation, so an oversized request is rejected without a
+/// copy.
 pub(crate) enum SendLen {
     /// Zero-length payload: a successful no-op — no allocation, no native send.
     Empty,
-    /// `0 < len <= MAX_ADAPTER_SEND`. The ceiling is below `u32::MAX`, so the
+    /// `0 < len <= ceiling`. The ceiling is below `u32::MAX`, so the
     /// materialized length always fits the `u32` a [`BufferRef`] carries.
     NonEmpty,
-    /// `len > MAX_ADAPTER_SEND`: reject with `OversizedSend` before any allocation.
+    /// `len > ceiling`: reject with `OversizedSend` before any allocation.
     Oversized,
 }
 
-/// Classify a payload length against [`MAX_ADAPTER_SEND`] before any allocation.
-pub(crate) fn classify_send_len(remaining: usize) -> SendLen {
+/// Classify a payload length against the configured `ceiling` (in bytes) before
+/// any allocation. The caller sources `ceiling` from the connection's
+/// `H3Config` (default [`MAX_ADAPTER_SEND`](crate::error::MAX_ADAPTER_SEND)).
+pub(crate) fn classify_send_len(remaining: usize, ceiling: u64) -> SendLen {
     if remaining == 0 {
         SendLen::Empty
-    } else if remaining as u64 > MAX_ADAPTER_SEND {
+    } else if remaining as u64 > ceiling {
         SendLen::Oversized
     } else {
         SendLen::NonEmpty
@@ -85,14 +87,16 @@ const _: fn() = || {
 impl SendBuffer {
     /// Materialize a validated, non-empty payload into an owned `SendBuffer`.
     ///
-    /// `bytes` must be non-empty and no longer than [`MAX_ADAPTER_SEND`] (both
-    /// already guaranteed by [`classify_send_len`] at the call site), so the
-    /// `usize as u32` length cast inside `BufferRef::from` never truncates.
+    /// `bytes` must be non-empty and no longer than the caller's configured send
+    /// ceiling (already guaranteed by [`classify_send_len`] at the call site).
+    /// Because every valid `H3Config` ceiling is `< u32::MAX`, the payload here
+    /// is always `< u32::MAX`, so the `usize as u32` length cast inside
+    /// `BufferRef::from` never truncates.
     pub(crate) fn new(bytes: Bytes) -> Self {
         debug_assert!(!bytes.is_empty(), "SendBuffer requires a non-empty payload");
         debug_assert!(
-            bytes.len() as u64 <= MAX_ADAPTER_SEND,
-            "SendBuffer length must be within MAX_ADAPTER_SEND"
+            (bytes.len() as u64) < u32::MAX as u64,
+            "SendBuffer length must fit a u32 BufferRef"
         );
         // Build the `BufferRef` from the heap slice *before* moving `bytes` into
         // the struct. The pointer targets the heap allocation, which does not move
@@ -120,7 +124,7 @@ impl SendBuffer {
 /// bench calls it with `&[u8]`; both implement [`Buf`], so both drive the
 /// identical `src.copy_to_bytes(remaining)` allocation — the benchmark measures
 /// the exact production copy, not a second implementation. The caller must have
-/// already classified the payload as non-empty and within [`MAX_ADAPTER_SEND`]
+/// already classified the payload as non-empty and within [`MAX_ADAPTER_SEND`](crate::error::MAX_ADAPTER_SEND)
 /// (via [`classify_send_len`]), matching [`SendBuffer::new`]'s contract.
 ///
 /// The helper is `pub` (inside the crate-private `mod buffer`) so a gated
@@ -162,14 +166,41 @@ mod test {
 
     #[test]
     fn classify_send_len_boundaries() {
-        assert!(matches!(classify_send_len(0), SendLen::Empty));
-        assert!(matches!(classify_send_len(1), SendLen::NonEmpty));
         assert!(matches!(
-            classify_send_len(MAX_ADAPTER_SEND as usize),
+            classify_send_len(0, MAX_ADAPTER_SEND),
+            SendLen::Empty
+        ));
+        assert!(matches!(
+            classify_send_len(1, MAX_ADAPTER_SEND),
             SendLen::NonEmpty
         ));
         assert!(matches!(
-            classify_send_len(MAX_ADAPTER_SEND as usize + 1),
+            classify_send_len(MAX_ADAPTER_SEND as usize, MAX_ADAPTER_SEND),
+            SendLen::NonEmpty
+        ));
+        assert!(matches!(
+            classify_send_len(MAX_ADAPTER_SEND as usize + 1, MAX_ADAPTER_SEND),
+            SendLen::Oversized
+        ));
+    }
+
+    #[test]
+    fn classify_send_len_honors_a_custom_ceiling() {
+        // A reduced ceiling C rejects payloads > C up front and accepts <= C,
+        // proving the send-size classification is config-driven (SC-001/SC-004).
+        let ceiling: u64 = 4096;
+        assert!(matches!(classify_send_len(0, ceiling), SendLen::Empty));
+        assert!(matches!(
+            classify_send_len(ceiling as usize, ceiling),
+            SendLen::NonEmpty
+        ));
+        assert!(matches!(
+            classify_send_len(ceiling as usize + 1, ceiling),
+            SendLen::Oversized
+        ));
+        // A payload the DEFAULT ceiling would accept is oversized under C.
+        assert!(matches!(
+            classify_send_len(MAX_ADAPTER_SEND as usize, ceiling),
             SendLen::Oversized
         ));
     }

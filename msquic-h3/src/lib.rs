@@ -15,6 +15,8 @@ pub(crate) use h3::quic::ConnectionErrorIncoming;
 use msquic::{Status, StatusCode};
 
 mod buffer;
+mod config;
+pub use config::{ConfigError, H3Config, H3ConfigBuilder};
 mod callback;
 pub(crate) use callback::{
     CbClass, ForceShutdown, NoShutdown, PoisonFlag, ShutdownSeam, guard_callback,

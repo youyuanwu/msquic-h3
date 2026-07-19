@@ -23,13 +23,14 @@ use msquic::{
 };
 
 use crate::buffer::{SendBuffer, SendLen, classify_send_len, copy_into_send_buffer};
+use crate::config::DEFAULT_MAX_RECV_UNITS;
 use crate::error::{
     ConnectionTerminal, ReceiveTerminal, SendCommand, SendEvent, SendInput, SendPayload, SendPoll,
     SendState, SendTerminal, clamp_application_code, convert_recv, convert_send, convert_send_op,
     transition,
 };
 use crate::{
-    CbClass, ConnHandle, ConnTerminalSlot, ForceShutdown, H3_INTERNAL_ERROR, PoisonFlag,
+    CbClass, ConnHandle, ConnTerminalSlot, ForceShutdown, H3_INTERNAL_ERROR, H3Config, PoisonFlag,
     SendTerminalSlot, ShutdownSeam, classify_conn_shutdown, commit_conn, guard_callback,
     internal_error_status, load_winner, lock_recover, new_send_terminal_slot, observe_conn_winner,
     peek_conn_terminal, publish_send, record_conn_terminal, report_contained_panic,
@@ -270,11 +271,28 @@ struct RecvState {
 
 /// Per-stream receive budget, shared (as an `Arc`) between the stream callback
 /// (writer) and the `poll_data` drain (reader). Each local or accepted stream
-/// owns its own independent 1 MiB budget; there is no connection-wide meter. See
-/// [`RecvState`].
-#[derive(Debug, Default)]
+/// owns its own independent budget sourced from the connection's [`H3Config`];
+/// there is no connection-wide meter. See [`RecvState`].
+///
+/// `max_bytes` is the per-stream byte ceiling (default [`MAX_RECV_BUFFER`]).
+/// `max_units` is the per-stream buffered-unit ceiling (default
+/// [`DEFAULT_MAX_RECV_UNITS`]); it is carried here from Phase 1 but not yet
+/// enforced — Phase 2 adds the unit-count backpressure that reads it.
+#[derive(Debug)]
 pub(crate) struct RecvBudget {
     state: Mutex<RecvState>,
+    /// Per-stream buffered-byte ceiling (config-sourced).
+    max_bytes: usize,
+    /// Per-stream buffered-unit ceiling (config-sourced). Plumbed in Phase 1;
+    /// enforced in Phase 2.
+    #[allow(dead_code)]
+    max_units: usize,
+}
+
+impl Default for RecvBudget {
+    fn default() -> Self {
+        Self::new(MAX_RECV_BUFFER, DEFAULT_MAX_RECV_UNITS)
+    }
 }
 
 /// Outcome of the callback-side [`RecvBudget::admit`] transition.
@@ -292,6 +310,15 @@ pub(crate) enum Admit {
 }
 
 impl RecvBudget {
+    /// Build a receive budget with explicit per-stream caps (from [`H3Config`]).
+    pub(crate) fn new(max_bytes: usize, max_units: usize) -> Self {
+        Self {
+            state: Mutex::new(RecvState::default()),
+            max_bytes,
+            max_units,
+        }
+    }
+
     /// Lock the receive state, recovering a poisoned lock rather than panicking
     /// (FFI callbacks must never unwind across the msquic boundary).
     fn lock(&self) -> MutexGuard<'_, RecvState> {
@@ -321,7 +348,7 @@ impl RecvBudget {
         if st.buffered > st.peak {
             st.peak = st.buffered;
         }
-        let pend = st.buffered >= MAX_RECV_BUFFER;
+        let pend = st.buffered >= self.max_bytes;
         if pend {
             st.pend_outstanding = true;
             st.pending_indication_len = total as u64;
@@ -356,7 +383,7 @@ impl RecvBudget {
             st.buffered
         );
         st.buffered = st.buffered.saturating_sub(len);
-        if st.pend_outstanding && st.buffered < MAX_RECV_BUFFER {
+        if st.pend_outstanding && st.buffered < self.max_bytes {
             st.pend_outstanding = false;
             let complete = st.pending_indication_len;
             st.pending_indication_len = 0;
@@ -380,6 +407,15 @@ impl RecvBudget {
     }
     fn pending_indication_len(&self) -> u64 {
         self.lock().pending_indication_len
+    }
+    /// Config-sourced per-stream byte ceiling (threading assertion).
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+    /// Config-sourced per-stream unit ceiling (threading assertion; Phase 2
+    /// enforces it).
+    pub(crate) fn max_units(&self) -> usize {
+        self.max_units
     }
 }
 
@@ -489,6 +525,12 @@ pub(crate) struct SendStreamReceiveCtx {
     /// Single ordered send-event source (MF-1): data completion, terminal wake,
     /// and finish completion. The reducer observes it only as a [`SendPoll`].
     pub(crate) send: mpsc::UnboundedReceiver<SendEvent>,
+    /// Per-stream `send_data` payload ceiling (config-sourced, default
+    /// [`MAX_ADAPTER_SEND`]). Read by `send_data` to classify/reject oversized
+    /// payloads before any allocation.
+    ///
+    /// [`MAX_ADAPTER_SEND`]: crate::error::MAX_ADAPTER_SEND
+    pub(crate) max_send_bytes: u64,
     /// Pure send-side reducer bookkeeping (replaces the old `send_inprogress`).
     pub(crate) reducer: SendState,
 }
@@ -509,9 +551,9 @@ pub(crate) struct PreIdReceivers {
     pub(crate) receive: mpsc::UnboundedReceiver<ReceiveEvent>,
     /// Per-stream receive budget (SF-A), carried into the receive half's ctx.
     pub(crate) recv_budget: Arc<RecvBudget>,
+    /// Per-stream `send_data` ceiling (config-sourced), moved into the send half.
+    pub(crate) max_send_bytes: u64,
 }
-
-/// A locally opened stream whose native handle is started but whose h3
 /// [`h3::quic::StreamId`] is not yet known. Private to [`StreamOpener`]; the
 /// only stream form allowed to exist without a cached ID. On a successful
 /// `StartComplete` it is consumed into an [`H3Stream`] with concrete ID fields
@@ -538,6 +580,8 @@ pub(crate) struct PreIdTail {
     pub(crate) receive: mpsc::UnboundedReceiver<ReceiveEvent>,
     /// Per-stream receive budget (SF-A), carried into the receive half's ctx.
     pub(crate) recv_budget: Arc<RecvBudget>,
+    /// Per-stream `send_data` ceiling (config-sourced), moved into the send half.
+    pub(crate) max_send_bytes: u64,
 }
 
 impl OpeningStream {
@@ -556,6 +600,7 @@ impl OpeningStream {
             conn_terminal,
             receive,
             recv_budget,
+            max_send_bytes,
         } = tail;
         H3Stream {
             send: H3SendStream {
@@ -567,6 +612,7 @@ impl OpeningStream {
                     send_terminal,
                     conn_terminal: conn_terminal.clone(),
                     send,
+                    max_send_bytes,
                     reducer: SendState::new(),
                 },
             },
@@ -595,12 +641,16 @@ impl OpeningStream {
 /// the receivers so both frontend halves resolve+freeze the same winner.
 pub(crate) fn stream_ctx_channel_pre_id(
     conn_terminal: ConnTerminalSlot,
+    config: H3Config,
 ) -> (StreamSendCtx, PreIdReceivers) {
     let (start_tx, start_rx) = oneshot::channel::<Result<u64, Status>>();
     let (send_tx, send_rx) = mpsc::unbounded();
     let send_terminal = new_send_terminal_slot();
     let (receive_tx, receive_rx) = mpsc::unbounded();
-    let recv_budget = Arc::new(RecvBudget::default());
+    let recv_budget = Arc::new(RecvBudget::new(
+        config.max_recv_bytes(),
+        config.max_recv_units(),
+    ));
     (
         StreamSendCtx {
             start: Some(start_tx),
@@ -619,6 +669,7 @@ pub(crate) fn stream_ctx_channel_pre_id(
             conn_terminal,
             receive: receive_rx,
             recv_budget,
+            max_send_bytes: config.max_send_bytes(),
         },
     )
 }
@@ -626,8 +677,9 @@ pub(crate) fn stream_ctx_channel_pre_id(
 /// ID-bearing stream channel builder used where the identity is already known
 /// (accepted streams and tests). Splits the pre-ID receivers into the two
 /// frontend halves' ctxs directly. Creates a fresh, standalone connection
-/// terminal slot; tests that need to drive connection-terminal refinement use
-/// [`stream_ctx_channel_with_conn`] to inject a shared slot.
+/// terminal slot and uses the default [`H3Config`]; tests that need to drive
+/// connection-terminal refinement use [`stream_ctx_channel_with_conn`], and
+/// tests that need custom caps use [`stream_ctx_channel_with_config`].
 #[cfg(test)]
 pub(crate) fn stream_ctx_channel(
     id: h3::quic::StreamId,
@@ -637,13 +689,26 @@ pub(crate) fn stream_ctx_channel(
 
 /// ID-bearing stream channel builder sharing an explicit connection terminal
 /// slot with the caller, so a test can record/refine the connection terminal and
-/// observe how the stream halves resolve+freeze it (FR-013).
+/// observe how the stream halves resolve+freeze it (FR-013). Uses the default
+/// [`H3Config`].
 #[cfg(test)]
 pub(crate) fn stream_ctx_channel_with_conn(
     id: h3::quic::StreamId,
     conn_terminal: ConnTerminalSlot,
 ) -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamReceiveCtx) {
-    let (ctx, recv) = stream_ctx_channel_pre_id(conn_terminal);
+    stream_ctx_channel_with_config(id, conn_terminal, H3Config::default())
+}
+
+/// ID-bearing stream channel builder with an explicit [`H3Config`], so a test
+/// can assert the connection's caps thread into both stream halves (the
+/// `RecvBudget` byte/unit caps and the send ceiling).
+#[cfg(test)]
+pub(crate) fn stream_ctx_channel_with_config(
+    id: h3::quic::StreamId,
+    conn_terminal: ConnTerminalSlot,
+    config: H3Config,
+) -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamReceiveCtx) {
+    let (ctx, recv) = stream_ctx_channel_pre_id(conn_terminal, config);
     let PreIdReceivers {
         start: _,
         send,
@@ -651,6 +716,7 @@ pub(crate) fn stream_ctx_channel_with_conn(
         conn_terminal,
         receive,
         recv_budget,
+        max_send_bytes,
     } = recv;
     (
         ctx,
@@ -659,6 +725,7 @@ pub(crate) fn stream_ctx_channel_with_conn(
             send_terminal,
             conn_terminal: conn_terminal.clone(),
             send,
+            max_send_bytes,
             reducer: SendState::new(),
         },
         RecvStreamReceiveCtx {
@@ -946,13 +1013,16 @@ impl H3Stream {
     ///
     /// `conn_terminal` is the accepting connection's SHARED terminal slot, so an
     /// accepted stream reports the same refinable connection cause the accept
-    /// frontends do (FR-013).
+    /// frontends do (FR-013). `config` is the accepting connection's memory
+    /// budget, so the accepted stream inherits the same caps as a locally-opened
+    /// one (FR-009).
     pub(crate) fn attach(
         stream: msquic::Stream,
         id: h3::quic::StreamId,
         conn_terminal: ConnTerminalSlot,
+        config: H3Config,
     ) -> Self {
-        let (mut ctx, recv) = stream_ctx_channel_pre_id(conn_terminal);
+        let (mut ctx, recv) = stream_ctx_channel_pre_id(conn_terminal, config);
         let handler = move |stream_ref: StreamRef, ev: StreamEvent| {
             let disp = stream_poison_disp(&ev);
             guard_callback(
@@ -975,6 +1045,7 @@ impl H3Stream {
                 conn_terminal: recv.conn_terminal,
                 receive: recv.receive,
                 recv_budget: recv.recv_budget,
+                max_send_bytes: recv.max_send_bytes,
             },
         }
         .finalize(id)
@@ -988,7 +1059,7 @@ impl H3Stream {
         tracing::instrument(skip_all, level = "trace", err, ret)
     )]
     fn open_and_start(conn: &ConnHandle, uni: bool) -> Result<OpeningStream, Status> {
-        let (mut ctx, recv) = stream_ctx_channel_pre_id(conn.terminal().clone());
+        let (mut ctx, recv) = stream_ctx_channel_pre_id(conn.terminal().clone(), conn.config());
         let handler = move |stream_ref: StreamRef, ev: StreamEvent| {
             let disp = stream_poison_disp(&ev);
             guard_callback(
@@ -1017,6 +1088,7 @@ impl H3Stream {
                 conn_terminal: recv.conn_terminal,
                 receive: recv.receive,
                 recv_budget: recv.recv_budget,
+                max_send_bytes: recv.max_send_bytes,
             },
         })
     }
@@ -1103,7 +1175,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         // when the reducer returns `SubmitSend`, so nothing is copied on a
         // terminal / misuse / oversized / empty path.
         let mut wb: h3::quic::WriteBuf<B> = data.into();
-        let payload = classify_payload(wb.remaining());
+        let payload = classify_payload(wb.remaining(), self.sctx.max_send_bytes);
         let mut input = SendInput::SendRequested {
             payload,
             terminal: self.sctx.resolve_terminal(),
@@ -1334,10 +1406,11 @@ impl SendStreamReceiveCtx {
 }
 
 /// Classify a `send_data` payload length into a [`SendPayload`] before any
-/// allocation. The `NonEmpty` upper bound is `MAX_ADAPTER_SEND` (< `u32::MAX`),
-/// so the `as u32` cast never truncates.
-fn classify_payload(remaining: usize) -> SendPayload {
-    match classify_send_len(remaining) {
+/// allocation. The `NonEmpty` upper bound is the configured `ceiling`
+/// (`<= u32::MAX` by [`H3Config`] validation), so the `as u32` cast never
+/// truncates.
+fn classify_payload(remaining: usize, ceiling: u64) -> SendPayload {
+    match classify_send_len(remaining, ceiling) {
         SendLen::Empty => SendPayload::Empty,
         SendLen::Oversized => SendPayload::Oversized { len: remaining },
         SendLen::NonEmpty => SendPayload::NonEmpty {
@@ -2317,5 +2390,101 @@ mod receive_events {
             other => panic!("expected concatenated data, got {other:?}"),
         }
         assert_eq!(rrx.recv_budget.buffered(), 9);
+    }
+}
+
+/// Phase 1 (config foundation & threading) unit tests: prove a connection's
+/// [`H3Config`] caps reach BOTH stream halves via the same seam
+/// (`stream_ctx_channel*`) that `H3Stream::attach` (peer-accepted) and
+/// `OpeningStream::finalize` (locally-opened) funnel through, that distinct
+/// per-connection configs stay isolated, and that the defaults equal the
+/// historical constants (behavior unchanged). Hermetic (no network).
+#[cfg(test)]
+mod config_threading {
+    use crate::error::MAX_ADAPTER_SEND;
+    use crate::{H3Config, MAX_RECV_BUFFER, new_conn_terminal_slot};
+
+    use super::stream_ctx_channel_with_config;
+
+    fn custom_config() -> H3Config {
+        H3Config::builder()
+            .with_max_send_bytes(4096)
+            .with_max_recv_bytes(8192)
+            .with_max_recv_units(7)
+            .build()
+            .unwrap()
+    }
+
+    /// A custom config threads into a stream ctx built via the seam (the exact
+    /// path both a locally-opened and a peer-accepted stream take through
+    /// `stream_ctx_channel_pre_id`): the receive byte/unit caps and the send
+    /// ceiling all equal the configured values.
+    #[test]
+    fn custom_config_threads_recv_and_send_caps() {
+        let cfg = custom_config();
+        let (_ctx, sctx, rctx) =
+            stream_ctx_channel_with_config(4u64.try_into().unwrap(), new_conn_terminal_slot(), cfg);
+        assert_eq!(rctx.recv_budget.max_bytes(), 8192);
+        assert_eq!(rctx.recv_budget.max_units(), 7);
+        assert_eq!(sctx.max_send_bytes, 4096);
+    }
+
+    /// The same custom config reaching an ACCEPTED-shaped stream (distinct
+    /// conn-terminal slot, mimicking `H3Stream::attach`'s dedicated seam call)
+    /// carries the identical caps: peer-accepted streams inherit the connection
+    /// config (FR-009).
+    #[test]
+    fn custom_config_threads_to_accepted_shaped_stream() {
+        let cfg = custom_config();
+        let accepted_slot = new_conn_terminal_slot();
+        let (_ctx, sctx, rctx) =
+            stream_ctx_channel_with_config(6u64.try_into().unwrap(), accepted_slot, cfg);
+        assert_eq!(rctx.recv_budget.max_bytes(), 8192);
+        assert_eq!(rctx.recv_budget.max_units(), 7);
+        assert_eq!(sctx.max_send_bytes, 4096);
+    }
+
+    /// Default-config construction yields caps equal to the historical constants
+    /// (no behavioral change).
+    #[test]
+    fn default_config_threads_the_historical_constants() {
+        let (_ctx, sctx, rctx) = stream_ctx_channel_with_config(
+            4u64.try_into().unwrap(),
+            new_conn_terminal_slot(),
+            H3Config::default(),
+        );
+        assert_eq!(rctx.recv_budget.max_bytes(), MAX_RECV_BUFFER);
+        assert_eq!(rctx.recv_budget.max_units(), 16384);
+        assert_eq!(sctx.max_send_bytes, MAX_ADAPTER_SEND);
+    }
+
+    /// Two connections with different configs produce streams with their own
+    /// respective caps — no cross-talk (Spec per-connection independence).
+    #[test]
+    fn two_configs_are_isolated() {
+        let a = H3Config::builder()
+            .with_max_send_bytes(1024)
+            .with_max_recv_bytes(2048)
+            .with_max_recv_units(3)
+            .build()
+            .unwrap();
+        let b = H3Config::builder()
+            .with_max_send_bytes(9999)
+            .with_max_recv_bytes(55555)
+            .with_max_recv_units(99)
+            .build()
+            .unwrap();
+        let (_ca, sa, ra) =
+            stream_ctx_channel_with_config(4u64.try_into().unwrap(), new_conn_terminal_slot(), a);
+        let (_cb, sb, rb) =
+            stream_ctx_channel_with_config(8u64.try_into().unwrap(), new_conn_terminal_slot(), b);
+
+        assert_eq!(ra.recv_budget.max_bytes(), 2048);
+        assert_eq!(ra.recv_budget.max_units(), 3);
+        assert_eq!(sa.max_send_bytes, 1024);
+
+        assert_eq!(rb.recv_budget.max_bytes(), 55555);
+        assert_eq!(rb.recv_budget.max_units(), 99);
+        assert_eq!(sb.max_send_bytes, 9999);
     }
 }
