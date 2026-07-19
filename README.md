@@ -5,6 +5,11 @@ Experimental.
 
 Currently can run h3 client and server.
 
+# Design docs
+See [`docs/`](./docs/README.md) for the design documentation describing the
+library's architecture, error model, receive/send paths, callback safety,
+registration lifecycle, and testing.
+
 # Build
 msquic lib is dynamically loaded and it is not required for building the rust code.
 

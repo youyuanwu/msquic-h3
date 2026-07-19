@@ -409,7 +409,7 @@ fn classify_transport(status: Status, error_code: u64) -> ConnectionTerminal {
 /// This is the deterministic fallback a *stream* callback uses when it observes
 /// `ShutdownComplete { connection_shutdown: true, .. }`. It follows MsQuic's
 /// `ConnectionShutdownByApp` / `ConnectionClosedRemotely` semantics (see
-/// `docs/error-propagation.md`, "Receive-side transitions"):
+/// `docs/receive-and-send.md`, "Receive-side transitions"):
 /// - `by_app && closed_remotely` is a peer HTTP/3 application close;
 /// - `by_app && !closed_remotely` is a local application close (no peer code);
 /// - anything else is a transport close, delegated to [`classify_transport`]
@@ -1983,7 +1983,8 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
                     // successful send attaches one `Box<SendBuffer>`). Do NOT emit a
                     // normal `Complete`: publish an internal send terminal and wake
                     // the send half so `poll_ready` / `poll_finish` surface the
-                    // internal error rather than a false readiness (docs:717-723).
+                    // internal error rather than a false readiness (see
+                    // "Send-side transitions" in `docs/error-model.md`).
                     publish_send(
                         &ctx.send_terminal,
                         SendTerminal::Internal("SendComplete missing client context"),
@@ -5433,7 +5434,7 @@ mod send_seam {
 
     #[test]
     fn send_complete_null_client_context_surfaces_internal_error() {
-        // F2 (docs:717-723): a null `SendComplete.client_context` breaks the
+        // F2 (see "Owned send buffer" in `docs/receive-and-send.md`): a null `SendComplete.client_context` breaks the
         // ownership invariant (every successful send attaches one
         // `Box<SendBuffer>`). The callback must NOT emit a normal `Complete`; it
         // publishes an internal send terminal and wakes the send half, so
@@ -6107,7 +6108,7 @@ mod send_seam {
     // `SendEvent::Complete` path — so the exactly-once ownership contract is
     // exercised, not mocked. Buffers carry a drop counter (`new_counted`) so the
     // reclamation COUNT is asserted concretely (this is the count that a real
-    // loopback send cannot expose; see `docs/error-propagation.md`,
+    // loopback send cannot expose; see `docs/testing.md`,
     // "Native-test mechanisms").
     //
     // These are self-checking and deterministic: if the outstanding allocation
@@ -7110,7 +7111,7 @@ mod downcall_clamp {
 /// inline `SendComplete` drain performed by native `QuicStreamClose` has **no**
 /// executable drop-triggered teardown test here — the public API cannot hold a
 /// real send observably outstanding across the close (buffered sends complete
-/// synchronously; see `docs/error-propagation.md`, "Native-test mechanisms").
+/// synchronously; see `docs/testing.md`, "Native-test mechanisms").
 /// That guarantee rests on native source review plus the binding's uniform
 /// `close_inner` contract, and is asserted only by
 /// [`conformance::close_time_inline_drain_is_source_review_only`] as a labelled,
@@ -7353,7 +7354,7 @@ mod conformance {
     // synchronously (often before `send_data` even returns), so a send cannot be
     // *held* observably outstanding through the public API — a loopback test could
     // claim "in flight" but never prove it (documented in "Native-test
-    // mechanisms", `docs/error-propagation.md`). The true outstanding-send
+    // mechanisms", `docs/testing.md`). The true outstanding-send
     // condition is instead proven deterministically at the send seam by
     // [`send_seam::peer_stop_sending_observed_with_send_outstanding`], where the
     // `CountingExec` retains the native-owned buffer so the send is provably still
@@ -7487,7 +7488,7 @@ mod conformance {
     /// with a drop-counted buffer. The public `send_data` path builds its
     /// `SendBuffer` internally with no injectable counter, so a real loopback send
     /// cannot be *counted* here — only its ordering and no-panic teardown are
-    /// observable (see `docs/error-propagation.md`, "Native-test mechanisms").
+    /// observable (see `docs/testing.md`, "Native-test mechanisms").
     #[test]
     fn accepted_send_completes_and_teardown_is_panic_free() {
         run_loopback(5_000, |mut server, mut client| async move {
@@ -7592,8 +7593,8 @@ mod conformance {
     /// executable test here. This test exists solely as an auditable label; it
     /// deliberately asserts nothing about runtime behavior (there is nothing
     /// test-observable to assert), only that this guarantee is documented as
-    /// source-review-only. See the module doc and `docs/error-propagation.md`
-    /// ("Native stream teardown on drop" / "Native-test mechanisms").
+    /// source-review-only. See "Native stream teardown on drop" in
+    /// `docs/callback-safety.md` and "Native-test mechanisms" in `docs/testing.md`.
     #[test]
     fn close_time_inline_drain_is_source_review_only() {
         // Intentionally empty: the inline-drain guarantee is established by
