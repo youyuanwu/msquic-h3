@@ -15,7 +15,9 @@ cargo fmt --all -- --check
 cargo test               --no-default-features --features native-find -- --nocapture
 
 # Vendored-source row: crate-built from the bundled msquic source via cmake.
-cargo test --no-default-features --features native-src -- --nocapture
+cargo check  --all-targets --no-default-features --features native-src
+cargo clippy --all-targets --no-default-features --features native-src -- -D warnings
+cargo test                --no-default-features --features native-src -- --nocapture
 
 # Default / tracing rows (no native tests):
 cargo test --all -- --nocapture
@@ -65,6 +67,17 @@ interop:
 
 ```sh
 cargo test --no-default-features --features native-find -- --ignored client_test_apache
+```
+
+## Per-stream receive-backpressure measurement
+
+The `stalled_receive_is_bounded` test offers at least eight times the 1 MiB
+per-stream budget through the receive callback. It reports the observed peak and
+verifies that it stays at or below `MAX_RECV_BUFFER + one indication`, with each
+pended indication completed using its full saved length:
+
+```sh
+cargo test --no-default-features --features native-find stalled_receive_is_bounded -- --nocapture
 ```
 
 If the linked `libmsquic` is not on the default loader path, point the loader at

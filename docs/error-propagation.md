@@ -860,12 +860,14 @@ normalization.
 A defense-in-depth backstop wraps the three adapter callback bodies this crate
 controls — connection, stream, and listener — in `guard_callback`, which runs
 each body inside `catch_unwind`. Containment does **not** rely on the callback
-return status (msquic often ignores it): on a caught panic the guard explicitly
-force-closes the affected handle through an injectable `ShutdownSeam` and wakes
-that handle's terminal waiters, so a stalled peer/task is released rather than
-left hanging. Recovery runs *after* `catch_unwind` returns (taking `&mut ctx` and
-the borrowed handle ref as parameters, so there is no overlapping borrow) and
-routes the force-close through the seam for a class-appropriate outcome:
+return status (msquic often ignores it): on a caught panic, stream and connection
+recovery explicitly force-close the affected handle through an injectable
+`ShutdownSeam`, while listener recovery follows the ownership-aware
+close-or-reject rule below. Every class wakes its terminal waiters so a stalled
+peer/task is released rather than left hanging. Recovery runs *after*
+`catch_unwind` returns (taking `&mut ctx` and the borrowed handle ref as
+parameters, so there is no overlapping borrow) and applies a class-appropriate
+outcome:
 
 - **stream** → `Stream::shutdown(ABORT)`;
 - **connection** → `Connection::shutdown(NONE)` (no connection `ABORT` flag
@@ -877,15 +879,15 @@ routes the force-close through the seam for a class-appropriate outcome:
 
 Recovery also sets a per-ctx `poisoned` flag; `guard_callback` then
 short-circuits every later event with an event-aware disposition instead of
-re-dispatching the body — teardown/terminal events return `Ok(())`, while
-ownership-bearing events (listener `NewConnection`, connection
-`PeerStreamStarted`) return `Err(H3_INTERNAL_ERROR)` so msquic rejects them. A
-real `Err` from the body (e.g. the Phase 2 receive `PENDING`) flows through
-unchanged and does **not** trigger recovery. The scope is deliberately narrow —
-only the adapter closure bodies this crate owns; panics unwinding out of the
-upstream msquic trampoline are out of scope. This backstop is defense-in-depth,
-not a substitute for the primary **no-panic-on-peer-paths** invariant, which
-still holds.
+re-dispatching the body — teardown-completion events (`ShutdownComplete` /
+`StopComplete`) return `Ok(())`; all other events return
+`Err(H3_INTERNAL_ERROR)`, notably rejecting ownership-bearing listener
+`NewConnection` and connection `PeerStreamStarted` events. A real `Err` from the
+body (e.g. the Phase 2 receive `PENDING`) flows through unchanged and does **not**
+trigger recovery. The scope is deliberately narrow — only the adapter closure
+bodies this crate owns; panics unwinding out of the upstream msquic trampoline
+are out of scope. This backstop is defense-in-depth, not a substitute for the
+primary **no-panic-on-peer-paths** invariant, which still holds.
 
 ### Native stream teardown on drop
 

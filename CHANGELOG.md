@@ -26,14 +26,16 @@ packaging hardening.
   bounded per stream: at/over `MAX_RECV_BUFFER` (1 MiB per stream) the callback
   returns `QUIC_STATUS_PENDING` and the stream is re-armed (with its full saved
   indication length) only after the reader drains below the bound, replacing the
-  prior eager-ack model. Connection memory is bounded by the per-stream bound ×
-  the negotiated max concurrent streams (SF-A).
+  prior eager-ack model. Connection memory is bounded by
+  (`MAX_RECV_BUFFER` + one in-flight indication) × the negotiated max concurrent
+  streams (SF-A).
 - **FFI callback panic backstop.** The connection, stream, and listener adapter
   callback bodies now run under a `catch_unwind` guard that force-closes the
-  affected handle (stream `ABORT` / connection `NONE`, `H3_INTERNAL_ERROR`
-  `0x0102`), wakes terminal waiters, and poisons the context so later events
-  short-circuit — containing a contained panic instead of unwinding across the
-  FFI boundary. This is defense-in-depth; peer-reachable paths remain panic-free
+  affected stream/connection handle (stream `ABORT` / connection `NONE`,
+  `H3_INTERNAL_ERROR` `0x0102`), performs ownership-aware close-or-reject recovery
+  for listeners, wakes terminal waiters, and poisons the context so later events
+  short-circuit — containing a panic instead of unwinding across the FFI
+  boundary. This is defense-in-depth; peer-reachable paths remain panic-free
   (SF-E).
 
 ### Changed
