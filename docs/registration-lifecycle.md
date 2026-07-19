@@ -5,7 +5,7 @@
 executor-agnostic (no tokio dependency). This document explains why the machinery
 exists and the teardown order it requires. It is implemented across
 [`registration.rs`](../msquic-h3/src/registration.rs),
-[`lib.rs`](../msquic-h3/src/lib.rs), and
+[`connection.rs`](../msquic-h3/src/connection.rs), and
 [`listener.rs`](../msquic-h3/src/listener.rs).
 
 ## The constraint

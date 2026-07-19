@@ -14,18 +14,21 @@ commands are summarized under [Commands](#commands) and detailed in
   proven exhaustively.
 - **Seam-injected unit tests.** The callback-driven paths are tested against
   in-process doubles injected through trait seams (below), without a real QUIC
-  connection. These live in `lib.rs` test modules (`callback_safety`,
-  `connection_terminal`, `receive_events`, `stream_open_identity`, `send_seam`,
-  `downcall_clamp`) and in `listener.rs` / `buffer.rs` / `registration.rs`.
+  connection. These are co-located with the code they exercise: `callback_safety`
+  (in `callback.rs`), `connection_terminal` (in `terminal.rs`), `receive_events`
+  (in `stream.rs`), `stream_open_identity` and `downcall_clamp` (in `opener.rs`),
+  the send-path `send_seam` suite (in its own `send_seam.rs`), plus tests in
+  `listener.rs` / `buffer.rs` / `registration.rs`.
 - **Loopback conformance.** The `conformance` module's `run_loopback` harness
-  drives a real client↔server HTTP/3 exchange over msquic on an ephemeral loopback
-  port, exercising accept, send, receive, and panic-free teardown end to end. The
-  server accept path also has a focused `basic_server_test` in `listener.rs`.
+  (in `conformance.rs`) drives a real client↔server HTTP/3 exchange over msquic on
+  an ephemeral loopback port, exercising accept, send, receive, and panic-free
+  teardown end to end. The server accept path also has a focused `basic_server_test`
+  in `listener.rs`.
 - **Native attestation.** Before the release conformance suite runs, a gate
   attests the actual libmsquic the process loaded (below).
 - **Feature-config negative.** `feature_config_negative` (an `#[ignore]`d test in
-  `lib.rs`) asserts that enabling both provenance features fails as expected
-  (below).
+  `feature_config_negative.rs`) asserts that enabling both provenance features fails
+  as expected (below).
 
 ## Test seams
 

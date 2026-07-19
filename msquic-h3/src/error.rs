@@ -294,7 +294,7 @@ pub(crate) fn convert_recv(
 //
 // A pure, native-free state machine for the send half. It mutates only
 // [`SendState`] and emits one [`SendCommand`] per input; the frontend executor
-// loops (in `lib.rs`) run the returned command against MsQuic through the
+// loops (in `stream.rs`) run the returned command against MsQuic through the
 // [`crate::SendExec`] seam and feed results straight back. Keeping the reducer
 // pure makes every transition exhaustively table-testable with no native handle.
 // See "Send-side transitions" / the reducer in `docs/error-model.md`.
@@ -1048,7 +1048,8 @@ mod tests {
 /// full send state machine is exercised with NO native handle. The reducer is
 /// pure (mutates only `state`, emits one [`SendCommand`]); the frontend executor
 /// loops and the shared-slot first-writer refinement (`publish_send`) live in
-/// `lib.rs` and are covered by the `send_seam` tests there.
+/// `stream.rs`/`terminal.rs` and are covered by the `send_seam` tests
+/// (`send_seam.rs`).
 #[cfg(test)]
 mod reducer_tests {
     use super::*;
@@ -1149,7 +1150,7 @@ mod reducer_tests {
     fn poll_ready_after_finish_is_nonsticky_internal() {
         // The reducer arm returns an Internal error without mutating state (the
         // frontend guard additionally avoids consuming the channel; see the
-        // liveness test in lib.rs `send_seam`).
+        // liveness test in `send_seam.rs`).
         let mut st = SendState {
             finish_started: true,
             ..SendState::new()
@@ -1712,7 +1713,7 @@ mod reducer_tests {
 
     #[test]
     fn provisional_abort_is_refinable_but_specific_is_not() {
-        // is_provisional gates the shared-slot refinement (publish_send in lib.rs).
+        // is_provisional gates the shared-slot refinement (publish_send in terminal.rs).
         // MF-2 (Item 2): ONLY the distinct synthesized `ProvisionalAbort` marker is
         // provisional/refinable; a real native `Failed` — even `QUIC_STATUS_ABORTED`
         // — is authoritative and NEVER refinable.

@@ -22,7 +22,8 @@ completion signals.
 centralized in the helpers in `../msquic-h3/src/error.rs` (`convert_conn`,
 `convert_send`, `convert_recv`, `convert_send_op`), which are the only places a
 `ConnectionTerminal` becomes a `ConnectionErrorIncoming`. The stream-open and
-accept frontends in `../msquic-h3/src/lib.rs` also construct a few
+accept frontends in `../msquic-h3/src/connection.rs` and `../msquic-h3/src/opener.rs`
+also construct a few
 `StreamErrorIncoming::ConnectionErrorIncoming` / `Unknown` wrappers directly, but
 they still route any connection cause through that same connection conversion:
 
@@ -143,7 +144,7 @@ A terminal reason is produced by a msquic callback but consumed by a later poll,
 so it is stored in a shared slot until the polling side reads it. Two slots exist
 per relevant scope:
 
-- The **connection slot** (`ConnTerminalState` in `../msquic-h3/src/lib.rs`) holds
+- The **connection slot** (`ConnTerminalState` in `../msquic-h3/src/terminal.rs`) holds
   the connection's terminal reason. `record` is a first-writer with
   provisional→specific refinement; `observe` freezes the slot so no later write
   can change what a reader already saw.
@@ -213,7 +214,7 @@ frontend commit-on-delivery points described earlier.
 
 ### Send-side transitions
 
-The frontend executor loops in `../msquic-h3/src/lib.rs` translate the reducer's
+The frontend executor loops in `../msquic-h3/src/stream.rs` translate the reducer's
 commands into native submissions and h3 results:
 
 - **`poll_ready`** resolves readiness, honoring the non-consuming finish guard so a
