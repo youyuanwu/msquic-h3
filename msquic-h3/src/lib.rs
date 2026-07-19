@@ -131,6 +131,14 @@ impl ConnTerminalState {
     fn has_internal(&self) -> bool {
         matches!(self.terminal, Some(ConnectionTerminal::Internal(_)))
     }
+
+    /// Whether a terminal reason has been recorded (regardless of the observed
+    /// freeze state). Read by [`commit_conn`] to freeze the slot *only* when a
+    /// cause is actually present, so an empty slot is never frozen on a
+    /// non-delivery (the commit-on-delivery invariant).
+    fn terminal_is_some(&self) -> bool {
+        self.terminal.is_some()
+    }
 }
 
 /// Record a connection terminal reason into the shared slot.
@@ -141,14 +149,35 @@ fn record_conn_terminal(slot: &ConnTerminalSlot, candidate: ConnectionTerminal) 
 /// Freeze the shared connection terminal slot and return its winner.
 ///
 /// This is the *stream-side* observation point of the SF-7 / T4 refinement rule
-/// (FR-013): a stream's `poll_data` / `poll_ready` / `poll_finish` freezes the
-/// shared connection winner exactly as the accept frontends' [`observe_terminal`]
-/// does, so a provisional cause refined *before* the stream observes surfaces the
-/// refined value, and a refinement attempted *after* observation is rejected.
-/// `None` only if no reason was ever recorded; the stream callback always records
-/// its fallback before signalling the halves, so this is a defensive fallback.
+/// (FR-013), retained for [`H3RecvStream`]'s `poll_data` `Connection` arm only,
+/// where the shared slot is **always populated** at the delivery point (the
+/// stream callback records the connection reason before signalling
+/// `ReceiveEvent::Connection`), so its unconditional `observe()` can never
+/// freeze an empty slot. Every *other* delivery site (send frontends,
+/// stream-open, accept) freezes through [`commit_conn`], which never freezes an
+/// empty slot.
 fn observe_conn_winner(slot: &ConnTerminalSlot) -> Option<ConnectionTerminal> {
     lock_recover(slot).observe()
+}
+
+/// Commit-on-delivery freeze primitive: freeze the shared connection slot **only**
+/// when a cause is actually present, and return it (frozen) for delivery to h3.
+///
+/// This is the single freeze primitive for every h3-facing poll that can surface
+/// a connection cause but is *not* guaranteed to hold one at the delivery point:
+/// the send frontends (via [`SendStreamReceiveCtx::commit_send_winner`]),
+/// [`StreamOpener::poll_open_inner`] and its helpers (SF-C), and the accept
+/// frontends (via [`observe_terminal`], Fix 1). Unlike [`observe_conn_winner`] it
+/// **never** freezes an empty slot: a non-delivery (an empty slot returning a
+/// synthetic internal/unknown error) leaves the slot refinable so a later real
+/// cause can still be recorded and delivered (FR-002 / FR-003).
+fn commit_conn(slot: &ConnTerminalSlot) -> Option<ConnectionTerminal> {
+    let mut g = lock_recover(slot);
+    if g.terminal_is_some() {
+        g.observe() // sets observed = true, returning the frozen cause
+    } else {
+        None
+    }
 }
 
 /// Shared, thread-safe slot recording the sticky *why* a send half terminated.
@@ -689,13 +718,18 @@ fn fail_fast_terminal(slot: &ConnTerminalSlot) -> Option<ConnectionErrorIncoming
     None
 }
 
-/// Freeze the terminal slot and convert the recorded reason for h3.
+/// Freeze the terminal slot and convert the recorded reason for h3, committing
+/// on delivery only.
 ///
-/// Called when the incoming-stream channel is drained/closed. A closure with no
-/// recorded reason maps to a defined internal error rather than a synthetic
-/// application close.
+/// Routes through [`commit_conn`], so this is a **committing** accept poll *only
+/// when it actually delivers a cause*: a recorded reason is frozen and converted
+/// exactly as before; an **empty** slot returns a defined internal error
+/// **without** freezing (`observed` stays unset), leaving the slot refinable so a
+/// later real cause can still be recorded and delivered (Fix 1 — FR-002 /
+/// FR-003). This makes the accept path uniform with the send/open/data delivery
+/// points, which all freeze only on genuine delivery.
 fn observe_terminal(slot: &ConnTerminalSlot) -> ConnectionErrorIncoming {
-    match lock_recover(slot).observe() {
+    match commit_conn(slot) {
         Some(t) => convert_conn(t),
         None => ConnectionErrorIncoming::InternalError(
             "connection closed without a terminal reason".to_string(),
@@ -877,8 +911,9 @@ impl StreamOpener {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<H3Stream, StreamErrorIncoming>> {
         use std::task::Poll;
-        // 1. Fail fast if the connection already published a terminal.
-        if let Some(reason) = peek_conn_terminal(conn.terminal()) {
+        // 1. Fail fast if the connection already published a terminal. A delivery
+        //    of the cause to h3 commits (freezes) it via `commit_conn` (SF-C).
+        if let Some(reason) = commit_conn(conn.terminal()) {
             *holder = None; // drop any in-flight OpeningStream
             return Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: convert_conn(reason),
@@ -889,8 +924,10 @@ impl StreamOpener {
             match open_exec.submit_open_start(conn, uni) {
                 Ok(opening) => *holder = Some(opening),
                 Err(status) => {
-                    // A shutdown may have raced the open; prefer the terminal.
-                    return Poll::Ready(Err(match peek_conn_terminal(conn.terminal()) {
+                    // A shutdown may have raced the open; prefer the terminal and
+                    // commit it on delivery (SF-C). A `None` (no cause) surfaces the
+                    // raw status as `Unknown` and does NOT freeze the slot.
+                    return Poll::Ready(Err(match commit_conn(conn.terminal()) {
                         Some(reason) => StreamErrorIncoming::ConnectionErrorIncoming {
                             connection_error: convert_conn(reason),
                         },
@@ -932,8 +969,10 @@ impl StreamOpener {
 ///
 /// A published connection terminal is the true cause; a cancellation with no
 /// recorded reason is a defined internal error, never a synthetic peer code.
+/// Delivering the cause to h3 commits (freezes) it via [`commit_conn`] (SF-C);
+/// the empty-slot internal-error fallback does not freeze.
 fn stream_open_conn_error(slot: &ConnTerminalSlot) -> ConnectionErrorIncoming {
-    match peek_conn_terminal(slot) {
+    match commit_conn(slot) {
         Some(reason) => convert_conn(reason),
         None => ConnectionErrorIncoming::InternalError(
             "stream start cancelled without a terminal reason".to_string(),
@@ -945,14 +984,16 @@ fn stream_open_conn_error(slot: &ConnTerminalSlot) -> ConnectionErrorIncoming {
 /// or a stream error.
 ///
 /// A failed start prefers a published connection terminal, else surfaces the raw
-/// `Status` as `Unknown`. A successful start validates the ID; an out-of-range
-/// ID is an adapter-internal fault (never `Unknown`).
+/// `Status` as `Unknown`. A delivered connection cause commits (freezes) via
+/// [`commit_conn`] (SF-C); the `Unknown` fallback does not freeze. A successful
+/// start validates the ID; an out-of-range ID is an adapter-internal fault
+/// (never `Unknown`).
 fn classify_start_outcome(
     raw: Result<u64, Status>,
     slot: &ConnTerminalSlot,
 ) -> Result<h3::quic::StreamId, StreamErrorIncoming> {
     match raw {
-        Err(status) => Err(match peek_conn_terminal(slot) {
+        Err(status) => Err(match commit_conn(slot) {
             Some(reason) => StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: convert_conn(reason),
             },
@@ -1269,10 +1310,12 @@ struct SendStreamReceiveCtx {
     /// here via the first-writer helper.
     send_terminal: SendTerminalSlot,
     /// Shared connection terminal slot (FR-013). When the send winner is a
-    /// `Connection` terminal, `poll_ready` / `poll_finish` resolve *and freeze*
-    /// this shared slot (via [`SendStreamReceiveCtx::observe_send_winner`]) so the
-    /// send half reports the refined connection cause consistently with the
-    /// receive half and the accept frontends.
+    /// `Connection` terminal, a delivering `poll_ready` / `poll_finish` / `send_data`
+    /// commits *and freezes* this shared slot (via
+    /// [`SendStreamReceiveCtx::commit_send_winner`]) so the send half reports the
+    /// refined connection cause consistently with the receive half and the accept
+    /// frontends; the reducer-input read ([`SendStreamReceiveCtx::resolve_terminal`])
+    /// is non-freezing.
     conn_terminal: ConnTerminalSlot,
     /// Single ordered send-event source (MF-1): data completion, terminal wake,
     /// and finish completion. The reducer observes it only as a [`SendPoll`].
@@ -1693,8 +1736,10 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         // purely from non-consuming state: a published terminal winner is surfaced;
         // otherwise the finish-after-poll_ready misuse (non-sticky).
         if self.sctx.reducer.finish_started {
-            return match self.sctx.observe_send_winner() {
-                Some(w) => Poll::Ready(Err(convert_send(w))),
+            return match self.sctx.resolve_terminal() {
+                // Delivery point: commit (freeze) a connection cause before it is
+                // returned to h3.
+                Some(w) => Poll::Ready(Err(convert_send(self.sctx.commit_send_winner(w)))),
                 None => Poll::Ready(Err(convert_send(SendTerminal::Internal(
                     "poll_ready after finish",
                 )))),
@@ -1703,13 +1748,16 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         // First input polls the channel; subsequent inputs are fed results.
         let mut input = SendInput::PollReady {
             poll: self.poll_send_channel(cx),
-            terminal: self.sctx.observe_send_winner(),
+            terminal: self.sctx.resolve_terminal(),
         };
         loop {
             match transition(&mut self.sctx.reducer, input) {
                 SendCommand::Pending => return Poll::Pending, // waker already registered
                 SendCommand::ReturnReady => return Poll::Ready(Ok(())),
-                SendCommand::ReturnError(t) => return Poll::Ready(Err(convert_send(t))),
+                SendCommand::ReturnError(t) => {
+                    // Delivery point: commit the connection slot on the way out.
+                    return Poll::Ready(Err(convert_send(self.sctx.commit_send_winner(t))));
+                }
                 SendCommand::RepollReady => {
                     // Re-poll the channel in THIS call so a synchronously-queued
                     // paired terminal / channel close (the closure point) is drained
@@ -1717,7 +1765,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
                     // (MF-2) is never returned to the caller.
                     input = SendInput::PollReady {
                         poll: self.poll_send_channel(cx),
-                        terminal: self.sctx.observe_send_winner(),
+                        terminal: self.sctx.resolve_terminal(),
                     };
                 }
                 SendCommand::PublishTerminal {
@@ -1755,13 +1803,16 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         let payload = classify_payload(wb.remaining());
         let mut input = SendInput::SendRequested {
             payload,
-            terminal: self.sctx.observe_send_winner(),
+            terminal: self.sctx.resolve_terminal(),
         };
         loop {
             match transition(&mut self.sctx.reducer, input) {
                 SendCommand::ReturnSent => return Ok(()),
                 SendCommand::ReturnImmediateError(e) => return Err(convert_send_op(e)),
-                SendCommand::ReturnError(t) => return Err(convert_send(t)),
+                SendCommand::ReturnError(t) => {
+                    // Delivery point: commit the connection slot on the way out.
+                    return Err(convert_send(self.sctx.commit_send_winner(t)));
+                }
                 SendCommand::SubmitSend => {
                     // The single production copy path: materialize the complete
                     // wire representation into owned `Bytes` while `B` is still on
@@ -1773,7 +1824,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
                     let res = self.exec.submit_send(buf);
                     input = SendInput::SendSubmitted {
                         result: res,
-                        terminal: self.sctx.observe_send_winner(),
+                        terminal: self.sctx.resolve_terminal(),
                     };
                 }
                 SendCommand::PublishTerminal {
@@ -1807,18 +1858,23 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         use std::task::Poll;
         let mut input = SendInput::PollFinish {
             poll: self.poll_send_channel(cx),
-            terminal: self.sctx.observe_send_winner(),
+            terminal: self.sctx.resolve_terminal(),
         };
         loop {
             match transition(&mut self.sctx.reducer, input) {
                 SendCommand::Pending => return Poll::Pending,
                 SendCommand::ReturnFinished => return Poll::Ready(Ok(())),
-                SendCommand::ReturnError(t) => return Poll::Ready(Err(convert_send(t))),
+                SendCommand::ReturnError(t) => {
+                    // Delivery point: commit the connection slot on the way out.
+                    // A graceful `ReturnFinished` never reaches here, so a
+                    // provisional cause prepared as input is never committed (MF-2).
+                    return Poll::Ready(Err(convert_send(self.sctx.commit_send_winner(t))));
+                }
                 SendCommand::SubmitGraceful => {
                     let res = self.exec.submit_graceful();
                     input = SendInput::GracefulSubmitted {
                         result: res,
-                        terminal: self.sctx.observe_send_winner(),
+                        terminal: self.sctx.resolve_terminal(),
                     };
                 }
                 SendCommand::RepollFinish => {
@@ -1827,7 +1883,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
                     // defer to a later poll (that recreates the lost-waker bug).
                     input = SendInput::PollFinish {
                         poll: self.poll_send_channel(cx),
-                        terminal: self.sctx.observe_send_winner(),
+                        terminal: self.sctx.resolve_terminal(),
                     };
                 }
                 SendCommand::PublishTerminal {
@@ -1859,14 +1915,14 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         // reset reservation. A callback-published peer/connection terminal wins
         // over this local reset (no second native op).
         //
-        // `reset()` returns NO observable terminal to the caller, so it must read
-        // the send winner WITHOUT freezing the shared connection slot
-        // (`peek_send_winner`, not `observe_send_winner`): freezing here would
-        // prematurely retain a provisional `LocalClose` over a later peer/transport
-        // refinement that a subsequent genuine caller observation should surface.
+        // `reset()` returns NO observable terminal to the caller, so it reads the
+        // send winner through the non-freezing `resolve_terminal` and NEVER commits
+        // the shared connection slot: freezing here would prematurely retain a
+        // provisional `LocalClose` over a later peer/transport refinement that a
+        // subsequent genuine caller observation should surface.
         let mut input = SendInput::Reset {
             code: clamp_application_code(reset_code),
-            terminal: self.sctx.peek_send_winner(),
+            terminal: self.sctx.resolve_terminal(),
         };
         loop {
             match transition(&mut self.sctx.reducer, input) {
@@ -1876,7 +1932,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
                     input = SendInput::ResetSubmitted {
                         code: c,
                         result: res,
-                        terminal: self.sctx.peek_send_winner(),
+                        terminal: self.sctx.resolve_terminal(),
                     };
                 }
                 SendCommand::PublishTerminal {
@@ -1918,44 +1974,60 @@ impl H3SendStream {
 }
 
 impl SendStreamReceiveCtx {
-    /// Load the current send winner, resolving a CONNECTION-caused terminal
-    /// against the SHARED connection slot at this send observation point (FR-013).
+    /// Load the current send winner **without freezing** the shared connection
+    /// slot, resolving connection precedence for every send-slot state so a
+    /// recorded connection cause is never masked (the MF-1 fix).
     ///
-    /// When the send winner is a [`SendTerminal::Connection`], the shared
-    /// connection slot is resolved *and frozen* (the same freeze-on-observation
-    /// the accept frontends and `poll_data` apply), so `poll_ready` / `poll_finish`
-    /// report the REFINED connection cause and a later refinement is rejected. The
-    /// carried reason is only a defensive fallback if the shared slot was never
-    /// recorded. A non-connection winner (a peer `Stopped`, a `LocalReset`, an
-    /// internal fault, or the send-scoped provisional marker) is returned
-    /// unchanged and never freezes the connection slot — keeping send-scope and
-    /// connection-scope separation intact.
-    fn observe_send_winner(&self) -> Option<SendTerminal> {
-        match load_winner(&self.send_terminal)? {
-            SendTerminal::Connection(fallback) => Some(SendTerminal::Connection(
-                observe_conn_winner(&self.conn_terminal).unwrap_or(fallback),
+    /// This is the single, non-freezing reducer-input read for all four send
+    /// frontends (`send_data`, `poll_ready`, `poll_finish`, `reset`). It defines
+    /// the connection-fallback precedence:
+    /// - `Some(Connection(fallback))` → the connection marker enriched from the
+    ///   shared slot (`peek_conn_terminal`), the carried reason only a defensive
+    ///   fallback;
+    /// - `None` → **MF-1 fallback**: a recorded connection cause is surfaced as
+    ///   `Connection(cause)`, so an immediate native error in the window before the
+    ///   stream callback publishes its marker still delivers the specific cause;
+    /// - `Some(ProvisionalAbort)` → **provisional-winner fallback**: a recorded
+    ///   connection cause takes precedence over the still-refinable provisional
+    ///   marker (returned as `Connection(cause)`); with no connection cause the
+    ///   provisional marker is kept (never surfaced, still refinable);
+    /// - `Some(other)` (authoritative `Stopped` / `LocalReset` / `Failed` /
+    ///   `Internal`) → returned unchanged.
+    ///
+    /// The rule: peek the shared connection slot as a fallback whenever the send
+    /// slot does not already hold an authoritative send-scope winner. Freezing is
+    /// deferred to [`Self::commit_send_winner`] at the delivery point.
+    fn resolve_terminal(&self) -> Option<SendTerminal> {
+        match load_winner(&self.send_terminal) {
+            Some(SendTerminal::Connection(fallback)) => Some(SendTerminal::Connection(
+                peek_conn_terminal(&self.conn_terminal).unwrap_or(fallback),
             )),
-            other => Some(other),
+            Some(SendTerminal::ProvisionalAbort) => {
+                match peek_conn_terminal(&self.conn_terminal) {
+                    Some(reason) => Some(SendTerminal::Connection(reason)),
+                    None => Some(SendTerminal::ProvisionalAbort),
+                }
+            }
+            None => peek_conn_terminal(&self.conn_terminal).map(SendTerminal::Connection),
+            other => other,
         }
     }
 
-    /// Non-freezing counterpart of [`Self::observe_send_winner`] for INTERNAL,
-    /// non-caller-observing winner reads (notably `reset()` bookkeeping).
+    /// Commit-on-delivery: freeze the shared connection slot at the exact point a
+    /// connection cause is returned to h3, and only when a cause is present.
     ///
-    /// Resolves a CONNECTION-caused send winner against the shared connection
-    /// slot with a non-freezing [`peek_conn_terminal`] read, so the shared slot
-    /// is NOT frozen. `reset()` returns no observable terminal to the caller, so
-    /// freezing there would be premature: a provisional connection `LocalClose`
-    /// followed by `reset()` and a later peer refinement would wrongly retain the
-    /// stale `LocalClose`. Freeze-on-observation stays exclusive to genuine caller
-    /// observation points (`poll_data` / `poll_ready` / `poll_finish`). Non-connection
-    /// winners are returned unchanged, identically to `observe_send_winner`.
-    fn peek_send_winner(&self) -> Option<SendTerminal> {
-        match load_winner(&self.send_terminal)? {
-            SendTerminal::Connection(fallback) => Some(SendTerminal::Connection(
-                peek_conn_terminal(&self.conn_terminal).unwrap_or(fallback),
-            )),
-            other => Some(other),
+    /// A [`SendTerminal::Connection`] winner is resolved+frozen through
+    /// [`commit_conn`] (the carried reason only a defensive fallback if the shared
+    /// slot was somehow never recorded); every other winner is returned unchanged
+    /// and never freezes the connection slot, keeping send-scope and
+    /// connection-scope separation intact. `reset()` returns no observable terminal
+    /// and therefore never calls this (never freezes) — the MF-2 fix.
+    fn commit_send_winner(&self, w: SendTerminal) -> SendTerminal {
+        match w {
+            SendTerminal::Connection(fallback) => SendTerminal::Connection(
+                commit_conn(&self.conn_terminal).unwrap_or(fallback),
+            ),
+            other => other,
         }
     }
 }
@@ -2710,6 +2782,47 @@ mod connection_terminal {
             ConnectionErrorIncoming::ApplicationClose { error_code: 11 }
         ));
     }
+
+    #[test]
+    fn accept_delivering_a_cause_commits_and_locks_identity() {
+        // Phase 1 / Fix 1 (SC-003, accept as a committing poll): `observe_terminal`
+        // (the accept frontends' delivery) is a COMMITTING poll when it delivers a
+        // cause. Record a cause, deliver it (freezing the slot), then a later
+        // different cause does not change what a subsequent observer sees.
+        let slot = new_conn_terminal_slot();
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+        // The delivery froze the slot: a later refinement is rejected.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+        assert!(matches!(
+            observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+    }
+
+    #[test]
+    fn accept_empty_slot_non_delivery_does_not_commit() {
+        // Phase 1 / Fix 1 core: an empty slot is a NON-delivery — `observe_terminal`
+        // returns `InternalError` WITHOUT freezing (the empty `None` branch leaves
+        // the slot refinable), so a later real cause can still be recorded and
+        // delivered by a genuine observer.
+        let slot = new_conn_terminal_slot();
+        match observe_terminal(&slot) {
+            ConnectionErrorIncoming::InternalError(msg) => {
+                assert!(msg.contains("without a terminal reason"), "msg: {msg}");
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+        // The slot was NOT frozen: a subsequently-recorded genuine cause is delivered.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+    }
 }
 
 /// Phase 4 (explicit receive events) unit tests: prove that a graceful FIN, a
@@ -3181,6 +3294,79 @@ mod stream_open_identity {
         assert!(matches!(
             stream_open_conn_error(&slot),
             ConnectionErrorIncoming::Timeout
+        ));
+    }
+
+    #[test]
+    fn classify_start_outcome_failed_start_commits_connection_cause() {
+        // Phase 1 / SF-C: a delivered connection cause on a failed start COMMITS
+        // (freezes) the shared slot, so a later refinement does not change what
+        // other observers see (SC-003, stream-open delivery point).
+        let slot = new_conn_terminal_slot();
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        let status = Status::new(StatusCode::QUIC_STATUS_ABORTED);
+        match classify_start_outcome(Err(status), &slot) {
+            Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code: 9 },
+            }) => {}
+            other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
+        }
+        // Frozen on delivery: a later refinement is rejected.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+    }
+
+    #[test]
+    fn classify_start_outcome_failed_start_empty_slot_does_not_commit() {
+        // Phase 1 / SF-C non-delivery: an empty slot surfaces `Unknown` WITHOUT
+        // freezing, so a later real cause can still be recorded and delivered.
+        let slot = new_conn_terminal_slot();
+        let status = Status::new(StatusCode::QUIC_STATUS_ABORTED);
+        match classify_start_outcome(Err(status), &slot) {
+            Err(StreamErrorIncoming::Unknown(_)) => {}
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+    }
+
+    #[test]
+    fn stream_open_conn_error_commits_connection_cause() {
+        // Phase 1 / SF-C: the cancellation-branch delivery (`stream_open_conn_error`)
+        // commits the shared slot when a cause is present; a later refinement is
+        // rejected.
+        let slot = new_conn_terminal_slot();
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            stream_open_conn_error(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+    }
+
+    #[test]
+    fn stream_open_conn_error_empty_slot_does_not_commit() {
+        // Phase 1 / SF-C non-delivery: an empty slot maps to `InternalError` WITHOUT
+        // freezing, leaving the slot refinable for a later genuine cause.
+        let slot = new_conn_terminal_slot();
+        match stream_open_conn_error(&slot) {
+            ConnectionErrorIncoming::InternalError(_) => {}
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
         ));
     }
 
@@ -4511,6 +4697,277 @@ mod send_seam {
             "a cancelled completion still reclaims the box exactly once"
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 1: terminal-cause commit-on-delivery (MF-1, MF-2, SC-003 send side).
+    // Dual-callback-ordering seam tests: the connection cause is injected DURING
+    // the executor downcall (via `InjectingExec`) so the immediate native error and
+    // the connection-cause recording interleave exactly as under concurrent
+    // callbacks, exercising the `resolve_terminal` (non-freezing) /
+    // `commit_send_winner` (freeze-on-delivery) split rather than a pre-populated
+    // short-circuit.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Send-side seam that records a connection terminal into the SHARED slot
+    /// *during* the executor downcall and then returns an immediate native error —
+    /// modelling the MF-1 window in which the connection callback records the cause
+    /// concurrently with an immediate send/finish/reset failure. `submit_send`
+    /// routes through the shared owned-buffer transaction so the buffer is reclaimed
+    /// exactly as the immediate-`Err` arm requires.
+    #[derive(Debug)]
+    struct InjectingExec {
+        slot: ConnTerminalSlot,
+        cause: ConnectionTerminal,
+        status: Status,
+    }
+
+    impl InjectingExec {
+        fn new(slot: ConnTerminalSlot, cause: ConnectionTerminal) -> Self {
+            Self {
+                slot,
+                cause,
+                status: Status::from(StatusCode::QUIC_STATUS_INVALID_PARAMETER),
+            }
+        }
+    }
+
+    impl SendExec for InjectingExec {
+        fn submit_send(&mut self, buf: SendBuffer) -> Result<(), Status> {
+            let status = self.status.clone();
+            let slot = self.slot.clone();
+            let cause = self.cause.clone();
+            crate::submit_owned_send(buf, move |_buffers, _cc| {
+                record_conn_terminal(&slot, cause);
+                Err(status)
+            })
+        }
+        fn submit_graceful(&mut self) -> Result<(), Status> {
+            record_conn_terminal(&self.slot, self.cause.clone());
+            Err(self.status.clone())
+        }
+        fn submit_reset(&mut self, _code: u64) -> Result<(), Status> {
+            record_conn_terminal(&self.slot, self.cause.clone());
+            Err(self.status.clone())
+        }
+    }
+
+    #[test]
+    fn mf1_send_data_immediate_error_delivers_injected_connection_cause() {
+        // SC-001 / MF-1: the shared slot is EMPTY until the executor downcall
+        // records the cause, so the send slot never becomes `Connection` before the
+        // immediate `Err` — exactly the concurrent-callback race. The send_data
+        // return itself must deliver the specific connection cause (code 9), not
+        // `Unknown(status)`.
+        let slot = new_conn_terminal_slot();
+        let exec = Box::new(InjectingExec::new(
+            slot.clone(),
+            ConnectionTerminal::PeerApplication(9),
+        ));
+        let (sctx, _ctx) = test_send_ctx_with_conn(slot.clone());
+        let mut s = H3SendStream::with_exec(exec, sctx);
+
+        match SendStream::<Bytes>::send_data(&mut s, Frame::Data(Bytes::from_static(b"data"))) {
+            Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            }) => assert_eq!(error_code, 9, "specific connection cause, not Unknown(status)"),
+            other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
+        }
+        // The send slot ends holding Connection(PeerApplication(9)), not Failed.
+        match crate::load_winner(&s.sctx.send_terminal) {
+            Some(crate::error::SendTerminal::Connection(ConnectionTerminal::PeerApplication(9))) => {
+            }
+            other => panic!("expected send slot Connection(PeerApplication(9)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mf1_poll_finish_immediate_error_delivers_injected_connection_cause() {
+        // SC-001 / MF-1 for the graceful-submit downcall: an idle poll_finish
+        // submits the graceful shutdown, which injects the cause and fails
+        // immediately; the poll return delivers the specific connection cause.
+        let slot = new_conn_terminal_slot();
+        let exec = Box::new(InjectingExec::new(
+            slot.clone(),
+            ConnectionTerminal::PeerApplication(9),
+        ));
+        let (sctx, _ctx) = test_send_ctx_with_conn(slot.clone());
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        match SendStream::<Bytes>::poll_finish(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            })) => assert_eq!(error_code, 9),
+            other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
+        }
+        match crate::load_winner(&s.sctx.send_terminal) {
+            Some(crate::error::SendTerminal::Connection(ConnectionTerminal::PeerApplication(9))) => {
+            }
+            other => panic!("expected send slot Connection(PeerApplication(9)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mf1_reset_injected_cause_surfaced_by_subsequent_poll() {
+        // SC-001 / MF-1 for reset: reset() returns NOTHING to h3, so the injected
+        // cause cannot be read from the reset() return; it is recorded during the
+        // reset downcall and published as the send winner WITHOUT freezing. A
+        // subsequent poll_finish surfaces the specific connection cause (code 9),
+        // confirming the injected connection cause won the resolve after reset.
+        let slot = new_conn_terminal_slot();
+        let exec = Box::new(InjectingExec::new(
+            slot.clone(),
+            ConnectionTerminal::PeerApplication(9),
+        ));
+        let (sctx, _ctx) = test_send_ctx_with_conn(slot.clone());
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        SendStream::<Bytes>::reset(&mut s, 5);
+        match SendStream::<Bytes>::poll_finish(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            })) => assert_eq!(error_code, 9, "reset did not freeze; the cause is delivered later"),
+            other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_prefers_recorded_connection_over_provisional_marker() {
+        // Provisional-winner regression (resolve precedence): drive the send slot
+        // to the provisional `ProvisionalAbort` marker (a cancelled SendComplete
+        // with no published cause), then record a connection cause on the shared
+        // slot. `resolve_terminal` must peek the connection slot as a fallback for
+        // the provisional winner, so a subsequent poll delivers the specific
+        // connection cause (code 9) instead of masking it with `ProvisionalAbort`.
+        let slot = new_conn_terminal_slot();
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx_with_conn(slot.clone());
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        submit_then_cancel(&h, &mut s, &mut ctx);
+        // Process the cancelled completion with NO cause: the provisional marker is
+        // retained (unobserved), poll is Pending.
+        assert!(matches!(
+            SendStream::<Bytes>::poll_ready(&mut s, &mut cx),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            matches!(
+                crate::load_winner(&s.sctx.send_terminal),
+                Some(crate::error::SendTerminal::ProvisionalAbort)
+            ),
+            "the send slot holds the retained provisional marker"
+        );
+
+        // A connection cause is recorded on the shared slot AFTER the provisional.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            })) => assert_eq!(error_code, 9, "connection cause takes precedence over provisional"),
+            other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mf2_graceful_finish_does_not_commit_connection_slot() {
+        // SC-002 / MF-2: a graceful finish that returns success must NOT commit the
+        // connection slot even though a provisional connection cause was prepared as
+        // reducer input; a subsequently-published specific cause is still delivered
+        // to a later observer.
+        let slot = new_conn_terminal_slot();
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx_with_conn(slot.clone());
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        // Start finish (submits graceful, sets finish_started), then queue the
+        // graceful FinishComplete on the ordered channel.
+        assert!(matches!(
+            SendStream::<Bytes>::poll_finish(&mut s, &mut cx),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(h.gracefuls.load(Relaxed), 1);
+        stream_callback(&mut ctx, StreamEvent::SendShutdownComplete { graceful: true }).unwrap();
+
+        // A provisional connection cause is prepared as reducer input.
+        record_conn_terminal(&slot, ConnectionTerminal::LocalClose);
+
+        // The graceful finish wins and returns success WITHOUT committing the slot.
+        assert!(matches!(
+            SendStream::<Bytes>::poll_finish(&mut s, &mut cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+
+        // The slot is still refinable (not observed): a later specific cause refines
+        // it and a genuine observer delivers code 9.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        match crate::observe_terminal(&slot) {
+            ConnectionErrorIncoming::ApplicationClose { error_code } => assert_eq!(
+                error_code, 9,
+                "graceful finish must not freeze a provisional cause"
+            ),
+            other => panic!("expected refined ApplicationClose{{9}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sc003_send_delivery_locks_identity_both_orderings() {
+        // SC-003 / consistency, both orderings: after a send delivery surfaces a
+        // connection cause it is committed (frozen), so a later refinement does not
+        // change what a subsequent accept observer (`observe_terminal`) sees.
+
+        // (a) deliver-before-record: an immediate send error delivers and freezes.
+        {
+            let slot = new_conn_terminal_slot();
+            let exec = Box::new(InjectingExec::new(
+                slot.clone(),
+                ConnectionTerminal::PeerApplication(9),
+            ));
+            let (sctx, _ctx) = test_send_ctx_with_conn(slot.clone());
+            let mut s = H3SendStream::with_exec(exec, sctx);
+
+            assert!(matches!(
+                SendStream::<Bytes>::send_data(&mut s, Frame::Data(Bytes::from_static(b"d"))),
+                Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error: ConnectionErrorIncoming::ApplicationClose { error_code: 9 },
+                })
+            ));
+            record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+            assert!(matches!(
+                crate::observe_terminal(&slot),
+                ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+            ));
+        }
+
+        // (b) record-before-deliver: the cause is recorded first; a poll_ready
+        //     delivery surfaces and locks it; a later refinement is still rejected.
+        {
+            let slot = new_conn_terminal_slot();
+            let h = CountingHandle::default();
+            let exec = Box::new(CountingExec::new(h, VecDeque::new()));
+            let (sctx, _ctx) = test_send_ctx_with_conn(slot.clone());
+            let mut s = H3SendStream::with_exec(exec, sctx);
+            let mut cx = noop_cx();
+
+            record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+            match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
+                std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+                })) => assert_eq!(error_code, 9),
+                other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
+            }
+            record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+            assert!(matches!(
+                crate::observe_terminal(&slot),
+                ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+            ));
+        }
+    }
 }
 
 /// Phase 7 downcall clamp tests: the recv-side `stop_sending` and the
@@ -4749,9 +5206,70 @@ mod downcall_clamp {
             drop(opener);
         }
     }
-}
 
-/// Phase 8 (Conformance) — end-to-end loopback tests over a real 127.0.0.1
+    #[test]
+    fn poll_open_inner_fail_fast_commits_connection_cause_both_orderings() {
+        // Phase 1 / SF-C (SC-003): the REAL `poll_open_inner` fail-fast delivery
+        // (step 1) commits (freezes) the connection slot on delivery, so a later
+        // refinement does not change what a subsequent observer sees — verified for
+        // both callback orderings against a real (unstarted) connection.
+        let reg = Registration::new(&RegistrationConfig::default()).unwrap();
+
+        // (a) record-before-deliver: the cause is recorded, then the open delivers
+        //     and freezes it; a later refinement is rejected.
+        {
+            let inner =
+                Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
+            let guard = RundownGuard::new(reg.state().clone());
+            let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
+            record_conn_terminal(conn.terminal(), ConnectionTerminal::PeerApplication(9));
+            let mut opener =
+                StreamOpener::with_open_exec(conn.clone(), Box::new(CancellingOpenExec { record: None }));
+            let mut cx = noop_cx();
+
+            match OpenStreams::<Bytes>::poll_open_bidi(&mut opener, &mut cx) {
+                std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+                })) => assert_eq!(error_code, 9, "fail-fast delivers the recorded cause"),
+                other => panic!("expected ApplicationClose{{9}} from fail-fast, got {other:?}"),
+            }
+            // The fail-fast delivery froze the slot: a later refinement is rejected.
+            record_conn_terminal(conn.terminal(), ConnectionTerminal::PeerApplication(7));
+            assert!(matches!(
+                crate::observe_terminal(conn.terminal()),
+                ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+            ));
+            drop(opener);
+        }
+
+        // (b) empty-then-record on a fresh open: with no cause the fail-fast does
+        //     not fire; a cause recorded before the next poll is then delivered and
+        //     frozen, and a later refinement is rejected.
+        {
+            let inner =
+                Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
+            let guard = RundownGuard::new(reg.state().clone());
+            let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
+            record_conn_terminal(conn.terminal(), ConnectionTerminal::PeerApplication(5));
+            let mut opener =
+                StreamOpener::with_open_exec(conn.clone(), Box::new(CancellingOpenExec { record: None }));
+            let mut cx = noop_cx();
+
+            match OpenStreams::<Bytes>::poll_open_send(&mut opener, &mut cx) {
+                std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+                })) => assert_eq!(error_code, 5),
+                other => panic!("expected ApplicationClose{{5}} from fail-fast, got {other:?}"),
+            }
+            record_conn_terminal(conn.terminal(), ConnectionTerminal::PeerApplication(6));
+            assert!(matches!(
+                crate::observe_terminal(conn.terminal()),
+                ConnectionErrorIncoming::ApplicationClose { error_code: 5 }
+            ));
+            drop(opener);
+        }
+    }
+}
 /// msquic connection, mirroring `listener::basic_server_test` but driving the
 /// raw `h3::quic` trait surface (open/accept bidi streams, `send_data`,
 /// `reset`, `stop_sending`, connection `close`) directly so each error-
