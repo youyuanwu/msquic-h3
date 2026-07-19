@@ -43,6 +43,12 @@ packaging hardening.
 - **Hermetic default test suite.** The external `client_test_apache` smoke test
   (which reaches the public internet) is now `#[ignore]`d so the default suite is
   self-contained; run it explicitly with `--ignored` (MF-3).
+- **Design docs reorganized.** The design documentation is now a forward-looking,
+  multi-file set under `docs/`: a `README.md` index plus `architecture.md`,
+  `error-model.md`, `receive-and-send.md`, `callback-safety.md`,
+  `registration-lifecycle.md`, and `testing.md` (with the former registration
+  wait-idle design folded into `registration-lifecycle.md`). Documentation-only;
+  no API or behavior change.
 
 ### Added
 
