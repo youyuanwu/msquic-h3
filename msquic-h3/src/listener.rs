@@ -620,7 +620,8 @@ mod new_conn_decision {
 /// the single close (never both — no double-close, no leak).
 #[cfg(test)]
 mod callback_safety {
-    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use msquic::{ListenerEvent, Status, StatusCode};
 
@@ -632,6 +633,19 @@ mod callback_safety {
 
     fn is_internal_err(r: &Result<(), Status>) -> bool {
         matches!(r, Err(s) if s.0 == Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR).0)
+    }
+
+    /// RAII stand-in for the owned `Connection` that `from_raw` hands over. Its
+    /// `Drop` increments a shared counter, mirroring how the real owned
+    /// `Connection`'s `Drop` performs the single native close. Constructing one
+    /// models taking ownership; the unwind dropping it models the close — so the
+    /// close becomes directly OBSERVABLE (counter), not merely inferred from the
+    /// recover return value.
+    struct OwnedStandIn(Arc<AtomicUsize>);
+    impl Drop for OwnedStandIn {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Assert both listener terminal waiters were signalled by `listener_recover`,
@@ -656,21 +670,33 @@ mod callback_safety {
     #[test]
     fn listener_callback_panic_before_from_raw_rejects() {
         let (tx, mut rx) = listener_ctx_channel();
+        // Close counter: no owned stand-in is ever created on this path.
+        let closes = Arc::new(AtomicUsize::new(0));
+        let closes_body = closes.clone();
         let mut ctx_ref: &ListenerCtxSender = &tx;
         let got = guard_callback(
             &mut ctx_ref,
             &NoShutdown,
             Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
-            |c| {
+            move |c| {
                 // Mirror listener_callback: reset at the start of the invocation.
                 c.ownership_taken.store(false, Ordering::Relaxed);
+                // Ownership never transferred, so no `OwnedStandIn` is constructed
+                // (from_raw never runs). Keep the counter clone alive but unused.
+                let _keep_alive = &closes_body;
                 // Panic BEFORE taking ownership (from_raw never runs).
                 panic!("boom before from_raw");
             },
             listener_recover,
         );
-        // Ownership never transferred → exactly one reject (Err); nothing to leak.
-        assert!(is_internal_err(&got));
+        // Ownership never transferred → recover returns Err: msquic performs the
+        // single reject (reject == 1), and ZERO owned-connection close happened.
+        assert!(is_internal_err(&got), "the single reject is the Err return");
+        assert_eq!(
+            closes.load(Ordering::Relaxed),
+            0,
+            "no owned stand-in exists, so zero close occurs (msquic rejects instead)"
+        );
         assert!(tx.poisoned.load(Ordering::Relaxed));
         // Both terminal waiters are woken so accept()/shutdown() cannot hang.
         assert_both_waiters_woken(&mut rx);
@@ -679,15 +705,21 @@ mod callback_safety {
     #[test]
     fn listener_callback_panic_after_from_raw_does_not_reject() {
         let (tx, mut rx) = listener_ctx_channel();
+        // Close counter: the owned stand-in's Drop increments it exactly once.
+        let closes = Arc::new(AtomicUsize::new(0));
+        let closes_body = closes.clone();
         let mut ctx_ref: &ListenerCtxSender = &tx;
         let got = guard_callback(
             &mut ctx_ref,
             &NoShutdown,
             Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
-            |c| {
+            move |c| {
                 c.ownership_taken.store(false, Ordering::Relaxed);
-                // Emulate from_raw taking ownership, then panic (the unwind's Drop
-                // closes the owned connection).
+                // Emulate from_raw taking ownership: construct the owned stand-in
+                // and mark ownership the instant it transfers. The named binding
+                // lives until the panic, so the unwind's Drop performs the single
+                // close (counter += 1).
+                let _owned = OwnedStandIn(closes_body.clone());
                 c.ownership_taken.store(true, Ordering::Relaxed);
                 panic!("boom after from_raw");
             },
@@ -695,7 +727,12 @@ mod callback_safety {
         );
         // Ownership already taken + dropped → msquic must NOT reject (Ok): the
         // owned-connection Drop performed the single close (no double-close).
-        assert!(got.is_ok());
+        assert!(got.is_ok(), "recover returns Ok so msquic does NOT reject");
+        assert_eq!(
+            closes.load(Ordering::Relaxed),
+            1,
+            "the owned stand-in's Drop performs exactly one close"
+        );
         assert!(tx.poisoned.load(Ordering::Relaxed));
         // Even on the owned-connection close path, both terminal waiters are woken
         // so accept()/shutdown() cannot hang.
