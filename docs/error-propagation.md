@@ -683,6 +683,36 @@ notifying the stream halves. Whichever callback publishes first establishes the
 connection-wide result. The transport `error_code` is retained for diagnostics
 but is never converted to an HTTP/3 application close code.
 
+**Commit-on-delivery freeze (as built).** The shared connection slot is frozen
+(made immutable) **only** when a cause is actually delivered to a caller through
+an h3-facing poll — `send_data`/`poll_ready`/`poll_finish` (send frontends),
+`poll_open`/stream-start (`StreamOpener`), or `accept` (the accept frontends).
+The single freeze primitive is `commit_conn`: it freezes and returns the winner
+**only when the slot holds a cause**, and leaves an **empty** slot untouched
+(unfrozen) so a later, more-specific cause can still be recorded and delivered.
+A non-delivery therefore never freezes: an empty slot yields a synthetic
+`InternalError`/`Unknown` without closing the door on a real cause (FR-002 /
+FR-003).
+
+The send frontends split the read from the freeze: `resolve_terminal` builds the
+reducer input by peeking the slot (connection-precedence, non-freezing), and
+`commit_send_winner` performs the actual `commit_conn` freeze at the delivery
+point. `reset()` uses `resolve_terminal` for its input **but omits any commit** —
+it returns no observable terminal to the caller, so it never freezes the
+connection slot and a later specific cause stays deliverable (MF-2). A graceful
+finish likewise never reaches a commit, so a successful finish never freezes
+(MF-2). The accept path now routes through the same guarded primitive:
+`observe_terminal` calls `commit_conn`, freezing only when it actually delivers a
+cause and leaving an empty slot refinable on the `InternalError` non-delivery
+(Fix 1) — making accept uniform with the send/open/data delivery sites.
+
+The one retained non-`commit_conn` delivery point is `poll_data`'s `Connection`
+arm, which still calls `observe_conn_winner` (an unconditional freeze). This is
+sound because of the **always-populated-at-delivery** invariant: the stream
+callback records the connection reason **before** signalling
+`ReceiveEvent::Connection`, so that arm is only ever reached with the slot
+already populated and can never freeze an empty slot.
+
 ### Receive-side transitions
 
 The receive callback enqueues data before a terminal event from the same MsQuic
@@ -703,6 +733,27 @@ for `Fin`, `StreamTerminated` for `Reset`, or
 `ConnectionErrorIncoming` for a connection terminal. Once stored, every later
 poll returns the same class of result without polling the channel. A closed
 channel without a terminal event becomes `Internal`.
+
+**Per-stream receive backpressure (SF-A, as built).** The `Receive` arm copies
+the **full** indication into a right-sized `BytesMut` (no data is ever dropped),
+then, under a single per-stream `RecvState` lock, commits the byte accounting and
+the pend decision and — as the last step of that same locked transition —
+publishes the bytes to the drain. Accounting is therefore committed *before* the
+bytes become drain-visible, so a concurrent drain can neither underflow the
+counter nor miss a pend (a failed hand-off rolls the whole transition back under
+the same lock). When a stream's buffered bytes reach `MAX_RECV_BUFFER` (1 MiB
+**per stream**) the callback returns `QUIC_STATUS_PENDING` **without** completing
+the indication, pausing MsQuic's receive callbacks for **that stream only**. The
+drain (`poll_data`) subtracts drained bytes under the same lock and, once a
+pended stream falls below the bound, completes the pended indication with its
+**full saved length** (never a partial/drained length) via `receive_complete` on
+the **same** stream, re-arming its receive callbacks. Peak buffered per stream
+stays `≤ MAX_RECV_BUFFER + one in-flight indication` independent of total bytes
+sent, so connection memory is bounded by that per-stream bound × the negotiated
+max concurrent streams. The native pend/complete handshake is safe without a
+native per-stream lock: msquic's `MsQuicStreamReceiveComplete` is lock-free and
+tolerates a concurrent/inline completion. This replaces the earlier eager-ack
+model that acked all bytes on every indication regardless of reader progress.
 
 ### Send-side transitions
 
@@ -803,6 +854,38 @@ applies `clamp_application_code(code.value())` before
 `(1<<62)-1` (accepted unchanged) and `1<<62` (clamped) for connection close,
 `reset`, and `stop_sending`. Incoming MsQuic codes are `u62` and require no
 normalization.
+
+### Callback panic containment (SF-E)
+
+A defense-in-depth backstop wraps the three adapter callback bodies this crate
+controls — connection, stream, and listener — in `guard_callback`, which runs
+each body inside `catch_unwind`. Containment does **not** rely on the callback
+return status (msquic often ignores it): on a caught panic the guard explicitly
+force-closes the affected handle through an injectable `ShutdownSeam` and wakes
+that handle's terminal waiters, so a stalled peer/task is released rather than
+left hanging. Recovery runs *after* `catch_unwind` returns (taking `&mut ctx` and
+the borrowed handle ref as parameters, so there is no overlapping borrow) and
+routes the force-close through the seam for a class-appropriate outcome:
+
+- **stream** → `Stream::shutdown(ABORT)`;
+- **connection** → `Connection::shutdown(NONE)` (no connection `ABORT` flag
+  exists) — both with `code = H3_INTERNAL_ERROR` (`0x0102`);
+- **listener** → ownership-aware recovery (close-or-reject, never both), driven
+  by an `ownership_taken` flag reset at the start of each invocation and set right
+  after `from_raw`, so the unwind `Drop` that closes an owned connection is never
+  double-closed or leaked.
+
+Recovery also sets a per-ctx `poisoned` flag; `guard_callback` then
+short-circuits every later event with an event-aware disposition instead of
+re-dispatching the body — teardown/terminal events return `Ok(())`, while
+ownership-bearing events (listener `NewConnection`, connection
+`PeerStreamStarted`) return `Err(H3_INTERNAL_ERROR)` so msquic rejects them. A
+real `Err` from the body (e.g. the Phase 2 receive `PENDING`) flows through
+unchanged and does **not** trigger recovery. The scope is deliberately narrow —
+only the adapter closure bodies this crate owns; panics unwinding out of the
+upstream msquic trampoline are out of scope. This backstop is defense-in-depth,
+not a substitute for the primary **no-panic-on-peer-paths** invariant, which
+still holds.
 
 ### Native stream teardown on drop
 
@@ -1943,17 +2026,20 @@ warnings` policy (fixing the transitive `Debug` derives and the unused `start_rx
 in `stream_ctx_channel`). Until then the compilability claim is dropped rather
 than asserted.
 
-### SF-5 — document the unbounded-receive trust/resource assumption
+### SF-5 — bounded per-stream receive backpressure (implemented)
 
-**Decision (down-scoped per critic: document, do not redesign).** Receive
-buffering remains governed by the existing unbounded-`mpsc` model plus available
-transport/stream flow control; this is a **pre-existing** property the current
-adapter already has (`msquic-h3/src/lib.rs` uses unbounded `mpsc`), not a
-regression introduced by this error-propagation change. **Documented assumption:**
-a peer can enqueue peer-controlled bytes ahead of a stalled h3 reader, bounded
-only by transport/stream flow control, so deployments that need a hard memory
-bound must treat bounded/deferred receive consumption (byte budget + re-enable
-behavior + overload tests) as **future work** outside this design's scope.
+**Decision (superseded — now implemented, not deferred).** The earlier
+down-scoped decision (document the trust assumption, defer the redesign) has been
+**superseded by the SF-A per-stream backpressure fix** (see "Per-stream receive
+backpressure" under Receive-side transitions). Receive buffering is now bounded
+**per stream** by `MAX_RECV_BUFFER` (1 MiB): a stream whose buffered bytes reach
+the bound returns `QUIC_STATUS_PENDING` and is re-armed via `receive_complete`
+only after the reader drains below the bound, so a peer can no longer enqueue
+arbitrary peer-controlled bytes ahead of a stalled h3 reader on a single stream.
+Connection memory is bounded by the per-stream bound × the negotiated max
+concurrent streams. Deployment note: the bound is per stream, so total resident
+receive memory still scales with the concurrent-stream count (itself governed by
+transport/stream flow control).
 
 ### SF-6 — define the post-`stop_sending` polling contract
 
@@ -2115,10 +2201,11 @@ bumped, so they are updated opportunistically, not en masse.
 - `msquic-h3/src/buffer.rs` — the owned `SendBuffer`, `classify_send_len`, the
   single production copy path (`copy_into_send_buffer`), and the exactly-once
   reclamation `Drop`.
-- `msquic-h3/src/lib.rs` — the FFI callbacks, the connection terminal slot with
-  refinement/freeze-on-observation, the explicit receive events, safe stream
-  open/identity, and the `SendExec`/`OpenExec` executor seam plus the conformance
-  suite.
+- `msquic-h3/src/lib.rs` — the FFI callbacks (with the SF-E `guard_callback`
+  panic-containment backstop), the connection terminal slot with refinement and
+  commit-on-delivery freeze, the explicit receive events with per-stream
+  `MAX_RECV_BUFFER` backpressure (SF-A), safe stream open/identity, and the
+  `SendExec`/`OpenExec` executor seam plus the conformance suite.
 - `msquic-h3/src/attest.rs` — the per-row native-version attestation gate.
 
 **Promoted invariants (design-load-bearing; realized in the code above).**
@@ -2142,7 +2229,11 @@ bumped, so they are updated opportunistically, not en masse.
    SF-9).** Each scope (connection/receive/send) records its terminal reason
    once. A *provisional* cause (a `ConnectionTerminal::LocalClose`, or the send
    `ProvisionalAbort` marker) may be refined to a more-specific peer/transport
-   cause **only while still unobserved**; observation freezes the value.
+   cause until a cause is actually **delivered** to a caller (commit-on-delivery,
+   via `commit_conn`); delivery freezes the value. A **non-delivery** — an empty
+   slot returning a synthetic internal/unknown error — never freezes, so a later
+   real cause can still be recorded and delivered. `reset()` and a graceful finish
+   deliver no observable terminal and therefore never freeze the connection slot.
 5. **Exactly-once `SendBuffer` reclamation (SF-3).** The owned buffer is destroyed
    exactly once — either by the callback-replayed `SendComplete` reclaiming the
    leaked box, or by the caller on an immediate `Stream::send` failure — proven by
@@ -2162,6 +2253,17 @@ bumped, so they are updated opportunistically, not en masse.
    binding's uniform `close_inner` contract, **not** by an executable
    drop-triggered teardown test (the public API cannot hold a real send stream at
    drop). It is documented as a labelled, untested guarantee.
+9. **Provenance selection and docs.rs (SF-L).** Native-library provenance is a
+   committed, mutually-exclusive feature: `native-find` (system-package
+   libmsquic) or `native-src` (self-contained via vendored source built by
+   cmake). docs.rs builds under `native-src` (pinned in
+   `[package.metadata.docs.rs]` with `--cfg docsrs`, and the `docsrs` cfg is
+   registered via `[lints.rust] check-cfg` so `-D warnings` stays clean). A
+   crate-level `compile_error!` (gated on `not(docsrs)`) rejects the
+   **neither-enabled** misconfiguration with an actionable message; the
+   **both-enabled** case is bounded by the upstream `msquic` build-script panic
+   (`feature src and find are mutually exclusive`), not intercepted at the crate
+   level. `--all-features` is therefore never a valid success gate.
 
 ## Implementation order
 

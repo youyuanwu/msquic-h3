@@ -25,6 +25,48 @@ cargo test --all --features tracing -- --nocapture
 cargo bench --no-default-features --features native-find,bench-internals --bench send_copy
 ```
 
+## Documentation build (docs.rs-equivalent)
+
+docs.rs builds this crate under the vendored `native-src` provenance (self-
+contained, no system package). Reproduce it locally with the same `--cfg docsrs`
+the crate metadata pins:
+
+```sh
+RUSTDOCFLAGS="--cfg docsrs" cargo doc --no-deps --no-default-features --features native-src
+```
+
+## Feature/provenance misconfiguration diagnostics
+
+Provenance is a committed, mutually-exclusive feature (`native-find` /
+`native-src`); exactly one must be selected.
+
+- **Neither enabled** → a crate-level `compile_error!` (gated on `not(docsrs)`)
+  fails the build with an actionable message pointing at the two features. This
+  is a *crate* diagnostic.
+- **Both enabled** → the upstream `msquic` build script panics with
+  `feature src and find are mutually exclusive`. This is an *upstream build-script*
+  failure, not a crate message, and is exactly why `--all-features` is not a valid
+  gate.
+
+The SC-008 negative check is an **expected-FAILURE** assertion of that
+both-enabled message (it is `#[ignore]`d so the default suite stays green); it is
+explicitly **not** an `--all-features` success gate:
+
+```sh
+# Expected to FAIL with the upstream mutual-exclusion message:
+cargo build --no-default-features --features native-find,native-src
+```
+
+## Opt-in external smoke test
+
+The `client_test_apache` test reaches the public internet and is `#[ignore]`d so
+the default suite is hermetic. Run it explicitly when validating real-world
+interop:
+
+```sh
+cargo test --no-default-features --features native-find -- --ignored client_test_apache
+```
+
 If the linked `libmsquic` is not on the default loader path, point the loader at
 it (e.g. a locally built copy under `build/`):
 
