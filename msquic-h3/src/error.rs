@@ -159,7 +159,7 @@ impl ConnectionTerminal {
     /// a subsequently-published, more-specific peer/transport cause until the
     /// terminal has been externally observed. Specific peer/transport causes and
     /// internal failures are authoritative and never refine to a provisional
-    /// value. See the SF-7 / T4 refinement decision in `docs/error-propagation.md`.
+    /// value. See "Terminal-cause refinement" in `docs/error-model.md`.
     pub(crate) fn is_provisional(&self) -> bool {
         matches!(self, ConnectionTerminal::LocalClose)
     }
@@ -213,7 +213,7 @@ impl SendTerminal {
     /// Only [`SendTerminal::ProvisionalAbort`] is provisional. A specific peer
     /// `Stopped`, a `Connection` reason, a `LocalReset`, an internal failure, or
     /// **any** `Failed` status (including a real native `QUIC_STATUS_ABORTED`) is
-    /// authoritative and never refined. See MF-2 in `docs/error-propagation.md`.
+    /// authoritative and never refined. See "Terminal-cause refinement" in `docs/error-model.md`.
     pub(crate) fn is_provisional(&self) -> bool {
         matches!(self, SendTerminal::ProvisionalAbort)
     }
@@ -297,7 +297,7 @@ pub(crate) fn convert_recv(
 // loops (in `lib.rs`) run the returned command against MsQuic through the
 // [`crate::SendExec`] seam and feed results straight back. Keeping the reducer
 // pure makes every transition exhaustively table-testable with no native handle.
-// See the "Send transitions" / reducer sections of `docs/error-propagation.md`.
+// See "Send-side transitions" / the reducer in `docs/error-model.md`.
 // ---------------------------------------------------------------------------
 
 /// One order-sensitive send event. All send events (data completion, terminal
