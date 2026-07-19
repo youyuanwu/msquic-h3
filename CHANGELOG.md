@@ -46,12 +46,12 @@ packaging hardening.
 
 ### Added
 
-- **docs.rs metadata and provenance guard.** `[package.metadata.docs.rs]` pins
-  the `native-src` provenance and `--cfg docsrs` for a self-contained doc build;
-  a crate-level `compile_error!` now rejects the neither-provenance
-  misconfiguration with an actionable message (the both-enabled case remains an
-  upstream build-script panic). `--all-features` is not a valid build/test gate
-  (SF-L).
+- **docs.rs metadata + provenance policy.** `[package.metadata.docs.rs]` pins
+  the `native-src` provenance and `--cfg docsrs` for a self-contained doc build.
+  Selecting neither provenance is a supported type-check-only configuration (no
+  crate-level guard; a real build/link requires one provenance); the both-enabled
+  case remains an upstream build-script panic. `--all-features` is not a valid
+  build/test gate (SF-L).
 
 ## [0.0.7] - 2026-07-18
 

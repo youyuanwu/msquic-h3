@@ -1,22 +1,12 @@
-// Native-provenance guard (SF-L / FR-010). NEITHER `native-find` nor `native-src`
-// selected is the ONLY provenance misconfiguration reachable at this crate's
-// compile time, and it otherwise silently mis-defaults `attest.rs`. It fires
-// UNCONDITIONALLY whenever neither feature is enabled — including under
-// `--cfg docsrs` — so no build configuration can slip past the guard. docs.rs is
-// unaffected in practice because `[package.metadata.docs.rs]` in Cargo.toml
-// selects `native-src`, so the neither-feature condition is never met there. The
-// BOTH-enabled case is intercepted FIRST by the upstream `msquic` build script
-// (`panic!("feature src and find are mutually exclusive")`), which runs before
-// this crate compiles; a crate-level `compile_error!` cannot preempt an upstream
-// build script, so it is deliberately NOT guarded here (see README/CHANGELOG and
-// the SC-008 negative check).
-#[cfg(all(not(feature = "native-find"), not(feature = "native-src")))]
-compile_error!(
-    "no native provenance selected: enable exactly one of the mutually-exclusive \
-     features `native-find` or `native-src` (e.g. \
-     `--no-default-features --features native-find` for a system-package libmsquic, \
-     or `--features native-src` to build from vendored source); see README/CHANGELOG"
-);
+// Native-provenance features `native-find` / `native-src` are mutually exclusive
+// (see Cargo.toml). Selecting BOTH is rejected by the upstream `msquic` build
+// script (`feature src and find are mutually exclusive`), which runs before this
+// crate compiles. Selecting NEITHER is a SUPPORTED type-check-only configuration:
+// the crate compiles without linking a native library (this is exactly what the
+// default-features CI `cargo check`/`clippy` job exercises), so no crate-level
+// guard is imposed. A real build/link that resolves msquic symbols requires
+// exactly one provenance. docs.rs builds under `native-src` via
+// `[package.metadata.docs.rs]` in Cargo.toml.
 
 use std::{
     cell::Cell,

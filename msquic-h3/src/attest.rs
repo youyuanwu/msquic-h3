@@ -207,12 +207,11 @@ mod tests {
         } else if cfg!(feature = "native-src") {
             [2, 5, 1]
         } else {
-            // No provenance selected: unreachable in a normal build — the
-            // crate-level `compile_error!` in `lib.rs` now rejects the
-            // neither-enabled case (SF-L / FR-010), and the link step would fail
-            // regardless. Retained as a test-only defensive default (this branch
-            // is only reachable under `docsrs`, which disables that guard for the
-            // link-free doc build). Keep the source pin.
+            // No provenance selected: this is a supported type-check-only
+            // configuration (the crate compiles without linking a native
+            // library; a real build/link would fail at link time). This
+            // `expected_version()` is test-only, so the branch is effectively
+            // unreached in practice. Keep the source pin as a defensive default.
             [2, 5, 1]
         }
     }

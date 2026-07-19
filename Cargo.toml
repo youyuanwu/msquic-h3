@@ -50,10 +50,11 @@ tracing = ["dep:tracing"]
 # (system-package libmsquic; the canonical local invocation on this 2.5.8 host)
 #   cargo test --no-default-features --features native-src
 # (crate-built from the vendored msquic source via cmake).
-# Selecting NEITHER is caught at compile time by the crate-level `compile_error!`
-# in `src/lib.rs` (SF-L / FR-010); the BOTH-enabled case is bounded by the upstream
-# build-script panic above (not intercepted at crate level). docs.rs builds under
-# `native-src` via `[package.metadata.docs.rs]` above.
+# Selecting NEITHER is a supported type-check-only configuration (the crate
+# compiles without linking a native library — the default-features CI check); a
+# real build/link requires exactly one provenance. The BOTH-enabled case is
+# bounded by the upstream build-script panic above (not intercepted at crate
+# level). docs.rs builds under `native-src` via `[package.metadata.docs.rs]` above.
 native-find = ["msquic/find"] # system-package libmsquic (find::find symlinks it)
 native-src = ["msquic/src"]   # crate-built from vendored source via cmake
 

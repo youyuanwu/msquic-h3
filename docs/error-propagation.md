@@ -2260,11 +2260,11 @@ bumped, so they are updated opportunistically, not en masse.
    libmsquic) or `native-src` (self-contained via vendored source built by
    cmake). docs.rs builds under `native-src` (pinned in
    `[package.metadata.docs.rs]` with `--cfg docsrs`, and the `docsrs` cfg is
-   registered via `[lints.rust] check-cfg` so `-D warnings` stays clean). A
-   crate-level `compile_error!` rejects the **neither-enabled** misconfiguration
-   with an actionable message whenever neither provenance is selected
-   (unconditionally — no `docsrs` exemption; docs.rs is unaffected because its
-   metadata selects `native-src`, so the guard never fires there); the
+   registered via `[lints.rust] check-cfg` so `-D warnings` stays clean).
+   Selecting **neither** provenance is a supported type-check-only configuration
+   (the crate compiles without linking a native library — exercised by the
+   default-features CI `cargo check`/`clippy` job; a real build/link requires a
+   provenance), so it is deliberately NOT guarded by a `compile_error!`. The
    **both-enabled** case is bounded by the upstream `msquic` build-script panic
    (`feature src and find are mutually exclusive`), not intercepted at the crate
    level. `--all-features` is therefore never a valid success gate.
