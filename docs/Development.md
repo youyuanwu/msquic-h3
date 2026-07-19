@@ -42,9 +42,10 @@ RUSTDOCFLAGS="--cfg docsrs" cargo doc --no-deps --no-default-features --features
 Provenance is a committed, mutually-exclusive feature (`native-find` /
 `native-src`); exactly one must be selected.
 
-- **Neither enabled** → a crate-level `compile_error!` (gated on `not(docsrs)`)
-  fails the build with an actionable message pointing at the two features. This
-  is a *crate* diagnostic.
+- **Neither enabled** → a crate-level `compile_error!` fails the build with an
+  actionable message pointing at the two features, regardless of the `docsrs`
+  cfg. This is a *crate* diagnostic. (docs.rs itself is unaffected because its
+  metadata selects `native-src`, so the guard never fires there.)
 - **Both enabled** → the upstream `msquic` build script panics with
   `feature src and find are mutually exclusive`. This is an *upstream build-script*
   failure, not a crate message, and is exactly why `--all-features` is not a valid

@@ -1,14 +1,16 @@
 // Native-provenance guard (SF-L / FR-010). NEITHER `native-find` nor `native-src`
 // selected is the ONLY provenance misconfiguration reachable at this crate's
-// compile time, and it otherwise silently mis-defaults `attest.rs`. Gated on
-// `not(docsrs)` so the docs.rs build (which sets `native-src`, see
-// `[package.metadata.docs.rs]` in Cargo.toml) is unaffected. The BOTH-enabled
-// case is intercepted FIRST by the upstream `msquic` build script
+// compile time, and it otherwise silently mis-defaults `attest.rs`. It fires
+// UNCONDITIONALLY whenever neither feature is enabled — including under
+// `--cfg docsrs` — so no build configuration can slip past the guard. docs.rs is
+// unaffected in practice because `[package.metadata.docs.rs]` in Cargo.toml
+// selects `native-src`, so the neither-feature condition is never met there. The
+// BOTH-enabled case is intercepted FIRST by the upstream `msquic` build script
 // (`panic!("feature src and find are mutually exclusive")`), which runs before
 // this crate compiles; a crate-level `compile_error!` cannot preempt an upstream
 // build script, so it is deliberately NOT guarded here (see README/CHANGELOG and
 // the SC-008 negative check).
-#[cfg(all(not(feature = "native-find"), not(feature = "native-src"), not(docsrs)))]
+#[cfg(all(not(feature = "native-find"), not(feature = "native-src")))]
 compile_error!(
     "no native provenance selected: enable exactly one of the mutually-exclusive \
      features `native-find` or `native-src` (e.g. \
@@ -17,6 +19,7 @@ compile_error!(
 );
 
 use std::{
+    cell::Cell,
     ffi::c_void,
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
@@ -668,7 +671,11 @@ impl AcceptedIdFailpoint {
     feature = "tracing",
     tracing::instrument(skip(ctx), level = "trace", ret, err)
 )]
-fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> Result<(), Status> {
+fn connection_callback(
+    ctx: &mut ConnCtxSender,
+    ev: msquic::ConnectionEvent,
+    stream_owned: &Cell<bool>,
+) -> Result<(), Status> {
     match ev {
         ConnectionEvent::Connected { .. } => {
             // A duplicate `Connected` (slot already taken) or a dropped receiver
@@ -721,8 +728,14 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
             // and msquic closes the rejected stream itself (single close). On
             // success we take native ownership only NOW.
             let id = accept_stream_id(ctx, query)?;
-            // Success: only NOW take native ownership and attach.
+            // Success: only NOW take native ownership and attach. Mark the
+            // per-invocation ownership token the instant ownership transfers, so a
+            // subsequent panic (e.g. inside `H3Stream::attach`) tells
+            // `connection_recover` the owned stream's Drop already closed it — and
+            // recover must NOT return an Err that would make msquic re-close it
+            // (the `stream_set.c` reject-and-close double-close hazard, F-C).
             let owned = unsafe { msquic::Stream::from_raw(stream.as_raw()) };
+            stream_owned.set(true);
             let h3 = crate::H3Stream::attach(owned, id, ctx.terminal.clone());
             let target = if flags.contains(StreamOpenFlags::UNIDIRECTIONAL) {
                 ctx.uni.as_ref()
@@ -786,9 +799,23 @@ fn conn_poison_disp(ev: &ConnectionEvent) -> Result<(), Status> {
 /// caught panic, once the body's `&mut ctx` borrow has ended. Force-closes the
 /// connection (no `ABORT` flag exists; the abort is conveyed by `code`), records
 /// an internal connection terminal, wakes every connection waiter (connect
-/// one-shot, both accept frontends, the shutdown waiter) so nothing hangs, marks
-/// the ctx poisoned, and returns `INTERNAL_ERROR`.
-fn connection_recover(ctx: &mut ConnCtxSender, seam: &dyn ShutdownSeam) -> Result<(), Status> {
+/// one-shot, both accept frontends, the shutdown waiter) so nothing hangs, and
+/// marks the ctx poisoned.
+///
+/// RETURN VALUE is ownership-aware for the `PeerStreamStarted` double-close
+/// hazard (F-C). If a peer stream's native ownership was already taken this
+/// invocation (`stream_owned == true`, i.e. the panic happened AFTER
+/// `Stream::from_raw`, e.g. inside `H3Stream::attach`), the owned stream's Drop
+/// already performed the single `StreamClose`; returning `Ok(())` prevents msquic
+/// from also closing that stream (`core/stream_set.c` reject → `core/stream.c`
+/// double-close assert). Otherwise — a pre-ownership `PeerStreamStarted` failure
+/// or ANY non-ownership-bearing connection event (`stream_owned` stays false) —
+/// return `Err(INTERNAL_ERROR)` so msquic performs the sole rejection/close.
+fn connection_recover(
+    ctx: &mut ConnCtxSender,
+    seam: &dyn ShutdownSeam,
+    stream_owned: &Cell<bool>,
+) -> Result<(), Status> {
     report_contained_panic(CbClass::Connection);
     seam.force_shutdown(
         ForceShutdown::Connection(ConnectionShutdownFlags::NONE),
@@ -808,7 +835,13 @@ fn connection_recover(ctx: &mut ConnCtxSender, seam: &dyn ShutdownSeam) -> Resul
         let _ = shutdown.send(());
     }
     ctx.poisoned = true;
-    Err(internal_error_status())
+    if stream_owned.get() {
+        // Owned peer stream already closed by its Drop; do NOT let msquic
+        // re-close it. The connection is still force-closed above.
+        Ok(())
+    } else {
+        Err(internal_error_status())
+    }
 }
 
 impl Connection {
@@ -830,12 +863,17 @@ impl Connection {
             let (mut ctx, mut crx) = conn_ctx_channel();
             let handler = move |conn_ref: ConnectionRef, ev: ConnectionEvent| {
                 let disp = conn_poison_disp(&ev);
+                // Per-invocation peer-stream ownership token (F-C): a fresh `Cell`
+                // per callback so parallel connection callbacks never share it.
+                // Set true right after `PeerStreamStarted`'s `from_raw`; read by
+                // `connection_recover` to stay double-close-safe.
+                let stream_owned = Cell::new(false);
                 guard_callback(
                     &mut ctx,
                     &conn_ref,
                     disp,
-                    |c| connection_callback(c, ev),
-                    connection_recover,
+                    |c| connection_callback(c, ev, &stream_owned),
+                    |c, seam| connection_recover(c, seam, &stream_owned),
                 )
             };
             // Build the ordered handle immediately after `open`, before `start`
@@ -871,12 +909,14 @@ impl Connection {
         let (mut ctx, crx) = conn_ctx_channel();
         let handler = move |conn_ref: ConnectionRef, ev: ConnectionEvent| {
             let disp = conn_poison_disp(&ev);
+            // Per-invocation peer-stream ownership token (F-C); see `connect`.
+            let stream_owned = Cell::new(false);
             guard_callback(
                 &mut ctx,
                 &conn_ref,
                 disp,
-                |c| connection_callback(c, ev),
-                connection_recover,
+                |c| connection_callback(c, ev, &stream_owned),
+                |c, seam| connection_recover(c, seam, &stream_owned),
             )
         };
         inner.set_callback_handler(handler);
@@ -1640,6 +1680,13 @@ enum ReceiveEvent {
     Reset(u64),
     /// The whole connection terminated with this reason.
     Connection(ConnectionTerminal),
+    /// A STREAM-LOCAL internal adapter failure (e.g. a contained callback panic
+    /// on this stream, SF-E). It maps DIRECTLY to a stream-scoped
+    /// [`ReceiveTerminal::Internal`] and must NOT touch the shared connection
+    /// terminal slot: unlike [`ReceiveEvent::Connection`], it never freezes the
+    /// connection winner, so a later genuine peer/transport connection cause is
+    /// still observed by the accept/open frontends (F-A / MF-1 / SF-C).
+    Internal(&'static str),
 }
 
 struct StreamSendCtx {
@@ -2133,12 +2180,13 @@ fn stream_recover(ctx: &mut StreamSendCtx, seam: &dyn ShutdownSeam) -> Result<()
         let _ = send.unbounded_send(SendEvent::TerminalWake);
     }
     ctx.send.take();
-    // Wake the receive half with an internal terminal (first-writer-wins; a real
-    // terminal already published wins, in which case this is a no-op).
-    publish_recv_terminal(
-        ctx,
-        ReceiveEvent::Connection(ConnectionTerminal::Internal("stream callback panicked")),
-    );
+    // Wake the receive half with a STREAM-LOCAL internal terminal
+    // (first-writer-wins; a real terminal already published wins). This uses the
+    // stream-scoped `ReceiveEvent::Internal` — NOT a `Connection` event — so it
+    // never freezes the shared connection slot on the EMPTY value; a later
+    // genuine peer/transport connection cause is still delivered to the frontends
+    // (F-A / MF-1 / SF-C).
+    publish_recv_terminal(ctx, ReceiveEvent::Internal("stream callback panicked"));
     // Resolve a still-pending `StartComplete` opener so `poll_open_inner` fails
     // fast instead of hanging.
     if let Some(start) = ctx.start.take() {
@@ -2620,6 +2668,15 @@ impl RecvStreamReceiveCtx {
                 let winner = observe_conn_winner(&self.conn_terminal).unwrap_or(fallback);
                 self.store_and_convert(ReceiveTerminal::Connection(winner))
             }
+            // A STREAM-LOCAL internal fault (e.g. a contained callback panic on
+            // this stream). It maps DIRECTLY to a stream-scoped
+            // `ReceiveTerminal::Internal` and deliberately does NOT call
+            // `observe_conn_winner`, so it never freezes the shared connection
+            // slot on the EMPTY value — a later genuine connection cause is still
+            // delivered to the accept/open frontends (F-A / MF-1 / SF-C).
+            Some(ReceiveEvent::Internal(msg)) => {
+                self.store_and_convert(ReceiveTerminal::Internal(msg))
+            }
             // A closed channel without an explicit terminal event is an internal
             // fault, not a clean end-of-stream.
             None => self.store_and_convert(ReceiveTerminal::Internal(
@@ -2998,7 +3055,7 @@ mod callback_safety {
         };
         // The fallible send returns Err internally; the callback must not panic
         // and must return Ok across the FFI boundary.
-        assert!(connection_callback(&mut ctx, ev).is_ok());
+        assert!(connection_callback(&mut ctx, ev, &std::cell::Cell::new(false)).is_ok());
         // The one-shot slot was consumed exactly once.
         assert!(ctx.connected.is_none());
     }
@@ -3042,9 +3099,10 @@ mod callback_safety {
     // native force-close is routed through the injectable [`ShutdownSeam`], so a
     // recording no-op double stands in for the real `StreamRef`/`ConnectionRef`.
 
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::error::{ConnectionTerminal, SendEvent, SendTerminal};
+    use crate::error::{SendEvent, SendTerminal};
     use crate::msquic::{ConnectionShutdownFlags, Status, StatusCode, StreamShutdownFlags};
     use crate::{
         ForceShutdown, H3_INTERNAL_ERROR, PoisonFlag, ReceiveEvent, ShutdownSeam, conn_poison_disp,
@@ -3181,7 +3239,7 @@ mod callback_safety {
                 negotiated_alpn: &[],
             }),
             |_c| panic!("boom in connection callback"),
-            connection_recover,
+            |c, seam| connection_recover(c, seam, &Cell::new(false)),
         );
         assert!(is_internal_err(&got));
         assert_eq!(
@@ -3217,7 +3275,7 @@ mod callback_safety {
                 negotiated_alpn: &[],
             }),
             |_c| panic!("boom"),
-            connection_recover,
+            |c, seam| connection_recover(c, seam, &Cell::new(false)),
         );
         assert!(ctx.poisoned);
 
@@ -3233,7 +3291,7 @@ mod callback_safety {
             &RecordingSeam::default(),
             conn_poison_disp(&teardown),
             |_c| panic!("body must NOT run when poisoned"),
-            connection_recover,
+            |c, seam| connection_recover(c, seam, &Cell::new(false)),
         );
         assert!(got.is_ok());
 
@@ -3250,7 +3308,7 @@ mod callback_safety {
             &RecordingSeam::default(),
             conn_poison_disp(&ownership_like),
             |_c| panic!("body must NOT run when poisoned"),
-            connection_recover,
+            |c, seam| connection_recover(c, seam, &Cell::new(false)),
         );
         assert!(is_internal_err(&got));
     }
@@ -3275,7 +3333,7 @@ mod callback_safety {
             &seam,
             conn_poison_disp(&teardown),
             |_c| panic!("boom while handling ShutdownComplete"),
-            connection_recover,
+            |c, seam| connection_recover(c, seam, &Cell::new(false)),
         );
         assert!(is_internal_err(&got));
         assert_eq!(
@@ -3303,7 +3361,7 @@ mod callback_safety {
             &seam,
             conn_poison_disp(&teardown),
             |_c| panic!("body must NOT run on teardown after poison"),
-            connection_recover,
+            |c, seam| connection_recover(c, seam, &Cell::new(false)),
         );
         assert!(got.is_ok());
         assert_eq!(
@@ -3311,6 +3369,125 @@ mod callback_safety {
             1,
             "no second force-close after poison short-circuit"
         );
+    }
+
+    /// RAII stand-in for the owned peer `Stream` that `Stream::from_raw` hands to
+    /// `H3Stream::attach` on `PeerStreamStarted`. Its `Drop` increments a shared
+    /// counter, mirroring how the real owned `Stream`'s `Drop` performs the single
+    /// native `StreamClose`. Constructing one models `from_raw` taking ownership;
+    /// the unwind dropping it models the close — so the close is directly
+    /// OBSERVABLE (counter), not merely inferred from the recover return value.
+    struct OwnedStreamStandIn(Arc<AtomicUsize>);
+    impl Drop for OwnedStreamStandIn {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn connection_peer_stream_panic_before_from_raw_rejects() {
+        // F-C: a `PeerStreamStarted` panic BEFORE `Stream::from_raw` never took
+        // native stream ownership, so no owned stand-in exists (close == 0) and
+        // `connection_recover` returns Err — msquic performs the single stream
+        // reject. The connection is still force-closed and its waiters woken.
+        let (mut ctx, mut crx) = conn_ctx_channel();
+        let seam = RecordingSeam::default();
+        // Per-invocation peer-stream ownership token, never shared with the ctx.
+        let stream_owned = Cell::new(false);
+        let closes = Arc::new(AtomicUsize::new(0));
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c| {
+                // Ownership never transferred: from_raw never runs, no stand-in.
+                let _keep_alive = &closes;
+                panic!("boom before PeerStreamStarted from_raw");
+            },
+            |c, seam| connection_recover(c, seam, &stream_owned),
+        );
+        // No stream ownership → Err: msquic performs the sole stream reject.
+        assert!(
+            is_internal_err(&got),
+            "pre-ownership PeerStreamStarted panic → Err (single msquic reject)"
+        );
+        assert_eq!(
+            closes.load(Ordering::Relaxed),
+            0,
+            "no owned stream stand-in exists, so zero close occurs"
+        );
+        // The connection itself is still force-closed exactly once.
+        assert_eq!(
+            *seam.calls.borrow(),
+            vec![(
+                ForceShutdown::Connection(ConnectionShutdownFlags::NONE),
+                H3_INTERNAL_ERROR
+            )],
+            "connection is force-closed once regardless of stream ownership"
+        );
+        assert!(ctx.poisoned);
+        // Connection waiters woken so a parked connect/accept task cannot hang.
+        let mut woken = crx.connected.take().expect("connect waiter present");
+        match woken.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("connect waiter should observe a failure, got {other:?}"),
+        }
+        assert!(ctx.bidi.is_none() && ctx.uni.is_none());
+    }
+
+    #[test]
+    fn connection_peer_stream_panic_after_from_raw_does_not_reject() {
+        // F-C: a `PeerStreamStarted` panic AFTER `Stream::from_raw` (e.g. inside
+        // `H3Stream::attach`) already took native stream ownership — the owned
+        // stream's Drop performs the single `StreamClose` (close == 1). msquic must
+        // NOT re-close it, so `connection_recover` returns Ok (no double-close),
+        // while still force-closing the CONNECTION and waking its waiters.
+        let (mut ctx, mut crx) = conn_ctx_channel();
+        let seam = RecordingSeam::default();
+        let stream_owned = Cell::new(false);
+        let closes = Arc::new(AtomicUsize::new(0));
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c| {
+                // Emulate from_raw taking stream ownership: construct the owned
+                // stand-in and mark the token the instant it transfers. The named
+                // binding lives until the panic, so the unwind's Drop performs the
+                // single close (counter += 1).
+                let _owned_stream = OwnedStreamStandIn(closes.clone());
+                stream_owned.set(true);
+                panic!("boom after PeerStreamStarted from_raw");
+            },
+            |c, seam| connection_recover(c, seam, &stream_owned),
+        );
+        // Stream ownership already taken + dropped → Ok: msquic must NOT re-close.
+        assert!(
+            got.is_ok(),
+            "post-ownership PeerStreamStarted panic → Ok (owned stream Drop closed it once)"
+        );
+        assert_eq!(
+            closes.load(Ordering::Relaxed),
+            1,
+            "the owned stream stand-in's Drop performs exactly one close"
+        );
+        // The connection is still force-closed exactly once.
+        assert_eq!(
+            *seam.calls.borrow(),
+            vec![(
+                ForceShutdown::Connection(ConnectionShutdownFlags::NONE),
+                H3_INTERNAL_ERROR
+            )],
+            "connection is force-closed once even when stream ownership was taken"
+        );
+        assert!(ctx.poisoned);
+        // Connection waiters woken so a parked connect/accept task cannot hang.
+        let mut woken = crx.connected.take().expect("connect waiter present");
+        match woken.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("connect waiter should observe a failure, got {other:?}"),
+        }
+        assert!(ctx.bidi.is_none() && ctx.uni.is_none());
     }
 
     #[test]
@@ -3343,10 +3520,12 @@ mod callback_safety {
             Ok(SendEvent::TerminalWake) => {}
             other => panic!("send half should be woken, got {other:?}"),
         }
-        // Receive half woken with an internal connection terminal.
+        // Receive half woken with a STREAM-LOCAL internal terminal (F-A): a
+        // stream-scoped `ReceiveEvent::Internal`, NOT a `Connection` event, so it
+        // never freezes the shared connection slot.
         match recv.receive.try_recv() {
-            Ok(ReceiveEvent::Connection(ConnectionTerminal::Internal(_))) => {}
-            _ => panic!("receive half should be woken with a Connection(Internal) terminal"),
+            Ok(ReceiveEvent::Internal(_)) => {}
+            _ => panic!("receive half should be woken with a stream-local Internal terminal"),
         }
         // Pending open (StartComplete) waiter resolved with a failure, not hung.
         match recv.start.try_recv() {
@@ -3470,11 +3649,18 @@ mod connection_terminal {
         record_conn_terminal,
     };
 
+    /// A fresh per-invocation peer-stream ownership token for driving
+    /// `connection_callback` in these hermetic tests. None of these events is a
+    /// `PeerStreamStarted`, so the token is never set (F-C).
+    fn no_stream_owned() -> std::cell::Cell<bool> {
+        std::cell::Cell::new(false)
+    }
+
     /// Drive one connection event through the callback and return the frozen,
     /// converted terminal the accept frontend would report.
     fn map_event(ev: ConnectionEvent) -> ConnectionErrorIncoming {
         let (mut ctx, crx) = conn_ctx_channel();
-        assert!(connection_callback(&mut ctx, ev).is_ok());
+        assert!(connection_callback(&mut ctx, ev, &no_stream_owned()).is_ok());
         observe_terminal(&crx.terminal)
     }
 
@@ -3575,7 +3761,7 @@ mod connection_terminal {
             session_resumed: false,
             negotiated_alpn: &[],
         };
-        assert!(connection_callback(&mut ctx, ev).is_ok());
+        assert!(connection_callback(&mut ctx, ev, &no_stream_owned()).is_ok());
         assert!(connect_result(&mut crx).is_ok());
     }
 
@@ -3587,7 +3773,7 @@ mod connection_terminal {
             status: Status::new(StatusCode::QUIC_STATUS_HANDSHAKE_FAILURE),
             error_code: 0,
         };
-        assert!(connection_callback(&mut ctx, ev).is_ok());
+        assert!(connection_callback(&mut ctx, ev, &no_stream_owned()).is_ok());
         let err = connect_result(&mut crx).expect_err("early shutdown resolves as Err");
         assert_eq!(
             err.try_as_status_code().ok(),
@@ -3602,7 +3788,8 @@ mod connection_terminal {
         assert!(
             connection_callback(
                 &mut ctx,
-                ConnectionEvent::ShutdownInitiatedByPeer { error_code: 9 }
+                ConnectionEvent::ShutdownInitiatedByPeer { error_code: 9 },
+                &no_stream_owned()
             )
             .is_ok()
         );
@@ -3629,7 +3816,8 @@ mod connection_terminal {
                     handshake_completed: false,
                     peer_acknowledged_shutdown: false,
                     app_close_in_progress: false,
-                }
+                },
+                &no_stream_owned()
             )
             .is_ok()
         );
@@ -3739,7 +3927,8 @@ mod connection_terminal {
         assert!(
             connection_callback(
                 &mut ctx,
-                ConnectionEvent::ShutdownInitiatedByPeer { error_code: 11 }
+                ConnectionEvent::ShutdownInitiatedByPeer { error_code: 11 },
+                &no_stream_owned()
             )
             .is_ok()
         );
@@ -3808,9 +3997,9 @@ mod receive_events {
     use crate::error::ConnectionTerminal;
     use crate::msquic::{BufferRef, ReceiveFlags, Status, StatusCode, StreamEvent};
     use crate::{
-        H3RecvStream, MAX_RECV_BUFFER, RecvBudget, RecvExec, RecvStreamReceiveCtx,
+        H3RecvStream, MAX_RECV_BUFFER, NoShutdown, RecvBudget, RecvExec, RecvStreamReceiveCtx,
         new_conn_terminal_slot, record_conn_terminal, stream_callback, stream_ctx_channel,
-        stream_ctx_channel_with_conn,
+        stream_ctx_channel_with_conn, stream_recover,
     };
 
     fn noop_context() -> Context<'static> {
@@ -4061,6 +4250,49 @@ mod receive_events {
                 "post-observation refinement must be rejected, got {e:?}"
             ),
             other => panic!("expected frozen LocalConnectionClose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f_a_stream_local_panic_does_not_freeze_empty_connection_slot() {
+        // F-A regression: a contained stream-callback panic recovers via
+        // `stream_recover`, which publishes a STREAM-LOCAL internal terminal
+        // (`ReceiveEvent::Internal`) and must NOT touch the shared connection
+        // slot. Polling the recovered stream surfaces the internal fault, and a
+        // later GENUINE connection cause recorded on the shared slot is still
+        // refinable and delivered to a subsequent observer — proving the slot was
+        // not frozen EMPTY (regression of MF-1 / SF-C / FR-002 / FR-003).
+        let slot = new_conn_terminal_slot();
+        let (mut ctx, _srx, mut rrx) =
+            stream_ctx_channel_with_conn(4u64.try_into().unwrap(), slot.clone());
+
+        // Recover a stream via a contained panic (no native handle: no-op seam).
+        assert!(stream_recover(&mut ctx, &NoShutdown).is_err());
+
+        // The recovered receive half reports the STREAM-LOCAL internal fault.
+        match poll(&mut rrx) {
+            Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::InternalError(_),
+            })) => {}
+            other => panic!("expected stream-local InternalError, got {other:?}"),
+        }
+
+        // The shared connection slot was NOT frozen by the stream-local panic: a
+        // genuine peer/transport connection cause recorded afterwards is still
+        // observable (not discarded, not overridden by an internal fault). A fresh
+        // stream sharing the SAME slot observes the delivered cause.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        let (mut ctx2, _srx2, mut rrx2) =
+            stream_ctx_channel_with_conn(8u64.try_into().unwrap(), slot.clone());
+        provisional_local_close(&mut ctx2);
+        match poll(&mut rrx2) {
+            Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            })) => assert_eq!(
+                error_code, 9,
+                "the genuine connection cause survives the stream-local panic"
+            ),
+            other => panic!("expected delivered ApplicationClose{{9}}, got {other:?}"),
         }
     }
 

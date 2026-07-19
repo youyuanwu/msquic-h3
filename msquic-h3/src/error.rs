@@ -45,7 +45,7 @@ pub(crate) fn clamp_application_code(code: u64) -> u64 {
 // into `StreamErrorIncoming::Unknown(Box<dyn Error + Send + Sync>)`.
 // ---------------------------------------------------------------------------
 
-/// A `send_data` payload above [`MAX_ADAPTER_SEND`]. One-shot; never stored in
+/// A `send_data` payload above `MAX_ADAPTER_SEND`. One-shot; never stored in
 /// the shared send-terminal slot. Constructed at the `send_data` rejection site
 /// and boxed into `StreamErrorIncoming::Unknown`.
 #[derive(Debug)]
