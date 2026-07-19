@@ -5269,6 +5269,144 @@ mod downcall_clamp {
             drop(opener);
         }
     }
+
+    /// Build a real (unstarted) adapter [`crate::Connection`] whose incoming-stream
+    /// channels and shared terminal slot the test controls, so the actual
+    /// `poll_accept_recv`/`poll_accept_bidi` frontends can be driven without a
+    /// live peer. The returned [`crate::ConnCtxSender`] owns the `uni`/`bidi`
+    /// senders: dropping it closes both channels (`poll_next` → `None`), which is
+    /// exactly the channel-closure path the accept frontends terminate on.
+    ///
+    /// Drop order matters: the caller binds `(reg, connection, ctx)` so that at
+    /// end of scope `connection` (and its `ConnHandle`) drops before `reg`, i.e.
+    /// the native `ConnectionClose` runs while the registration is still alive.
+    fn accept_frontend_connection() -> (Registration, crate::Connection, crate::ConnCtxSender) {
+        let reg = Registration::new(&RegistrationConfig::default()).unwrap();
+        let inner =
+            Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
+        let guard = RundownGuard::new(reg.state().clone());
+        let (ctx, crx) = crate::conn_ctx_channel();
+        let conn = Arc::new(ConnHandle::new(inner, guard, crx.terminal.clone()));
+        let opener = StreamOpener::new(conn.clone());
+        let connection = crate::Connection {
+            conn,
+            ctx: crx,
+            opener,
+        };
+        (reg, connection, ctx)
+    }
+
+    #[test]
+    fn poll_accept_recv_delivering_cause_commits_and_locks_identity() {
+        // Phase 1 / Fix 1 (SC-003) — accept as a COMMITTING poll, cause-delivery
+        // ordering, driven through the real `poll_accept_recv` frontend: a
+        // connection cause is recorded, the incoming-stream channel then closes,
+        // and the accept poll delivers+commits (freezes) the cause. A later
+        // refinement is rejected because delivery froze the slot.
+        let (_reg, mut connection, ctx) = accept_frontend_connection();
+        let slot = connection.ctx.terminal.clone();
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        drop(ctx); // close the uni/bidi channels: accept observes channel closure
+        let mut cx = noop_cx();
+        match <crate::Connection as h3::quic::Connection<Bytes>>::poll_accept_recv(
+            &mut connection,
+            &mut cx,
+        ) {
+            std::task::Poll::Ready(Err(ConnectionErrorIncoming::ApplicationClose {
+                error_code,
+            })) => assert_eq!(error_code, 9),
+            other => panic!("expected ApplicationClose{{9}} from accept delivery, got {other:?}"),
+        }
+        // Delivery froze the slot: a later different cause does not change what a
+        // subsequent observer sees.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+        drop(connection);
+    }
+
+    #[test]
+    fn poll_accept_recv_empty_slot_non_delivery_does_not_commit() {
+        // Phase 1 / Fix 1 core — accept as a NON-delivery, empty-slot ordering,
+        // driven through the real `poll_accept_recv` frontend: the channel closes
+        // with NO recorded terminal, so the poll returns the synthetic
+        // `InternalError` WITHOUT freezing. A subsequently-recorded genuine cause
+        // is therefore still observable by a later consumer.
+        let (_reg, mut connection, ctx) = accept_frontend_connection();
+        let slot = connection.ctx.terminal.clone();
+        drop(ctx); // close the channels with an empty slot
+        let mut cx = noop_cx();
+        match <crate::Connection as h3::quic::Connection<Bytes>>::poll_accept_recv(
+            &mut connection,
+            &mut cx,
+        ) {
+            std::task::Poll::Ready(Err(ConnectionErrorIncoming::InternalError(msg))) => {
+                assert!(msg.contains("without a terminal reason"), "msg: {msg}");
+            }
+            other => panic!("expected InternalError from empty-slot non-delivery, got {other:?}"),
+        }
+        // The non-delivery did not freeze: a later genuine cause is delivered.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+        drop(connection);
+    }
+
+    #[test]
+    fn poll_accept_bidi_delivering_cause_commits_and_locks_identity() {
+        // Same committing-poll delivery invariant as the recv case, driven through
+        // the real `poll_accept_bidi` frontend (both accept frontends share the
+        // `observe_terminal` → `commit_conn` delivery seam).
+        let (_reg, mut connection, ctx) = accept_frontend_connection();
+        let slot = connection.ctx.terminal.clone();
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        drop(ctx);
+        let mut cx = noop_cx();
+        match <crate::Connection as h3::quic::Connection<Bytes>>::poll_accept_bidi(
+            &mut connection,
+            &mut cx,
+        ) {
+            std::task::Poll::Ready(Err(ConnectionErrorIncoming::ApplicationClose {
+                error_code,
+            })) => assert_eq!(error_code, 9),
+            other => panic!("expected ApplicationClose{{9}} from accept delivery, got {other:?}"),
+        }
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+        drop(connection);
+    }
+
+    #[test]
+    fn poll_accept_bidi_empty_slot_non_delivery_does_not_commit() {
+        // Empty-slot non-delivery invariant driven through the real
+        // `poll_accept_bidi` frontend.
+        let (_reg, mut connection, ctx) = accept_frontend_connection();
+        let slot = connection.ctx.terminal.clone();
+        drop(ctx);
+        let mut cx = noop_cx();
+        match <crate::Connection as h3::quic::Connection<Bytes>>::poll_accept_bidi(
+            &mut connection,
+            &mut cx,
+        ) {
+            std::task::Poll::Ready(Err(ConnectionErrorIncoming::InternalError(msg))) => {
+                assert!(msg.contains("without a terminal reason"), "msg: {msg}");
+            }
+            other => panic!("expected InternalError from empty-slot non-delivery, got {other:?}"),
+        }
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+        drop(connection);
+    }
 }
 /// msquic connection, mirroring `listener::basic_server_test` but driving the
 /// raw `h3::quic` trait surface (open/accept bidi streams, `send_data`,
