@@ -14,7 +14,7 @@ between h3 polls. The adapter enforces a per-stream budget so a stalled reader
 pauses only its own stream, and the connection's total receive memory is bounded
 by the number of concurrent streams.
 
-`MAX_RECV_BUFFER` is `1 MiB` per stream (`../msquic-h3/src/lib.rs`). Returning
+`MAX_RECV_BUFFER` is `1 MiB` per stream (`../msquic-h3/src/stream.rs`). Returning
 `QUIC_STATUS_PENDING` from a receive callback pauses delivery for *that stream
 only*, which is why the budget is per-stream rather than per-connection. The
 resulting connection memory bound is approximately
@@ -98,7 +98,7 @@ real copy.
 
 Because msquic completes a send asynchronously, the owned `SendBuffer` must
 outlive the callback and be freed exactly once. The transfer is centralized in
-`submit_owned_send` (`../msquic-h3/src/lib.rs`) — the single place that
+`submit_owned_send` (`../msquic-h3/src/stream.rs`) — the single place that
 `Box::into_raw`s the buffer, hands the raw pointer to msquic as the send's
 `client_context`, and, if the submit fails immediately, reclaims it with
 `Box::from_raw`. The `StreamExecutor` (implementing the `SendExec` seam) exposes

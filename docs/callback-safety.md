@@ -9,7 +9,7 @@ keep the boundary sound: panic containment and take-ownership-only-on-success.
 ## Panic containment
 
 Every one of the three callbacks (connection, stream, listener) runs its body
-inside `guard_callback` (`../msquic-h3/src/lib.rs`), which wraps the work in
+inside `guard_callback` (`../msquic-h3/src/callback.rs`), which wraps the work in
 `catch_unwind(AssertUnwindSafe(...))`. Three outcomes are handled distinctly:
 
 - **Normal return** — the body's result (including a legitimate `Err`, such as the

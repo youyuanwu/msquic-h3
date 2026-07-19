@@ -38,12 +38,19 @@ lives.
 
 ## Module map
 
-The crate is a single library (`[lib] path = "msquic-h3/src/lib.rs"`) with a
-handful of sibling modules declared in `../msquic-h3/src/lib.rs`.
+The crate root (`../msquic-h3/src/lib.rs`) is a small module that wires the
+submodules together (module declarations, crate-root re-exports, a few shared
+prelude helpers, and the `msquic`/`bench_support` re-exports). The adapter's logic
+lives in the sibling modules below.
 
 | Module | Role |
 | --- | --- |
-| `lib` (`../msquic-h3/src/lib.rs`) | The bulk of the adapter: `Connection`, the stream types, the h3 trait impls, and the connection and stream FFI callbacks. |
+| `lib` (`../msquic-h3/src/lib.rs`) | Crate-root wiring: module declarations, public/`pub(crate)` re-exports, shared prelude helpers (`lock_recover`, `H3_INTERNAL_ERROR`, `internal_error_status`). |
+| `callback` (`../msquic-h3/src/callback.rs`) | Callback-safety primitives: `guard_callback`, `PoisonFlag`, `ShutdownSeam`, `CbClass`, `ForceShutdown`. |
+| `terminal` (`../msquic-h3/src/terminal.rs`) | Terminal-cause machinery: the connection/send terminal slots, `ConnTerminalState`, commit-on-delivery + refinement helpers, transport/shutdown classification. |
+| `connection` (`../msquic-h3/src/connection.rs`) | `Connection`, `ConnHandle`, the connection FFI callback + recovery, the accept path, `ConnectionShutdownWaiter`, and the `Connection` h3 trait impls. |
+| `opener` (`../msquic-h3/src/opener.rs`) | `StreamOpener` and its `OpenStreams` impl, stream-open outcome classification. |
+| `stream` (`../msquic-h3/src/stream.rs`) | The stream types (`H3Stream`/`H3SendStream`/`H3RecvStream`), the send/receive exec seams, the owned-send buffer transfer, receive backpressure, the stream FFI callback, and the stream h3 trait impls. |
 | `error` (`../msquic-h3/src/error.rs`) | Adapter error vocabulary, the scoped terminal enums, the h3-conversion helpers, and the pure send reducer `transition()`. |
 | `buffer` (`../msquic-h3/src/buffer.rs`) | The owned send payload (`SendBuffer`), send-length classification, and the single production copy path. |
 | `listener` (`../msquic-h3/src/listener.rs`) | The server-side `Listener` plus the listener FFI callback and its ownership-aware recovery. |
@@ -57,9 +64,9 @@ name msquic types without a second dependency.
 
 ## Public API surface
 
-The public surface is intentionally small. Types come from `lib.rs` unless noted:
+The public surface is intentionally small. Types come from the modules noted:
 
-- **Connection & streams**: `Connection` (`../msquic-h3/src/lib.rs`),
+- **Connection & streams**: `Connection` (`../msquic-h3/src/connection.rs`),
   `ConnectionShutdownWaiter`, `StreamOpener`, and the stream types `H3Stream`,
   `H3SendStream`, `H3RecvStream`. `H3Stream` composes a send half and a receive
   half and can `split` into the two.
@@ -89,16 +96,17 @@ it is not nameable outside the crate; it is an internal type documented in
 msquic delivers connection, stream, and listener events by invoking C function
 pointers. The adapter registers a Rust closure for each handle and dispatches on
 the event. There are exactly three callbacks, and every one runs inside
-`guard_callback` (`../msquic-h3/src/lib.rs`), the panic backstop described in
+`guard_callback` (`../msquic-h3/src/callback.rs`), the panic backstop described in
 [callback safety](./callback-safety.md):
 
-- **`connection_callback`** — handles `Connected`, `ShutdownInitiatedByPeer`,
-  `ShutdownInitiatedByTransport`, `PeerStreamStarted`, and `ShutdownComplete`.
-  Registered when a connection is opened (client) or attached (server-accepted).
-- **`stream_callback`** — handles `StartComplete`, `SendComplete`, `Receive`,
-  `PeerSendShutdown`, `PeerSendAborted`, `PeerReceiveAborted`,
-  `SendShutdownComplete`, and `ShutdownComplete`. Registered when a stream is
-  attached or opened-and-started.
+- **`connection_callback`** (`../msquic-h3/src/connection.rs`) — handles
+  `Connected`, `ShutdownInitiatedByPeer`, `ShutdownInitiatedByTransport`,
+  `PeerStreamStarted`, and `ShutdownComplete`. Registered when a connection is
+  opened (client) or attached (server-accepted).
+- **`stream_callback`** (`../msquic-h3/src/stream.rs`) — handles `StartComplete`,
+  `SendComplete`, `Receive`, `PeerSendShutdown`, `PeerSendAborted`,
+  `PeerReceiveAborted`, `SendShutdownComplete`, and `ShutdownComplete`. Registered
+  when a stream is attached or opened-and-started.
 - **`listener_callback`** (`../msquic-h3/src/listener.rs`) — handles
   `NewConnection` and `StopComplete`. Registered by `Listener::new`.
 
