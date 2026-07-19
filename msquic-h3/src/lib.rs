@@ -2579,12 +2579,10 @@ impl SendStreamReceiveCtx {
             Some(SendTerminal::Connection(fallback)) => Some(SendTerminal::Connection(
                 peek_conn_terminal(&self.conn_terminal).unwrap_or(fallback),
             )),
-            Some(SendTerminal::ProvisionalAbort) => {
-                match peek_conn_terminal(&self.conn_terminal) {
-                    Some(reason) => Some(SendTerminal::Connection(reason)),
-                    None => Some(SendTerminal::ProvisionalAbort),
-                }
-            }
+            Some(SendTerminal::ProvisionalAbort) => match peek_conn_terminal(&self.conn_terminal) {
+                Some(reason) => Some(SendTerminal::Connection(reason)),
+                None => Some(SendTerminal::ProvisionalAbort),
+            },
             None => peek_conn_terminal(&self.conn_terminal).map(SendTerminal::Connection),
             other => other,
         }
@@ -2601,9 +2599,9 @@ impl SendStreamReceiveCtx {
     /// and therefore never calls this (never freezes) — the MF-2 fix.
     fn commit_send_winner(&self, w: SendTerminal) -> SendTerminal {
         match w {
-            SendTerminal::Connection(fallback) => SendTerminal::Connection(
-                commit_conn(&self.conn_terminal).unwrap_or(fallback),
-            ),
+            SendTerminal::Connection(fallback) => {
+                SendTerminal::Connection(commit_conn(&self.conn_terminal).unwrap_or(fallback))
+            }
             other => other,
         }
     }
@@ -4383,7 +4381,10 @@ mod receive_events {
                 pend_returns += 1;
                 assert!(recv.rctx.recv_budget.pend_outstanding());
                 // The saved length is this FULL indication (never a drained one).
-                assert_eq!(recv.rctx.recv_budget.pending_indication_len() as usize, CHUNK);
+                assert_eq!(
+                    recv.rctx.recv_budget.pending_indication_len() as usize,
+                    CHUNK
+                );
             } else {
                 assert!(res.is_ok(), "sub-bound offer must be Ok, got {res:?}");
             }
@@ -4408,7 +4409,10 @@ mod receive_events {
         );
         // Bounded peak: it reached the bound but never exceeded bound + one
         // in-flight indication, independent of how much was offered.
-        assert!(peak >= MAX_RECV_BUFFER, "peak {peak} should reach the bound");
+        assert!(
+            peak >= MAX_RECV_BUFFER,
+            "peak {peak} should reach the bound"
+        );
         assert!(
             peak <= MAX_RECV_BUFFER + CHUNK,
             "peak {peak} must stay <= bound + one indication ({})",
@@ -4417,7 +4421,11 @@ mod receive_events {
         // Each PENDING was completed exactly once via the seam, always with the
         // FULL saved indication length.
         let c = completes.lock().unwrap();
-        assert_eq!(c.len(), pend_returns, "exactly one receive_complete per pend");
+        assert_eq!(
+            c.len(),
+            pend_returns,
+            "exactly one receive_complete per pend"
+        );
         assert!(
             c.iter().all(|&l| l as usize == CHUNK),
             "completions must use the FULL saved indication length"
@@ -4475,7 +4483,10 @@ mod receive_events {
         });
         assert!(matches!(outcome, Admit::Pend));
         assert!(recv.rctx.recv_budget.pend_outstanding());
-        assert_eq!(recv.rctx.recv_budget.pending_indication_len() as usize, RACE);
+        assert_eq!(
+            recv.rctx.recv_budget.pending_indication_len() as usize,
+            RACE
+        );
         assert_eq!(recv.rctx.recv_budget.buffered(), 3 * PRE + RACE);
 
         // (3) INTERLEAVE: the drain runs NOW, before the callback's PENDING return
@@ -4505,9 +4516,17 @@ mod receive_events {
         while let Poll::Ready(Ok(Some(b))) = recv.poll_data(&mut cx) {
             drained += b.len();
         }
-        assert_eq!(drained, 3 * PRE + RACE, "all bytes drained exactly, no loss");
+        assert_eq!(
+            drained,
+            3 * PRE + RACE,
+            "all bytes drained exactly, no loss"
+        );
         assert_eq!(recv.rctx.recv_budget.buffered(), 0);
-        assert_eq!(completes.lock().unwrap().len(), 1, "exactly one completion total");
+        assert_eq!(
+            completes.lock().unwrap().len(),
+            1,
+            "exactly one completion total"
+        );
     }
 
     /// Genuine concurrent race (finding 2): a writer thread runs the callback's
@@ -4563,12 +4582,17 @@ mod receive_events {
 
         // Every published byte drained exactly; the counter never underflowed.
         assert_eq!(drained, ITERS * CHUNK);
-        assert_eq!(budget.buffered(), 0, "buffered returns to exactly 0 after the race");
-        // The stream is never left stranded PENDING with buffered below the bound.
-        assert!(!budget.pend_outstanding(), "no pend left outstanding after the race");
-        println!(
-            "drain_before_pend_return_is_absorbed: completes={completes} drained={drained}"
+        assert_eq!(
+            budget.buffered(),
+            0,
+            "buffered returns to exactly 0 after the race"
         );
+        // The stream is never left stranded PENDING with buffered below the bound.
+        assert!(
+            !budget.pend_outstanding(),
+            "no pend left outstanding after the race"
+        );
+        println!("drain_before_pend_return_is_absorbed: completes={completes} drained={drained}");
     }
 
     /// Rollback-on-failed-publication (finding 1): if the frontend receiver is
@@ -4622,7 +4646,10 @@ mod receive_events {
             "saved indication length rolled back"
         );
         // The dropped frontend is observed: the sender half is taken.
-        assert!(ctx.receive.is_none(), "dropped frontend detaches the sender");
+        assert!(
+            ctx.receive.is_none(),
+            "dropped frontend detaches the sender"
+        );
     }
 
     /// SC-005 no regression: a promptly-draining consumer sees identical data,
@@ -4673,7 +4700,11 @@ mod receive_events {
         let stalled = H3RecvStream::with_exec(Box::new(rec1), stalled_rctx);
         let chunk = vec![0u8; MAX_RECV_BUFFER];
         assert!(
-            is_pending(&feed_receive_result(&mut stalled_ctx, &chunk, ReceiveFlags::NONE)),
+            is_pending(&feed_receive_result(
+                &mut stalled_ctx,
+                &chunk,
+                ReceiveFlags::NONE
+            )),
             "one full-bound indication pends the stalled stream"
         );
         assert!(stalled.rctx.recv_budget.pend_outstanding());
@@ -4708,7 +4739,11 @@ mod receive_events {
         let a = [1u8, 2, 3];
         let b = [4u8, 5];
         let c = [6u8, 7, 8, 9];
-        let bufs = [BufferRef::from(&a[..]), BufferRef::from(&b[..]), BufferRef::from(&c[..])];
+        let bufs = [
+            BufferRef::from(&a[..]),
+            BufferRef::from(&b[..]),
+            BufferRef::from(&c[..]),
+        ];
         let mut total = (a.len() + b.len() + c.len()) as u64;
         let ev = StreamEvent::Receive {
             absolute_offset: 0,
@@ -6400,13 +6435,17 @@ mod send_seam {
         match SendStream::<Bytes>::send_data(&mut s, Frame::Data(Bytes::from_static(b"data"))) {
             Err(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
-            }) => assert_eq!(error_code, 9, "specific connection cause, not Unknown(status)"),
+            }) => assert_eq!(
+                error_code, 9,
+                "specific connection cause, not Unknown(status)"
+            ),
             other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
         }
         // The send slot ends holding Connection(PeerApplication(9)), not Failed.
         match crate::load_winner(&s.sctx.send_terminal) {
-            Some(crate::error::SendTerminal::Connection(ConnectionTerminal::PeerApplication(9))) => {
-            }
+            Some(crate::error::SendTerminal::Connection(ConnectionTerminal::PeerApplication(
+                9,
+            ))) => {}
             other => panic!("expected send slot Connection(PeerApplication(9)), got {other:?}"),
         }
     }
@@ -6432,8 +6471,9 @@ mod send_seam {
             other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
         }
         match crate::load_winner(&s.sctx.send_terminal) {
-            Some(crate::error::SendTerminal::Connection(ConnectionTerminal::PeerApplication(9))) => {
-            }
+            Some(crate::error::SendTerminal::Connection(ConnectionTerminal::PeerApplication(
+                9,
+            ))) => {}
             other => panic!("expected send slot Connection(PeerApplication(9)), got {other:?}"),
         }
     }
@@ -6458,7 +6498,10 @@ mod send_seam {
         match SendStream::<Bytes>::poll_finish(&mut s, &mut cx) {
             std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
-            })) => assert_eq!(error_code, 9, "reset did not freeze; the cause is delivered later"),
+            })) => assert_eq!(
+                error_code, 9,
+                "reset did not freeze; the cause is delivered later"
+            ),
             other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
         }
     }
@@ -6498,7 +6541,10 @@ mod send_seam {
         match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
             std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
-            })) => assert_eq!(error_code, 9, "connection cause takes precedence over provisional"),
+            })) => assert_eq!(
+                error_code, 9,
+                "connection cause takes precedence over provisional"
+            ),
             other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
         }
     }
@@ -6523,7 +6569,11 @@ mod send_seam {
             std::task::Poll::Pending
         ));
         assert_eq!(h.gracefuls.load(Relaxed), 1);
-        stream_callback(&mut ctx, StreamEvent::SendShutdownComplete { graceful: true }).unwrap();
+        stream_callback(
+            &mut ctx,
+            StreamEvent::SendShutdownComplete { graceful: true },
+        )
+        .unwrap();
 
         // A provisional connection cause is prepared as reducer input.
         record_conn_terminal(&slot, ConnectionTerminal::LocalClose);
@@ -6856,8 +6906,10 @@ mod downcall_clamp {
             let guard = RundownGuard::new(reg.state().clone());
             let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
             record_conn_terminal(conn.terminal(), ConnectionTerminal::PeerApplication(9));
-            let mut opener =
-                StreamOpener::with_open_exec(conn.clone(), Box::new(CancellingOpenExec { record: None }));
+            let mut opener = StreamOpener::with_open_exec(
+                conn.clone(),
+                Box::new(CancellingOpenExec { record: None }),
+            );
             let mut cx = noop_cx();
 
             match OpenStreams::<Bytes>::poll_open_bidi(&mut opener, &mut cx) {
@@ -6884,8 +6936,10 @@ mod downcall_clamp {
             let guard = RundownGuard::new(reg.state().clone());
             let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
             record_conn_terminal(conn.terminal(), ConnectionTerminal::PeerApplication(5));
-            let mut opener =
-                StreamOpener::with_open_exec(conn.clone(), Box::new(CancellingOpenExec { record: None }));
+            let mut opener = StreamOpener::with_open_exec(
+                conn.clone(),
+                Box::new(CancellingOpenExec { record: None }),
+            );
             let mut cx = noop_cx();
 
             match OpenStreams::<Bytes>::poll_open_send(&mut opener, &mut cx) {
