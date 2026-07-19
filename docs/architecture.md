@@ -53,6 +53,7 @@ lives in the sibling modules below.
 | `stream` (`../msquic-h3/src/stream.rs`) | The stream types (`H3Stream`/`H3SendStream`/`H3RecvStream`), the send/receive exec seams, the owned-send buffer transfer, receive backpressure, the stream FFI callback, and the stream h3 trait impls. |
 | `error` (`../msquic-h3/src/error.rs`) | Adapter error vocabulary, the scoped terminal enums, the h3-conversion helpers, and the pure send reducer `transition()`. |
 | `buffer` (`../msquic-h3/src/buffer.rs`) | The owned send payload (`SendBuffer`), send-length classification, and the single production copy path. |
+| `config` (`../msquic-h3/src/config.rs`) | The public, validated memory-budget configuration `H3Config` (with `H3ConfigBuilder` and `ConfigError`): the per-send-size ceiling and the per-stream receive byte/unit caps, threaded from construction into every connection and stream. |
 | `listener` (`../msquic-h3/src/listener.rs`) | The server-side `Listener` plus the listener FFI callback and its ownership-aware recovery. |
 | `registration` (`../msquic-h3/src/registration.rs`) | `Registration`, rundown tracking (`RundownState`/`RundownGuard`), and the `WaitIdle` future. |
 | `attest` (`../msquic-h3/src/attest.rs`, test-only) | Runtime native-library version / git-hash / digest attestation gate. |
@@ -74,6 +75,16 @@ The public surface is intentionally small. Types come from the modules noted:
   *not* an h3 trait impl; it produces `Connection`s that are.
 - **Registration**: `Registration` and `WaitIdle`
   (`../msquic-h3/src/registration.rs`).
+- **Configuration**: `H3Config`, `H3ConfigBuilder`, and `ConfigError`
+  (`../msquic-h3/src/config.rs`) — the validated memory budgets (per-send-size
+  ceiling, per-stream receive byte and unit caps). Supplied at construction via
+  the additive `Connection::connect_with_config` / `Listener::with_config`; the
+  existing `Connection::connect` / `Listener::new` apply `H3Config::default()`.
+  The config rides the **dual per-connection carrier** — it is stored on both
+  `ConnHandle` (read by locally-opened streams via `StreamOpener`) and the
+  callback-side `ConnCtxSender` (read in the `PeerStreamStarted` arm), so it
+  reaches both locally-opened and peer-accepted streams, mirroring the terminal
+  slot.
 - **Error types**: the adapter-owned `MsQuicTransportError`, `LocalConnectionClose`,
   `LocalStreamReset`, and `OversizedSend` (`../msquic-h3/src/error.rs`), described
   in the [error model](./error-model.md).

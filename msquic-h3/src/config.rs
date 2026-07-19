@@ -33,6 +33,16 @@ pub(crate) const DEFAULT_MAX_RECV_UNITS: usize = 16384;
 /// Fields are private; construct via [`H3Config::default`] or
 /// [`H3Config::builder`]. All accessors are read-only, so a value cannot be
 /// mutated after construction.
+///
+/// The receive side is enforced per stream as real backpressure (both a byte
+/// budget and a unit-count budget). The **send** side is only bounded by
+/// `max_send_bytes` per outstanding send; there is no aggregate send cap, so
+/// per-connection send memory scales as `max_send_bytes × concurrent
+/// in-flight streams`. The adapter cannot enforce an aggregate send budget as
+/// backpressure because the h3 trait contract calls the synchronous
+/// `send_data` (which copies and takes ownership) before its only async
+/// readiness hook — applications that need to bound send memory should choose
+/// `max_send_bytes` and cap their concurrent stream count.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct H3Config {
     /// Maximum single `send_data` payload accepted before rejecting with

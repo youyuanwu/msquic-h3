@@ -275,9 +275,9 @@ impl Listener {
         Self::with_config(reg, config, alpn, local_addr, crate::H3Config::default())
     }
 
-    /// Create a listener with an explicit [`H3Config`], applied to every
-    /// connection it accepts (and thus to every stream those connections
-    /// open/accept).
+    /// Create a listener with an explicit [`H3Config`](crate::H3Config),
+    /// applied to every connection it accepts (and thus to every stream those
+    /// connections open/accept).
     pub fn with_config(
         reg: &crate::Registration,
         config: Arc<msquic::Configuration>,
