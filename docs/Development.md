@@ -15,7 +15,9 @@ cargo fmt --all -- --check
 cargo test               --no-default-features --features native-find -- --nocapture
 
 # Vendored-source row: crate-built from the bundled msquic source via cmake.
-cargo test --no-default-features --features native-src -- --nocapture
+cargo check  --all-targets --no-default-features --features native-src
+cargo clippy --all-targets --no-default-features --features native-src -- -D warnings
+cargo test                --no-default-features --features native-src -- --nocapture
 
 # Default / tracing rows (no native tests):
 cargo test --all -- --nocapture
@@ -23,6 +25,62 @@ cargo test --all --features tracing -- --nocapture
 
 # Send-copy benchmark (separate Criterion crate; needs the gated entry point):
 cargo bench --no-default-features --features native-find,bench-internals --bench send_copy
+```
+
+## Documentation build (docs.rs-equivalent)
+
+docs.rs builds this crate under the vendored `native-src` provenance (self-
+contained, no system package). Reproduce it locally with the same `--cfg docsrs`
+the crate metadata pins:
+
+```sh
+RUSTDOCFLAGS="--cfg docsrs" cargo doc --no-deps --no-default-features --features native-src
+```
+
+## Feature/provenance misconfiguration diagnostics
+
+Provenance is a committed, mutually-exclusive feature (`native-find` /
+`native-src`); exactly one must be selected.
+
+- **Neither enabled** → a SUPPORTED type-check-only configuration: the crate
+  compiles (`cargo check`/`clippy`) without linking a native library, which is
+  exactly what the default-features CI job exercises. There is no crate-level
+  guard. A real build/link that resolves msquic symbols will fail at link time
+  unless exactly one provenance is selected. (docs.rs is unaffected because its
+  metadata selects `native-src`.)
+- **Both enabled** → the upstream `msquic` build script panics with
+  `feature src and find are mutually exclusive`. This is an *upstream build-script*
+  failure, not a crate message, and is exactly why `--all-features` is not a valid
+  gate.
+
+The SC-008 negative check is an **expected-FAILURE** assertion of that
+both-enabled message (it is `#[ignore]`d so the default suite stays green); it is
+explicitly **not** an `--all-features` success gate:
+
+```sh
+# Expected to FAIL with the upstream mutual-exclusion message:
+cargo build --no-default-features --features native-find,native-src
+```
+
+## Opt-in external smoke test
+
+The `client_test_apache` test reaches the public internet and is `#[ignore]`d so
+the default suite is hermetic. Run it explicitly when validating real-world
+interop:
+
+```sh
+cargo test --no-default-features --features native-find -- --ignored client_test_apache
+```
+
+## Per-stream receive-backpressure measurement
+
+The `stalled_receive_is_bounded` test offers at least eight times the 1 MiB
+per-stream budget through the receive callback. It reports the observed peak and
+verifies that it stays at or below `MAX_RECV_BUFFER + one indication`, with each
+pended indication completed using its full saved length:
+
+```sh
+cargo test --no-default-features --features native-find stalled_receive_is_bounded -- --nocapture
 ```
 
 If the linked `libmsquic` is not on the default loader path, point the loader at

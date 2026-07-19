@@ -6,6 +6,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Cargo pre-1.0 semantics](https://doc.rust-lang.org/cargo/reference/semver.html)
 where every `0.0.z` bump may contain breaking changes.
 
+## [Unreleased]
+
+Post-`0.0.7` crate-review fixes. No public API break: the adapter surface is
+unchanged and these are behavioral/robustness corrections plus test and
+packaging hardening.
+
+### Fixed
+
+- **Faithful terminal-cause reporting (commit-on-delivery).** The shared
+  connection terminal slot is now frozen only when a cause is actually delivered
+  to a caller through an h3-facing poll (`send_data`/`poll_ready`/`poll_finish`/
+  `poll_open`/`accept`); an empty slot is never frozen on a non-delivery, so a
+  later, more-specific cause can still be recorded and delivered. `reset()` and a
+  successful graceful finish deliver no observable terminal and no longer freeze
+  the slot, and the accept path uses the same guarded commit primitive (MF-1 /
+  MF-2 / SF-C).
+- **Per-stream receive flow-control backpressure.** Receive buffering is now
+  bounded per stream: at/over `MAX_RECV_BUFFER` (1 MiB per stream) the callback
+  returns `QUIC_STATUS_PENDING` and the stream is re-armed (with its full saved
+  indication length) only after the reader drains below the bound, replacing the
+  prior eager-ack model. Connection memory is bounded by
+  (`MAX_RECV_BUFFER` + one in-flight indication) × the negotiated max concurrent
+  streams (SF-A).
+- **FFI callback panic backstop.** The connection, stream, and listener adapter
+  callback bodies now run under a `catch_unwind` guard that force-closes the
+  affected stream/connection handle (stream `ABORT` / connection `NONE`,
+  `H3_INTERNAL_ERROR` `0x0102`), performs ownership-aware close-or-reject recovery
+  for listeners, wakes terminal waiters, and poisons the context so later events
+  short-circuit — containing a panic instead of unwinding across the FFI
+  boundary. This is defense-in-depth; peer-reachable paths remain panic-free
+  (SF-E).
+
+### Changed
+
+- **Hermetic default test suite.** The external `client_test_apache` smoke test
+  (which reaches the public internet) is now `#[ignore]`d so the default suite is
+  self-contained; run it explicitly with `--ignored` (MF-3).
+
+### Added
+
+- **docs.rs metadata + provenance policy.** `[package.metadata.docs.rs]` pins
+  the `native-src` provenance and `--cfg docsrs` for a self-contained doc build.
+  Selecting neither provenance is a supported type-check-only configuration (no
+  crate-level guard; a real build/link requires one provenance); the both-enabled
+  case remains an upstream build-script panic. `--all-features` is not a valid
+  build/test gate (SF-L).
+
 ## [0.0.7] - 2026-07-18
 
 The MsQuic → h3 error-propagation refactor. Callbacks are now panic-free across
@@ -75,4 +122,5 @@ attestation plus send-copy measurements.
   connection mapping). If a consumer cannot yet adopt the new error model, pin
   `msquic-h3 = "0.0.6"` and the last-known-good native/config matrix row.
 
+[Unreleased]: https://github.com/youyuanwu/msquic-h3/compare/v0.0.7...HEAD
 [0.0.7]: https://github.com/youyuanwu/msquic-h3/releases/tag/v0.0.7

@@ -11,6 +11,22 @@ categories = ["web-programming", "network-programming"]
 keywords = ["quic", "h3"]
 readme = "./README.md"
 
+# docs.rs build configuration (SF-L / FR-009). docs.rs defaults to `--all-features`,
+# which enables both `native-find` + `native-src` and trips the upstream msquic
+# build-script panic. Pin the self-contained `native-src` provenance (libmsquic
+# built from vendored source via cmake — no preinstalled system library required,
+# unlike `native-find`) and set `--cfg docsrs` so the crate-level neither-provenance
+# guard in `src/lib.rs` is disabled for the link-free doc build.
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["native-src"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Register the `docsrs` cfg (set by docs.rs / the doc build above) so it is a known
+# cfg and `-D warnings` does not flag `unexpected_cfgs` (SF-L).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
+
 [lib]
 path = "msquic-h3/src/lib.rs"
 
@@ -34,6 +50,11 @@ tracing = ["dep:tracing"]
 # (system-package libmsquic; the canonical local invocation on this 2.5.8 host)
 #   cargo test --no-default-features --features native-src
 # (crate-built from the vendored msquic source via cmake).
+# Selecting NEITHER is a supported type-check-only configuration (the crate
+# compiles without linking a native library — the default-features CI check); a
+# real build/link requires exactly one provenance. The BOTH-enabled case is
+# bounded by the upstream build-script panic above (not intercepted at crate
+# level). docs.rs builds under `native-src` via `[package.metadata.docs.rs]` above.
 native-find = ["msquic/find"] # system-package libmsquic (find::find symlinks it)
 native-src = ["msquic/src"]   # crate-built from vendored source via cmake
 

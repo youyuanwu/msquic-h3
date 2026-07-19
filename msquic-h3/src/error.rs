@@ -45,7 +45,7 @@ pub(crate) fn clamp_application_code(code: u64) -> u64 {
 // into `StreamErrorIncoming::Unknown(Box<dyn Error + Send + Sync>)`.
 // ---------------------------------------------------------------------------
 
-/// A `send_data` payload above [`MAX_ADAPTER_SEND`]. One-shot; never stored in
+/// A `send_data` payload above `MAX_ADAPTER_SEND`. One-shot; never stored in
 /// the shared send-terminal slot. Constructed at the `send_data` rejection site
 /// and boxed into `StreamErrorIncoming::Unknown`.
 #[derive(Debug)]
@@ -508,11 +508,16 @@ fn provisional_pending(terminal: &Option<SendTerminal>) -> bool {
 /// absorbing/queued finish, then method-specific terminal handling, then event
 /// rows. Every impossible pairing is an explicit `Internal` publish, never a panic.
 ///
-/// The `terminal` field of every input is the raw shared-slot winner; the reducer
+/// The `terminal` field of every input is a **non-freezing snapshot** of the
+/// resolved shared-slot winner (the frontend's `resolve_terminal`); the reducer
 /// consults it only through [`definitive`] / [`provisional_pending`], so a
 /// provisional MF-2 cancellation marker is never observed by the caller — it is
 /// refined by a paired terminal callback or finalized to an authoritative abort at
-/// the closure point (channel close, finish/reset completion).
+/// the closure point (channel close, finish/reset completion). The reducer never
+/// freezes the shared connection slot: when it emits a [`SendCommand::ReturnError`]
+/// carrying a connection cause, the frontend commits (freezes) that connection
+/// identity via `commit_send_winner` at the exact delivery point, so the freeze
+/// happens only when the cause is actually returned to h3 (commit-on-delivery).
 pub(crate) fn transition(state: &mut SendState, input: SendInput) -> SendCommand {
     use SendCommand::*;
     use SendInput::*;

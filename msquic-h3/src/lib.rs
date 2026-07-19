@@ -1,4 +1,15 @@
+// Native-provenance features `native-find` / `native-src` are mutually exclusive
+// (see Cargo.toml). Selecting BOTH is rejected by the upstream `msquic` build
+// script (`feature src and find are mutually exclusive`), which runs before this
+// crate compiles. Selecting NEITHER is a SUPPORTED type-check-only configuration:
+// the crate compiles without linking a native library (this is exactly what the
+// default-features CI `cargo check`/`clippy` job exercises), so no crate-level
+// guard is imposed. A real build/link that resolves msquic symbols requires
+// exactly one provenance. docs.rs builds under `native-src` via
+// `[package.metadata.docs.rs]` in Cargo.toml.
+
 use std::{
+    cell::Cell,
     ffi::c_void,
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
@@ -66,6 +77,151 @@ pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+// ---------------------------------------------------------------------------
+// FFI callback panic containment (SF-E / FR-007).
+//
+// The upstream msquic `extern "C"` trampolines contain no `catch_unwind`, so a
+// panic raised inside one of this crate's adapter callback bodies would unwind
+// across the C boundary and abort the process. [`guard_callback`] is a
+// defense-in-depth backstop that wraps each adapter body in
+// `catch_unwind(AssertUnwindSafe(..))` and, on a caught panic, runs a
+// class-specific `recover` action that force-closes the affected native handle,
+// wakes the affected terminal waiters (msquic ignores the callback return status
+// for many events, so a returned `Err` alone cannot be relied upon), and marks
+// the ctx poisoned so any subsequent teardown event short-circuits. It contains
+// only panics raised inside the crate's own closure bodies; a panic raised
+// inside the upstream trampoline itself (before this frame is entered) is out of
+// scope per FR-007.
+// ---------------------------------------------------------------------------
+
+/// The HTTP/3 `H3_INTERNAL_ERROR` application error code, conveyed to the peer
+/// as the abort cause on a panic-contained connection/stream force-close.
+pub(crate) const H3_INTERNAL_ERROR: u64 = 0x0102;
+
+/// Build the internal-error status returned to msquic on a contained panic.
+pub(crate) fn internal_error_status() -> Status {
+    Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)
+}
+
+/// The callback class a contained panic originated in. Retained only as a label
+/// for the structured error event (`report_contained_panic`); the
+/// class-appropriate recovery behavior lives in the `recover` closure passed at
+/// each registration site, not in a `match` on this label inside the guard.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CbClass {
+    Connection,
+    Stream,
+    Listener,
+}
+
+/// The native force-close a panic-recovery action requests through the
+/// injectable [`ShutdownSeam`]. The exact flags are carried here (chosen by the
+/// class `recover`) so the `callback_safety` unit-test double can assert them
+/// without a real native handle: streams abort (`StreamShutdownFlags::ABORT`);
+/// connections have no `ABORT` flag, so the abort is conveyed by the application
+/// `code` alongside `ConnectionShutdownFlags::NONE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForceShutdown {
+    Connection(ConnectionShutdownFlags),
+    Stream(StreamShutdownFlags),
+}
+
+/// Injectable seam for the native force-close performed during callback panic
+/// recovery. In production the seam is the callback-time BORROWED handle ref
+/// (`ConnectionRef`/`StreamRef`), whose `force_shutdown` delegates to the real
+/// FFI `shutdown`; the `callback_safety` unit tests inject a no-op double that
+/// records the request without any native handle. The listener class does not
+/// force-close, so it is wired with [`NoShutdown`].
+pub(crate) trait ShutdownSeam {
+    /// Perform the requested native force-close with the given application code.
+    fn force_shutdown(&self, request: ForceShutdown, code: u64);
+}
+
+/// Production connection seam: the borrowed `ConnectionRef` (auto-derefs to
+/// `Connection`). Acts only on a `Connection` request; a mismatched request
+/// never occurs (the connection `recover` only ever asks for a connection
+/// shutdown) and is a safe no-op.
+impl ShutdownSeam for ConnectionRef {
+    fn force_shutdown(&self, request: ForceShutdown, code: u64) {
+        if let ForceShutdown::Connection(flags) = request {
+            self.shutdown(flags, code);
+        }
+    }
+}
+
+/// Production stream seam: the borrowed `StreamRef` (auto-derefs to `Stream`).
+/// Acts only on a `Stream` request; the fallible native `shutdown` result is
+/// discarded (the handle is being abandoned regardless).
+impl ShutdownSeam for StreamRef {
+    fn force_shutdown(&self, request: ForceShutdown, code: u64) {
+        if let ForceShutdown::Stream(flags) = request {
+            let _ = self.shutdown(flags, code);
+        }
+    }
+}
+
+/// A no-op shutdown seam. Used by the listener registration site (the listener
+/// recover is ownership-aware and never force-closes) and available to tests.
+pub(crate) struct NoShutdown;
+
+impl ShutdownSeam for NoShutdown {
+    fn force_shutdown(&self, _request: ForceShutdown, _code: u64) {}
+}
+
+/// A callback context carrying a panic-poison flag. Once a contained panic has
+/// poisoned the ctx, [`guard_callback`] short-circuits every later event with
+/// the caller-precomputed event-aware disposition instead of dispatching the
+/// body again.
+pub(crate) trait PoisonFlag {
+    fn is_poisoned(&self) -> bool;
+}
+
+/// Emit a structured error event for a contained callback panic. A no-op unless
+/// the `tracing` feature is enabled (no logging dependency is required
+/// otherwise).
+#[cfg(feature = "tracing")]
+pub(crate) fn report_contained_panic(class: CbClass) {
+    tracing::error!(?class, "FFI callback panic contained (SF-E)");
+}
+
+#[cfg(not(feature = "tracing"))]
+pub(crate) fn report_contained_panic(_class: CbClass) {}
+
+/// Run an adapter callback `body` under panic containment (SF-E / FR-007).
+///
+/// BORROW DISCIPLINE (must compile): `body` holds the ONLY `&mut ctx` borrow
+/// while it runs inside `catch_unwind(AssertUnwindSafe(..))`. That borrow ENDS
+/// when `catch_unwind` returns, so `recover` — called only on the `Err` path,
+/// AFTER `catch_unwind` returns — legally re-borrows `&mut ctx`. There is no
+/// overlapping borrow, so neither the (non-`Clone`/`Copy`) handle nor the
+/// ctx-owned senders are captured by value; both the `&mut ctx` and the
+/// callback-time borrowed handle ref are passed as PARAMETERS.
+///
+/// - Already poisoned by a prior contained panic → return the caller-precomputed
+///   event-aware `poisoned_result` (teardown/terminal events → `Ok(())`;
+///   ownership-bearing events → `Err(INTERNAL_ERROR)` so msquic rejects them).
+/// - A real `Err` from the body (e.g. the Phase 2 receive `PENDING`) flows
+///   through unchanged; `recover` is NOT run.
+/// - A caught panic → run `recover(ctx, handle)` (force-close + wake waiters +
+///   poison) and return its status.
+pub(crate) fn guard_callback<C: PoisonFlag>(
+    ctx: &mut C,
+    handle: &dyn ShutdownSeam,
+    poisoned_result: Result<(), Status>,
+    body: impl FnOnce(&mut C) -> Result<(), Status>,
+    recover: impl FnOnce(&mut C, &dyn ShutdownSeam) -> Result<(), Status>,
+) -> Result<(), Status> {
+    if ctx.is_poisoned() {
+        return poisoned_result;
+    }
+    // `body(&mut *ctx)` is a reborrow that lives only for the `catch_unwind`
+    // call; after it returns the borrow is released and `ctx` is free again.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut *ctx))) {
+        Ok(r) => r,
+        Err(_) => recover(ctx, handle),
+    }
+}
+
 /// Shared, thread-safe slot recording *why* a connection terminated.
 ///
 /// Shared between the connection FFI callback (the writer) and the accept
@@ -131,6 +287,14 @@ impl ConnTerminalState {
     fn has_internal(&self) -> bool {
         matches!(self.terminal, Some(ConnectionTerminal::Internal(_)))
     }
+
+    /// Whether a terminal reason has been recorded (regardless of the observed
+    /// freeze state). Read by [`commit_conn`] to freeze the slot *only* when a
+    /// cause is actually present, so an empty slot is never frozen on a
+    /// non-delivery (the commit-on-delivery invariant).
+    fn terminal_is_some(&self) -> bool {
+        self.terminal.is_some()
+    }
 }
 
 /// Record a connection terminal reason into the shared slot.
@@ -141,14 +305,35 @@ fn record_conn_terminal(slot: &ConnTerminalSlot, candidate: ConnectionTerminal) 
 /// Freeze the shared connection terminal slot and return its winner.
 ///
 /// This is the *stream-side* observation point of the SF-7 / T4 refinement rule
-/// (FR-013): a stream's `poll_data` / `poll_ready` / `poll_finish` freezes the
-/// shared connection winner exactly as the accept frontends' [`observe_terminal`]
-/// does, so a provisional cause refined *before* the stream observes surfaces the
-/// refined value, and a refinement attempted *after* observation is rejected.
-/// `None` only if no reason was ever recorded; the stream callback always records
-/// its fallback before signalling the halves, so this is a defensive fallback.
+/// (FR-013), retained for [`H3RecvStream`]'s `poll_data` `Connection` arm only,
+/// where the shared slot is **always populated** at the delivery point (the
+/// stream callback records the connection reason before signalling
+/// `ReceiveEvent::Connection`), so its unconditional `observe()` can never
+/// freeze an empty slot. Every *other* delivery site (send frontends,
+/// stream-open, accept) freezes through [`commit_conn`], which never freezes an
+/// empty slot.
 fn observe_conn_winner(slot: &ConnTerminalSlot) -> Option<ConnectionTerminal> {
     lock_recover(slot).observe()
+}
+
+/// Commit-on-delivery freeze primitive: freeze the shared connection slot **only**
+/// when a cause is actually present, and return it (frozen) for delivery to h3.
+///
+/// This is the single freeze primitive for every h3-facing poll that can surface
+/// a connection cause but is *not* guaranteed to hold one at the delivery point:
+/// the send frontends (via [`SendStreamReceiveCtx::commit_send_winner`]),
+/// [`StreamOpener::poll_open_inner`] and its helpers (SF-C), and the accept
+/// frontends (via [`observe_terminal`], Fix 1). Unlike [`observe_conn_winner`] it
+/// **never** freezes an empty slot: a non-delivery (an empty slot returning a
+/// synthetic internal/unknown error) leaves the slot refinable so a later real
+/// cause can still be recorded and delivered (FR-002 / FR-003).
+fn commit_conn(slot: &ConnTerminalSlot) -> Option<ConnectionTerminal> {
+    let mut g = lock_recover(slot);
+    if g.terminal_is_some() {
+        g.observe() // sets observed = true, returning the frozen cause
+    } else {
+        None
+    }
 }
 
 /// Shared, thread-safe slot recording the sticky *why* a send half terminated.
@@ -301,6 +486,9 @@ struct ConnCtxSender {
     uni: Option<mpsc::UnboundedSender<Option<crate::H3Stream>>>,
     /// Shared connection terminal-reason slot (writer side).
     terminal: ConnTerminalSlot,
+    /// Set by [`connection_recover`] after a contained callback panic (SF-E), so
+    /// [`guard_callback`] short-circuits every subsequent event on this ctx.
+    poisoned: bool,
     /// Connection-scoped test seam that forces an accepted-stream ID resolution
     /// to fail exactly once. Shares its atomic with
     /// [`ConnCtxReceiver::accepted_id_failpoint`] (created once in
@@ -347,6 +535,7 @@ fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
             bidi: Some(bidi_tx),
             uni: Some(uni_tx),
             terminal: terminal.clone(),
+            poisoned: false,
             #[cfg(test)]
             accepted_id_failpoint: accepted_id_failpoint.clone(),
         },
@@ -472,7 +661,11 @@ impl AcceptedIdFailpoint {
     feature = "tracing",
     tracing::instrument(skip(ctx), level = "trace", ret, err)
 )]
-fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> Result<(), Status> {
+fn connection_callback(
+    ctx: &mut ConnCtxSender,
+    ev: msquic::ConnectionEvent,
+    stream_owned: &Cell<bool>,
+) -> Result<(), Status> {
     match ev {
         ConnectionEvent::Connected { .. } => {
             // A duplicate `Connected` (slot already taken) or a dropped receiver
@@ -525,8 +718,14 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
             // and msquic closes the rejected stream itself (single close). On
             // success we take native ownership only NOW.
             let id = accept_stream_id(ctx, query)?;
-            // Success: only NOW take native ownership and attach.
+            // Success: only NOW take native ownership and attach. Mark the
+            // per-invocation ownership token the instant ownership transfers, so a
+            // subsequent panic (e.g. inside `H3Stream::attach`) tells
+            // `connection_recover` the owned stream's Drop already closed it — and
+            // recover must NOT return an Err that would make msquic re-close it
+            // (the `stream_set.c` reject-and-close double-close hazard, F-C).
             let owned = unsafe { msquic::Stream::from_raw(stream.as_raw()) };
+            stream_owned.set(true);
             let h3 = crate::H3Stream::attach(owned, id, ctx.terminal.clone());
             let target = if flags.contains(StreamOpenFlags::UNIDIRECTIONAL) {
                 ctx.uni.as_ref()
@@ -568,8 +767,74 @@ fn connection_callback(ctx: &mut ConnCtxSender, ev: msquic::ConnectionEvent) -> 
     Ok(())
 }
 
+impl PoisonFlag for ConnCtxSender {
+    fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+}
+
+/// Event-aware poison disposition for the connection callback (SF-E). Once the
+/// ctx is poisoned, a `PeerStreamStarted` (ownership-bearing) or any non-teardown
+/// event is rejected with `INTERNAL_ERROR` so msquic does not expect the adapter
+/// to have taken ownership; a `ShutdownComplete` (teardown) is a safe `Ok(())`
+/// no-op (the handle is already force-closed and its waiters already woken).
+fn conn_poison_disp(ev: &ConnectionEvent) -> Result<(), Status> {
+    match ev {
+        ConnectionEvent::ShutdownComplete { .. } => Ok(()),
+        _ => Err(internal_error_status()),
+    }
+}
+
+/// Panic-recovery action for the connection callback (SF-E). Runs only after a
+/// caught panic, once the body's `&mut ctx` borrow has ended. Force-closes the
+/// connection (no `ABORT` flag exists; the abort is conveyed by `code`), records
+/// an internal connection terminal, wakes every connection waiter (connect
+/// one-shot, both accept frontends, the shutdown waiter) so nothing hangs, and
+/// marks the ctx poisoned.
+///
+/// RETURN VALUE is ownership-aware for the `PeerStreamStarted` double-close
+/// hazard (F-C). If a peer stream's native ownership was already taken this
+/// invocation (`stream_owned == true`, i.e. the panic happened AFTER
+/// `Stream::from_raw`, e.g. inside `H3Stream::attach`), the owned stream's Drop
+/// already performed the single `StreamClose`; returning `Ok(())` prevents msquic
+/// from also closing that stream (`core/stream_set.c` reject → `core/stream.c`
+/// double-close assert). Otherwise — a pre-ownership `PeerStreamStarted` failure
+/// or ANY non-ownership-bearing connection event (`stream_owned` stays false) —
+/// return `Err(INTERNAL_ERROR)` so msquic performs the sole rejection/close.
+fn connection_recover(
+    ctx: &mut ConnCtxSender,
+    seam: &dyn ShutdownSeam,
+    stream_owned: &Cell<bool>,
+) -> Result<(), Status> {
+    report_contained_panic(CbClass::Connection);
+    seam.force_shutdown(
+        ForceShutdown::Connection(ConnectionShutdownFlags::NONE),
+        H3_INTERNAL_ERROR,
+    );
+    record_conn_terminal(
+        &ctx.terminal,
+        ConnectionTerminal::Internal("connection callback panicked"),
+    );
+    if let Some(tx) = ctx.connected.take() {
+        let _ = tx.send(Err(internal_error_status()));
+    }
+    // Drop both accept-frontend senders so a parked acceptor observes the
+    // published internal terminal instead of hanging.
+    wake_acceptors(ctx);
+    if let Some(shutdown) = ctx.shutdown.take() {
+        let _ = shutdown.send(());
+    }
+    ctx.poisoned = true;
+    if stream_owned.get() {
+        // Owned peer stream already closed by its Drop; do NOT let msquic
+        // re-close it. The connection is still force-closed above.
+        Ok(())
+    } else {
+        Err(internal_error_status())
+    }
+}
+
 impl Connection {
-    /// Connects to the server.
     ///
     /// The rundown count is reserved synchronously when this is called (before
     /// the returned future is polled), so even a queued/unpolled connect is
@@ -586,8 +851,21 @@ impl Connection {
         let guard = RundownGuard::new(reg.state().clone());
         async move {
             let (mut ctx, mut crx) = conn_ctx_channel();
-            let handler =
-                move |_: ConnectionRef, ev: ConnectionEvent| connection_callback(&mut ctx, ev);
+            let handler = move |conn_ref: ConnectionRef, ev: ConnectionEvent| {
+                let disp = conn_poison_disp(&ev);
+                // Per-invocation peer-stream ownership token (F-C): a fresh `Cell`
+                // per callback so parallel connection callbacks never share it.
+                // Set true right after `PeerStreamStarted`'s `from_raw`; read by
+                // `connection_recover` to stay double-close-safe.
+                let stream_owned = Cell::new(false);
+                guard_callback(
+                    &mut ctx,
+                    &conn_ref,
+                    disp,
+                    |c| connection_callback(c, ev, &stream_owned),
+                    |c, seam| connection_recover(c, seam, &stream_owned),
+                )
+            };
             // Build the ordered handle immediately after `open`, before `start`
             // and before the first await, so every success/error/cancellation
             // path uses ConnHandle's proven ConnectionClose-then-guard drop
@@ -619,8 +897,18 @@ impl Connection {
     /// attach to an accepted connection
     pub(crate) fn attach(inner: msquic::Connection, guard: RundownGuard) -> Self {
         let (mut ctx, crx) = conn_ctx_channel();
-        let handler =
-            move |_: ConnectionRef, ev: ConnectionEvent| connection_callback(&mut ctx, ev);
+        let handler = move |conn_ref: ConnectionRef, ev: ConnectionEvent| {
+            let disp = conn_poison_disp(&ev);
+            // Per-invocation peer-stream ownership token (F-C); see `connect`.
+            let stream_owned = Cell::new(false);
+            guard_callback(
+                &mut ctx,
+                &conn_ref,
+                disp,
+                |c| connection_callback(c, ev, &stream_owned),
+                |c, seam| connection_recover(c, seam, &stream_owned),
+            )
+        };
         inner.set_callback_handler(handler);
         let conn = Arc::new(ConnHandle::new(inner, guard, crx.terminal.clone()));
 
@@ -689,13 +977,18 @@ fn fail_fast_terminal(slot: &ConnTerminalSlot) -> Option<ConnectionErrorIncoming
     None
 }
 
-/// Freeze the terminal slot and convert the recorded reason for h3.
+/// Freeze the terminal slot and convert the recorded reason for h3, committing
+/// on delivery only.
 ///
-/// Called when the incoming-stream channel is drained/closed. A closure with no
-/// recorded reason maps to a defined internal error rather than a synthetic
-/// application close.
+/// Routes through [`commit_conn`], so this is a **committing** accept poll *only
+/// when it actually delivers a cause*: a recorded reason is frozen and converted
+/// exactly as before; an **empty** slot returns a defined internal error
+/// **without** freezing (`observed` stays unset), leaving the slot refinable so a
+/// later real cause can still be recorded and delivered (Fix 1 — FR-002 /
+/// FR-003). This makes the accept path uniform with the send/open/data delivery
+/// points, which all freeze only on genuine delivery.
 fn observe_terminal(slot: &ConnTerminalSlot) -> ConnectionErrorIncoming {
-    match lock_recover(slot).observe() {
+    match commit_conn(slot) {
         Some(t) => convert_conn(t),
         None => ConnectionErrorIncoming::InternalError(
             "connection closed without a terminal reason".to_string(),
@@ -877,8 +1170,9 @@ impl StreamOpener {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<H3Stream, StreamErrorIncoming>> {
         use std::task::Poll;
-        // 1. Fail fast if the connection already published a terminal.
-        if let Some(reason) = peek_conn_terminal(conn.terminal()) {
+        // 1. Fail fast if the connection already published a terminal. A delivery
+        //    of the cause to h3 commits (freezes) it via `commit_conn` (SF-C).
+        if let Some(reason) = commit_conn(conn.terminal()) {
             *holder = None; // drop any in-flight OpeningStream
             return Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: convert_conn(reason),
@@ -889,8 +1183,10 @@ impl StreamOpener {
             match open_exec.submit_open_start(conn, uni) {
                 Ok(opening) => *holder = Some(opening),
                 Err(status) => {
-                    // A shutdown may have raced the open; prefer the terminal.
-                    return Poll::Ready(Err(match peek_conn_terminal(conn.terminal()) {
+                    // A shutdown may have raced the open; prefer the terminal and
+                    // commit it on delivery (SF-C). A `None` (no cause) surfaces the
+                    // raw status as `Unknown` and does NOT freeze the slot.
+                    return Poll::Ready(Err(match commit_conn(conn.terminal()) {
                         Some(reason) => StreamErrorIncoming::ConnectionErrorIncoming {
                             connection_error: convert_conn(reason),
                         },
@@ -932,8 +1228,10 @@ impl StreamOpener {
 ///
 /// A published connection terminal is the true cause; a cancellation with no
 /// recorded reason is a defined internal error, never a synthetic peer code.
+/// Delivering the cause to h3 commits (freezes) it via [`commit_conn`] (SF-C);
+/// the empty-slot internal-error fallback does not freeze.
 fn stream_open_conn_error(slot: &ConnTerminalSlot) -> ConnectionErrorIncoming {
-    match peek_conn_terminal(slot) {
+    match commit_conn(slot) {
         Some(reason) => convert_conn(reason),
         None => ConnectionErrorIncoming::InternalError(
             "stream start cancelled without a terminal reason".to_string(),
@@ -945,14 +1243,16 @@ fn stream_open_conn_error(slot: &ConnTerminalSlot) -> ConnectionErrorIncoming {
 /// or a stream error.
 ///
 /// A failed start prefers a published connection terminal, else surfaces the raw
-/// `Status` as `Unknown`. A successful start validates the ID; an out-of-range
-/// ID is an adapter-internal fault (never `Unknown`).
+/// `Status` as `Unknown`. A delivered connection cause commits (freezes) via
+/// [`commit_conn`] (SF-C); the `Unknown` fallback does not freeze. A successful
+/// start validates the ID; an out-of-range ID is an adapter-internal fault
+/// (never `Unknown`).
 fn classify_start_outcome(
     raw: Result<u64, Status>,
     slot: &ConnTerminalSlot,
 ) -> Result<h3::quic::StreamId, StreamErrorIncoming> {
     match raw {
-        Err(status) => Err(match peek_conn_terminal(slot) {
+        Err(status) => Err(match commit_conn(slot) {
             Some(reason) => StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: convert_conn(reason),
             },
@@ -1115,6 +1415,13 @@ impl SendExec for StreamExecutor {
 trait RecvExec: std::fmt::Debug + Send + Sync {
     /// `Stream::shutdown(ABORT_RECEIVE)` with an already-clamped application code.
     fn submit_stop_sending(&self, code: u64) -> Result<(), Status>;
+    /// Complete a previously pended receive indication on THIS stream (SF-A),
+    /// re-arming its receive callbacks and advancing its flow-control window.
+    /// `len` is always the FULL saved pended-indication length (never a
+    /// drained/partial length). Behind the seam so the per-stream
+    /// pending→complete cycle is deterministically testable. The default is a
+    /// no-op for doubles that never exercise the backpressure cycle.
+    fn submit_receive_complete(&self, _len: u64) {}
 }
 
 /// Production receive-side seam. Owns the `Arc<msquic::Stream>` and issues the
@@ -1128,6 +1435,13 @@ impl RecvExec for RecvStreamExecutor {
     fn submit_stop_sending(&self, code: u64) -> Result<(), Status> {
         self.stream
             .shutdown(StreamShutdownFlags::ABORT_RECEIVE, code)
+    }
+
+    fn submit_receive_complete(&self, len: u64) {
+        // Per-stream, already-bound, thread-safe. msquic tolerates an inline or
+        // concurrent completion issued before/while the RECEIVE callback returns
+        // (lock-free active-call flag), so this is safe from the drain path.
+        self.stream.receive_complete(len);
     }
 }
 
@@ -1192,6 +1506,153 @@ impl StreamOpener {
     }
 }
 
+/// Per-STREAM receive backpressure bound (SF-A / SC-004): the maximum number of
+/// undrained, adapter-buffered received bytes tolerated on a single stream
+/// before its receive callback pends (returns `QUIC_STATUS_PENDING`) instead of
+/// completing the indication. Because a msquic PENDING pauses receive callbacks
+/// for THAT stream only and `receive_complete` re-arms THAT stream, the budget
+/// is tracked per stream, not connection-wide; a connection's adapter receive
+/// memory is therefore bounded by `(MAX_RECV_BUFFER + one in-flight indication)
+/// × the negotiated max concurrent streams`.
+const MAX_RECV_BUFFER: usize = 1024 * 1024; // 1 MiB per stream
+
+/// The single `Mutex`-guarded receive accounting for ONE stream. The buffered
+/// byte counter, the pending flag, and the saved pending-indication length are
+/// all mutated under one lock, so the callback's (increment → decide-pend →
+/// publish) and the drain's (decrement → decide-complete) transitions can never
+/// interleave to underflow the counter or lose a just-published pend.
+#[derive(Debug, Default)]
+struct RecvState {
+    /// Undrained bytes currently sitting in this stream's receive channel.
+    buffered: usize,
+    /// True once this stream returned `QUIC_STATUS_PENDING` and has not yet been
+    /// re-armed via `receive_complete`.
+    pend_outstanding: bool,
+    /// FULL length of the indication that was pended — never a drained or
+    /// partial length. Replayed verbatim to `receive_complete` when the drain
+    /// frees the budget.
+    pending_indication_len: u64,
+    /// Peak `buffered` ever observed on this stream (test/measurement
+    /// observation for the SC-004 bound; must stay ≤ `MAX_RECV_BUFFER` + one
+    /// in-flight indication).
+    peak: usize,
+}
+
+/// Per-stream receive budget, shared (as an `Arc`) between the stream callback
+/// (writer) and the `poll_data` drain (reader). Each local or accepted stream
+/// owns its own independent 1 MiB budget; there is no connection-wide meter. See
+/// [`RecvState`].
+#[derive(Debug, Default)]
+struct RecvBudget {
+    state: Mutex<RecvState>,
+}
+
+/// Outcome of the callback-side [`RecvBudget::admit`] transition.
+enum Admit {
+    /// Bytes published and the stream is within budget: complete normally.
+    Accepted,
+    /// Bytes published and the stream is now at/over budget: the caller must
+    /// return `QUIC_STATUS_PENDING` (the indication is NOT completed yet).
+    Pend,
+    /// Publication failed (the frontend receive half was dropped). The
+    /// `RecvState` mutation was rolled back under the same lock, so accounting is
+    /// exactly as if the indication never arrived; the caller drops the sender
+    /// and issues no pend.
+    PublishFailed,
+}
+
+impl RecvBudget {
+    /// Lock the receive state, recovering a poisoned lock rather than panicking
+    /// (FFI callbacks must never unwind across the msquic boundary).
+    fn lock(&self) -> MutexGuard<'_, RecvState> {
+        lock_recover(&self.state)
+    }
+
+    /// Callback-side single synchronized transition — **accounting BEFORE
+    /// drain-visibility, publish and decision atomic under one lock**. Adds a
+    /// full indication of `total` bytes, decides whether the stream must pend
+    /// (saving this indication's FULL length), and then — still holding the
+    /// lock, as the LAST step — runs `publish` to make the bytes drain-visible.
+    /// `publish` returns `true` on a successful hand-off (or when there is
+    /// nothing to publish). On a failed hand-off (dropped frontend) the entire
+    /// mutation is **rolled back under the same lock** so a concurrent drain can
+    /// never observe stale accounting, and [`Admit::PublishFailed`] is returned.
+    /// Because the publish is the last step, a concurrent drain can never
+    /// subtract before the increment lands.
+    fn admit(&self, total: usize, publish: impl FnOnce() -> bool) -> Admit {
+        let mut st = self.lock();
+        // Snapshot for exact rollback if the publication fails.
+        let prev_buffered = st.buffered;
+        let prev_peak = st.peak;
+        let prev_pend = st.pend_outstanding;
+        let prev_len = st.pending_indication_len;
+
+        st.buffered += total;
+        if st.buffered > st.peak {
+            st.peak = st.buffered;
+        }
+        let pend = st.buffered >= MAX_RECV_BUFFER;
+        if pend {
+            st.pend_outstanding = true;
+            st.pending_indication_len = total as u64;
+        }
+
+        if publish() {
+            if pend { Admit::Pend } else { Admit::Accepted }
+        } else {
+            // Roll the whole transition back: buffered, peak watermark, and the
+            // pend fields all return to their pre-indication values.
+            st.buffered = prev_buffered;
+            st.peak = prev_peak;
+            st.pend_outstanding = prev_pend;
+            st.pending_indication_len = prev_len;
+            Admit::PublishFailed
+        }
+    }
+
+    /// Drain-side single synchronized transition. Subtracts `len` drained bytes
+    /// and, if a pend is outstanding and the budget has fallen below the bound,
+    /// clears the pend and returns the FULL saved indication length to hand to
+    /// `receive_complete` (re-arming the stream). Returns `None` otherwise.
+    fn on_drained(&self, len: usize) -> Option<u64> {
+        let mut st = self.lock();
+        // The publish-last ordering in `admit` guarantees the increment for these
+        // bytes was committed before they became drain-visible, so this can never
+        // underflow. Catch a regression in debug/test builds rather than let
+        // `saturating_sub` silently clamp it.
+        debug_assert!(
+            st.buffered >= len,
+            "recv buffered underflow: buffered={} drained={len}",
+            st.buffered
+        );
+        st.buffered = st.buffered.saturating_sub(len);
+        if st.pend_outstanding && st.buffered < MAX_RECV_BUFFER {
+            st.pend_outstanding = false;
+            let complete = st.pending_indication_len;
+            st.pending_indication_len = 0;
+            Some(complete)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+impl RecvBudget {
+    fn buffered(&self) -> usize {
+        self.lock().buffered
+    }
+    fn peak(&self) -> usize {
+        self.lock().peak
+    }
+    fn pend_outstanding(&self) -> bool {
+        self.lock().pend_outstanding
+    }
+    fn pending_indication_len(&self) -> u64 {
+        self.lock().pending_indication_len
+    }
+}
+
 /// Explicit receive-side event delivered from the stream callback to the
 /// frontend receive half.
 ///
@@ -1209,6 +1670,13 @@ enum ReceiveEvent {
     Reset(u64),
     /// The whole connection terminated with this reason.
     Connection(ConnectionTerminal),
+    /// A STREAM-LOCAL internal adapter failure (e.g. a contained callback panic
+    /// on this stream, SF-E). It maps DIRECTLY to a stream-scoped
+    /// [`ReceiveTerminal::Internal`] and must NOT touch the shared connection
+    /// terminal slot: unlike [`ReceiveEvent::Connection`], it never freezes the
+    /// connection winner, so a later genuine peer/transport connection cause is
+    /// still observed by the accept/open frontends (F-A / MF-1 / SF-C).
+    Internal(&'static str),
 }
 
 struct StreamSendCtx {
@@ -1227,11 +1695,18 @@ struct StreamSendCtx {
     /// points.
     conn_terminal: ConnTerminalSlot,
     receive: Option<mpsc::UnboundedSender<ReceiveEvent>>,
+    /// Per-stream receive backpressure budget (SF-A). The callback (writer)
+    /// commits its accounting and enqueue under this budget's single lock; the
+    /// matching `Arc` in the receive half's ctx drains it.
+    recv_budget: Arc<RecvBudget>,
     /// First-writer-wins guard for the receive scope: once a `Fin`, `Reset`, or
     /// `Connection` terminal has been published, later receive events are
     /// suppressed (e.g. the usual `Receive { FIN }` then `PeerSendShutdown`
     /// sequence must not enqueue a duplicate FIN).
     receive_terminal_sent: bool,
+    /// Set by [`stream_recover`] after a contained callback panic (SF-E), so
+    /// [`guard_callback`] short-circuits every subsequent event on this ctx.
+    poisoned: bool,
 }
 
 /// ctx for receiving data on frontend.
@@ -1256,6 +1731,11 @@ struct RecvStreamReceiveCtx {
     /// Distinct from `terminal` (a peer/connection-caused reason); when set,
     /// `poll_data` returns a clean `Ok(None)` and `terminal` is left untouched.
     receive_closed: bool,
+    /// Per-stream receive backpressure budget (SF-A). The drain (reader)
+    /// decrements it on each delivered `Data` and, when a pend has been freed,
+    /// hands the FULL saved indication length back to `receive_complete`. Shares
+    /// the same `Arc` the callback (writer) accounts against.
+    recv_budget: Arc<RecvBudget>,
 }
 
 /// ctx for sending data on frontend.
@@ -1269,10 +1749,12 @@ struct SendStreamReceiveCtx {
     /// here via the first-writer helper.
     send_terminal: SendTerminalSlot,
     /// Shared connection terminal slot (FR-013). When the send winner is a
-    /// `Connection` terminal, `poll_ready` / `poll_finish` resolve *and freeze*
-    /// this shared slot (via [`SendStreamReceiveCtx::observe_send_winner`]) so the
-    /// send half reports the refined connection cause consistently with the
-    /// receive half and the accept frontends.
+    /// `Connection` terminal, a delivering `poll_ready` / `poll_finish` / `send_data`
+    /// commits *and freezes* this shared slot (via
+    /// [`SendStreamReceiveCtx::commit_send_winner`]) so the send half reports the
+    /// refined connection cause consistently with the receive half and the accept
+    /// frontends; the reducer-input read ([`SendStreamReceiveCtx::resolve_terminal`])
+    /// is non-freezing.
     conn_terminal: ConnTerminalSlot,
     /// Single ordered send-event source (MF-1): data completion, terminal wake,
     /// and finish completion. The reducer observes it only as a [`SendPoll`].
@@ -1295,6 +1777,8 @@ struct PreIdReceivers {
     /// `finalize` so each observation point can resolve+freeze the same winner.
     conn_terminal: ConnTerminalSlot,
     receive: mpsc::UnboundedReceiver<ReceiveEvent>,
+    /// Per-stream receive budget (SF-A), carried into the receive half's ctx.
+    recv_budget: Arc<RecvBudget>,
 }
 
 /// A locally opened stream whose native handle is started but whose h3
@@ -1322,6 +1806,8 @@ struct PreIdTail {
     /// `finalize`.
     conn_terminal: ConnTerminalSlot,
     receive: mpsc::UnboundedReceiver<ReceiveEvent>,
+    /// Per-stream receive budget (SF-A), carried into the receive half's ctx.
+    recv_budget: Arc<RecvBudget>,
 }
 
 impl OpeningStream {
@@ -1339,6 +1825,7 @@ impl OpeningStream {
             send_terminal,
             conn_terminal,
             receive,
+            recv_budget,
         } = tail;
         H3Stream {
             send: H3SendStream {
@@ -1361,6 +1848,7 @@ impl OpeningStream {
                     terminal: None,
                     conn_terminal,
                     receive_closed: false,
+                    recv_budget,
                 },
             },
         }
@@ -1380,6 +1868,7 @@ fn stream_ctx_channel_pre_id(conn_terminal: ConnTerminalSlot) -> (StreamSendCtx,
     let (send_tx, send_rx) = mpsc::unbounded();
     let send_terminal = new_send_terminal_slot();
     let (receive_tx, receive_rx) = mpsc::unbounded();
+    let recv_budget = Arc::new(RecvBudget::default());
     (
         StreamSendCtx {
             start: Some(start_tx),
@@ -1387,7 +1876,9 @@ fn stream_ctx_channel_pre_id(conn_terminal: ConnTerminalSlot) -> (StreamSendCtx,
             send_terminal: send_terminal.clone(),
             conn_terminal: conn_terminal.clone(),
             receive: Some(receive_tx),
+            recv_budget: recv_budget.clone(),
             receive_terminal_sent: false,
+            poisoned: false,
         },
         PreIdReceivers {
             start: start_rx,
@@ -1395,6 +1886,7 @@ fn stream_ctx_channel_pre_id(conn_terminal: ConnTerminalSlot) -> (StreamSendCtx,
             send_terminal,
             conn_terminal,
             receive: receive_rx,
+            recv_budget,
         },
     )
 }
@@ -1426,6 +1918,7 @@ fn stream_ctx_channel_with_conn(
         send_terminal,
         conn_terminal,
         receive,
+        recv_budget,
     } = recv;
     (
         ctx,
@@ -1442,6 +1935,7 @@ fn stream_ctx_channel_with_conn(
             terminal: None,
             conn_terminal,
             receive_closed: false,
+            recv_budget,
         },
     )
 }
@@ -1500,14 +1994,27 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
                 }
             }
         }
-        StreamEvent::Receive { buffers, flags, .. } => {
-            // Enqueue received bytes (if any) BEFORE any terminal marker from
-            // this same notification, so `poll_data` observes data then FIN.
-            // Once a receive terminal has been published, suppress further data.
-            if !ctx.receive_terminal_sent
-                && let Some(receive) = ctx.receive.as_ref()
-            {
-                let mut b = BytesMut::new();
+        StreamEvent::Receive {
+            total_buffer_length,
+            buffers,
+            flags,
+            ..
+        } => {
+            // Full-completion receive backpressure (SF-A). The FULL indication is
+            // ALWAYS copied (no data is ever dropped); the accounting and the
+            // pend decision are committed under the per-stream `RecvState` lock,
+            // and the bytes are made drain-visible as the LAST step of that same
+            // locked transition — so a concurrent drain can never subtract before
+            // the increment lands. When the stream's buffered bytes reach
+            // `MAX_RECV_BUFFER` the event returns `QUIC_STATUS_PENDING` (below) to
+            // pause THIS stream without completing the indication yet.
+            let mut pend = false;
+            if !ctx.receive_terminal_sent && ctx.receive.is_some() {
+                // Pre-sum the buffer lengths for a single right-sized allocation.
+                // msquic reports the same total in `total_buffer_length`.
+                let total: usize = buffers.iter().map(|br| br.as_bytes().len()).sum();
+                debug_assert_eq!(total as u64, *total_buffer_length);
+                let mut b = BytesMut::with_capacity(total);
                 for br in buffers {
                     // skip empty buffs.
                     if !br.as_bytes().is_empty() {
@@ -1515,19 +2022,45 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
                     }
                 }
                 let b = b.freeze();
-                if !b.is_empty() {
-                    // Failed delivery (frontend `H3RecvStream` dropped) drops
-                    // the sender so no further receive events are attempted.
-                    if receive.unbounded_send(ReceiveEvent::Data(b)).is_err() {
+                // ONE synchronized transition: increment → decide-pend (saving
+                // this indication's FULL length) → publish under the lock. On a
+                // failed publication the whole mutation is rolled back inside
+                // `admit`, so a dropped frontend leaves accounting untouched.
+                match ctx.recv_budget.admit(total, || {
+                    // An empty, non-FIN notification produces NO event (Finding
+                    // 8): a zero-length receive is not by itself end-of-stream,
+                    // and counts as a successful (no-op) publication.
+                    if b.is_empty() {
+                        true
+                    } else if let Some(receive) = ctx.receive.as_ref() {
+                        receive.unbounded_send(ReceiveEvent::Data(b)).is_ok()
+                    } else {
+                        false
+                    }
+                }) {
+                    Admit::Pend => pend = true,
+                    Admit::Accepted => {}
+                    Admit::PublishFailed => {
+                        // Failed delivery (frontend `H3RecvStream` dropped): drop
+                        // the sender so no further receive events are attempted,
+                        // and issue NO pend — no receiver means no stuck window,
+                        // and the stream is being torn down regardless. Accounting
+                        // was already rolled back under the lock inside `admit`.
                         ctx.receive.take();
                     }
                 }
-                // An empty, non-FIN notification produces NO event (Finding
-                // 8): a zero-length receive is not by itself an end-of-stream.
             }
             // A FIN flag is a clean end-of-stream marker (peer finished sending).
+            // Preserved even on an over-budget indication: the full indication
+            // (including a FIN) was already copied and enqueued above.
             if flags.contains(ReceiveFlags::FIN) {
                 publish_recv_terminal(ctx, ReceiveEvent::Fin);
+            }
+            // Over-budget: pause THIS stream by pending (the indication is NOT
+            // completed until the drain frees the budget and calls
+            // `receive_complete` with the FULL saved length).
+            if pend {
+                return Err(Status::new(StatusCode::QUIC_STATUS_PENDING));
             }
         }
         StreamEvent::PeerSendShutdown => {
@@ -1596,6 +2129,63 @@ fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Result<(), Statu
     Ok(())
 }
 
+impl PoisonFlag for StreamSendCtx {
+    fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+}
+
+/// Event-aware poison disposition for the stream callback (SF-E). Once the ctx
+/// is poisoned, a `ShutdownComplete` (teardown) is a safe `Ok(())` no-op — the
+/// handle is already force-closed and its waiters woken, and re-running teardown
+/// could only double-complete the Phase 2 receive state — while any other event
+/// is conservatively rejected with `INTERNAL_ERROR`.
+fn stream_poison_disp(ev: &StreamEvent) -> Result<(), Status> {
+    match ev {
+        StreamEvent::ShutdownComplete { .. } => Ok(()),
+        _ => Err(internal_error_status()),
+    }
+}
+
+/// Panic-recovery action for the stream callback (SF-E). Runs only after a
+/// caught panic, once the body's `&mut ctx` borrow has ended. Force-closes the
+/// stream (`StreamShutdownFlags::ABORT`), publishes an internal send terminal and
+/// an internal receive terminal and wakes both halves (plus any pending
+/// `StartComplete` opener), so no send/receive/open waiter hangs; the `poisoned`
+/// short-circuit then prevents a follow-up teardown callback from re-touching the
+/// Phase 2 receive state. Marks the ctx poisoned and returns `INTERNAL_ERROR`.
+fn stream_recover(ctx: &mut StreamSendCtx, seam: &dyn ShutdownSeam) -> Result<(), Status> {
+    report_contained_panic(CbClass::Stream);
+    seam.force_shutdown(
+        ForceShutdown::Stream(StreamShutdownFlags::ABORT),
+        H3_INTERNAL_ERROR,
+    );
+    // Wake the send half: publish an internal send terminal, wake it through the
+    // single ordered channel, then close the channel.
+    publish_send(
+        &ctx.send_terminal,
+        SendTerminal::Internal("stream callback panicked"),
+    );
+    if let Some(send) = ctx.send.as_ref() {
+        let _ = send.unbounded_send(SendEvent::TerminalWake);
+    }
+    ctx.send.take();
+    // Wake the receive half with a STREAM-LOCAL internal terminal
+    // (first-writer-wins; a real terminal already published wins). This uses the
+    // stream-scoped `ReceiveEvent::Internal` — NOT a `Connection` event — so it
+    // never freezes the shared connection slot on the EMPTY value; a later
+    // genuine peer/transport connection cause is still delivered to the frontends
+    // (F-A / MF-1 / SF-C).
+    publish_recv_terminal(ctx, ReceiveEvent::Internal("stream callback panicked"));
+    // Resolve a still-pending `StartComplete` opener so `poll_open_inner` fails
+    // fast instead of hanging.
+    if let Some(start) = ctx.start.take() {
+        let _ = start.send(Err(internal_error_status()));
+    }
+    ctx.poisoned = true;
+    Err(internal_error_status())
+}
+
 /// Publish a receive-side terminal event under first-writer-wins.
 ///
 /// The first `Fin`/`Reset`/`Connection` wins and suppresses later receive
@@ -1627,7 +2217,16 @@ impl H3Stream {
         conn_terminal: ConnTerminalSlot,
     ) -> Self {
         let (mut ctx, recv) = stream_ctx_channel_pre_id(conn_terminal);
-        let handler = move |_: StreamRef, ev: StreamEvent| stream_callback(&mut ctx, ev);
+        let handler = move |stream_ref: StreamRef, ev: StreamEvent| {
+            let disp = stream_poison_disp(&ev);
+            guard_callback(
+                &mut ctx,
+                &stream_ref,
+                disp,
+                |c| stream_callback(c, ev),
+                stream_recover,
+            )
+        };
         stream.set_callback_handler(handler);
         // The ID is known, so finalize straight away. An accepted stream never
         // receives `StartComplete`, so its `start` receiver simply drops.
@@ -1639,6 +2238,7 @@ impl H3Stream {
                 send_terminal: recv.send_terminal,
                 conn_terminal: recv.conn_terminal,
                 receive: recv.receive,
+                recv_budget: recv.recv_budget,
             },
         }
         .finalize(id)
@@ -1653,7 +2253,16 @@ impl H3Stream {
     )]
     fn open_and_start(conn: &ConnHandle, uni: bool) -> Result<OpeningStream, Status> {
         let (mut ctx, recv) = stream_ctx_channel_pre_id(conn.terminal().clone());
-        let handler = move |_: StreamRef, ev: StreamEvent| stream_callback(&mut ctx, ev);
+        let handler = move |stream_ref: StreamRef, ev: StreamEvent| {
+            let disp = stream_poison_disp(&ev);
+            guard_callback(
+                &mut ctx,
+                &stream_ref,
+                disp,
+                |c| stream_callback(c, ev),
+                stream_recover,
+            )
+        };
 
         let flag = match uni {
             true => StreamOpenFlags::UNIDIRECTIONAL,
@@ -1671,6 +2280,7 @@ impl H3Stream {
                 send_terminal: recv.send_terminal,
                 conn_terminal: recv.conn_terminal,
                 receive: recv.receive,
+                recv_budget: recv.recv_budget,
             },
         })
     }
@@ -1693,8 +2303,10 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         // purely from non-consuming state: a published terminal winner is surfaced;
         // otherwise the finish-after-poll_ready misuse (non-sticky).
         if self.sctx.reducer.finish_started {
-            return match self.sctx.observe_send_winner() {
-                Some(w) => Poll::Ready(Err(convert_send(w))),
+            return match self.sctx.resolve_terminal() {
+                // Delivery point: commit (freeze) a connection cause before it is
+                // returned to h3.
+                Some(w) => Poll::Ready(Err(convert_send(self.sctx.commit_send_winner(w)))),
                 None => Poll::Ready(Err(convert_send(SendTerminal::Internal(
                     "poll_ready after finish",
                 )))),
@@ -1703,13 +2315,16 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         // First input polls the channel; subsequent inputs are fed results.
         let mut input = SendInput::PollReady {
             poll: self.poll_send_channel(cx),
-            terminal: self.sctx.observe_send_winner(),
+            terminal: self.sctx.resolve_terminal(),
         };
         loop {
             match transition(&mut self.sctx.reducer, input) {
                 SendCommand::Pending => return Poll::Pending, // waker already registered
                 SendCommand::ReturnReady => return Poll::Ready(Ok(())),
-                SendCommand::ReturnError(t) => return Poll::Ready(Err(convert_send(t))),
+                SendCommand::ReturnError(t) => {
+                    // Delivery point: commit the connection slot on the way out.
+                    return Poll::Ready(Err(convert_send(self.sctx.commit_send_winner(t))));
+                }
                 SendCommand::RepollReady => {
                     // Re-poll the channel in THIS call so a synchronously-queued
                     // paired terminal / channel close (the closure point) is drained
@@ -1717,7 +2332,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
                     // (MF-2) is never returned to the caller.
                     input = SendInput::PollReady {
                         poll: self.poll_send_channel(cx),
-                        terminal: self.sctx.observe_send_winner(),
+                        terminal: self.sctx.resolve_terminal(),
                     };
                 }
                 SendCommand::PublishTerminal {
@@ -1755,13 +2370,16 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         let payload = classify_payload(wb.remaining());
         let mut input = SendInput::SendRequested {
             payload,
-            terminal: self.sctx.observe_send_winner(),
+            terminal: self.sctx.resolve_terminal(),
         };
         loop {
             match transition(&mut self.sctx.reducer, input) {
                 SendCommand::ReturnSent => return Ok(()),
                 SendCommand::ReturnImmediateError(e) => return Err(convert_send_op(e)),
-                SendCommand::ReturnError(t) => return Err(convert_send(t)),
+                SendCommand::ReturnError(t) => {
+                    // Delivery point: commit the connection slot on the way out.
+                    return Err(convert_send(self.sctx.commit_send_winner(t)));
+                }
                 SendCommand::SubmitSend => {
                     // The single production copy path: materialize the complete
                     // wire representation into owned `Bytes` while `B` is still on
@@ -1773,7 +2391,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
                     let res = self.exec.submit_send(buf);
                     input = SendInput::SendSubmitted {
                         result: res,
-                        terminal: self.sctx.observe_send_winner(),
+                        terminal: self.sctx.resolve_terminal(),
                     };
                 }
                 SendCommand::PublishTerminal {
@@ -1807,18 +2425,23 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         use std::task::Poll;
         let mut input = SendInput::PollFinish {
             poll: self.poll_send_channel(cx),
-            terminal: self.sctx.observe_send_winner(),
+            terminal: self.sctx.resolve_terminal(),
         };
         loop {
             match transition(&mut self.sctx.reducer, input) {
                 SendCommand::Pending => return Poll::Pending,
                 SendCommand::ReturnFinished => return Poll::Ready(Ok(())),
-                SendCommand::ReturnError(t) => return Poll::Ready(Err(convert_send(t))),
+                SendCommand::ReturnError(t) => {
+                    // Delivery point: commit the connection slot on the way out.
+                    // A graceful `ReturnFinished` never reaches here, so a
+                    // provisional cause prepared as input is never committed (MF-2).
+                    return Poll::Ready(Err(convert_send(self.sctx.commit_send_winner(t))));
+                }
                 SendCommand::SubmitGraceful => {
                     let res = self.exec.submit_graceful();
                     input = SendInput::GracefulSubmitted {
                         result: res,
-                        terminal: self.sctx.observe_send_winner(),
+                        terminal: self.sctx.resolve_terminal(),
                     };
                 }
                 SendCommand::RepollFinish => {
@@ -1827,7 +2450,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
                     // defer to a later poll (that recreates the lost-waker bug).
                     input = SendInput::PollFinish {
                         poll: self.poll_send_channel(cx),
-                        terminal: self.sctx.observe_send_winner(),
+                        terminal: self.sctx.resolve_terminal(),
                     };
                 }
                 SendCommand::PublishTerminal {
@@ -1859,14 +2482,14 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         // reset reservation. A callback-published peer/connection terminal wins
         // over this local reset (no second native op).
         //
-        // `reset()` returns NO observable terminal to the caller, so it must read
-        // the send winner WITHOUT freezing the shared connection slot
-        // (`peek_send_winner`, not `observe_send_winner`): freezing here would
-        // prematurely retain a provisional `LocalClose` over a later peer/transport
-        // refinement that a subsequent genuine caller observation should surface.
+        // `reset()` returns NO observable terminal to the caller, so it reads the
+        // send winner through the non-freezing `resolve_terminal` and NEVER commits
+        // the shared connection slot: freezing here would prematurely retain a
+        // provisional `LocalClose` over a later peer/transport refinement that a
+        // subsequent genuine caller observation should surface.
         let mut input = SendInput::Reset {
             code: clamp_application_code(reset_code),
-            terminal: self.sctx.peek_send_winner(),
+            terminal: self.sctx.resolve_terminal(),
         };
         loop {
             match transition(&mut self.sctx.reducer, input) {
@@ -1876,7 +2499,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
                     input = SendInput::ResetSubmitted {
                         code: c,
                         result: res,
-                        terminal: self.sctx.peek_send_winner(),
+                        terminal: self.sctx.resolve_terminal(),
                     };
                 }
                 SendCommand::PublishTerminal {
@@ -1918,44 +2541,58 @@ impl H3SendStream {
 }
 
 impl SendStreamReceiveCtx {
-    /// Load the current send winner, resolving a CONNECTION-caused terminal
-    /// against the SHARED connection slot at this send observation point (FR-013).
+    /// Load the current send winner **without freezing** the shared connection
+    /// slot, resolving connection precedence for every send-slot state so a
+    /// recorded connection cause is never masked (the MF-1 fix).
     ///
-    /// When the send winner is a [`SendTerminal::Connection`], the shared
-    /// connection slot is resolved *and frozen* (the same freeze-on-observation
-    /// the accept frontends and `poll_data` apply), so `poll_ready` / `poll_finish`
-    /// report the REFINED connection cause and a later refinement is rejected. The
-    /// carried reason is only a defensive fallback if the shared slot was never
-    /// recorded. A non-connection winner (a peer `Stopped`, a `LocalReset`, an
-    /// internal fault, or the send-scoped provisional marker) is returned
-    /// unchanged and never freezes the connection slot — keeping send-scope and
-    /// connection-scope separation intact.
-    fn observe_send_winner(&self) -> Option<SendTerminal> {
-        match load_winner(&self.send_terminal)? {
-            SendTerminal::Connection(fallback) => Some(SendTerminal::Connection(
-                observe_conn_winner(&self.conn_terminal).unwrap_or(fallback),
+    /// This is the single, non-freezing reducer-input read for all four send
+    /// frontends (`send_data`, `poll_ready`, `poll_finish`, `reset`). It defines
+    /// the connection-fallback precedence:
+    /// - `Some(Connection(fallback))` → the connection marker enriched from the
+    ///   shared slot (`peek_conn_terminal`), the carried reason only a defensive
+    ///   fallback;
+    /// - `None` → **MF-1 fallback**: a recorded connection cause is surfaced as
+    ///   `Connection(cause)`, so an immediate native error in the window before the
+    ///   stream callback publishes its marker still delivers the specific cause;
+    /// - `Some(ProvisionalAbort)` → **provisional-winner fallback**: a recorded
+    ///   connection cause takes precedence over the still-refinable provisional
+    ///   marker (returned as `Connection(cause)`); with no connection cause the
+    ///   provisional marker is kept (never surfaced, still refinable);
+    /// - `Some(other)` (authoritative `Stopped` / `LocalReset` / `Failed` /
+    ///   `Internal`) → returned unchanged.
+    ///
+    /// The rule: peek the shared connection slot as a fallback whenever the send
+    /// slot does not already hold an authoritative send-scope winner. Freezing is
+    /// deferred to [`Self::commit_send_winner`] at the delivery point.
+    fn resolve_terminal(&self) -> Option<SendTerminal> {
+        match load_winner(&self.send_terminal) {
+            Some(SendTerminal::Connection(fallback)) => Some(SendTerminal::Connection(
+                peek_conn_terminal(&self.conn_terminal).unwrap_or(fallback),
             )),
-            other => Some(other),
+            Some(SendTerminal::ProvisionalAbort) => match peek_conn_terminal(&self.conn_terminal) {
+                Some(reason) => Some(SendTerminal::Connection(reason)),
+                None => Some(SendTerminal::ProvisionalAbort),
+            },
+            None => peek_conn_terminal(&self.conn_terminal).map(SendTerminal::Connection),
+            other => other,
         }
     }
 
-    /// Non-freezing counterpart of [`Self::observe_send_winner`] for INTERNAL,
-    /// non-caller-observing winner reads (notably `reset()` bookkeeping).
+    /// Commit-on-delivery: freeze the shared connection slot at the exact point a
+    /// connection cause is returned to h3, and only when a cause is present.
     ///
-    /// Resolves a CONNECTION-caused send winner against the shared connection
-    /// slot with a non-freezing [`peek_conn_terminal`] read, so the shared slot
-    /// is NOT frozen. `reset()` returns no observable terminal to the caller, so
-    /// freezing there would be premature: a provisional connection `LocalClose`
-    /// followed by `reset()` and a later peer refinement would wrongly retain the
-    /// stale `LocalClose`. Freeze-on-observation stays exclusive to genuine caller
-    /// observation points (`poll_data` / `poll_ready` / `poll_finish`). Non-connection
-    /// winners are returned unchanged, identically to `observe_send_winner`.
-    fn peek_send_winner(&self) -> Option<SendTerminal> {
-        match load_winner(&self.send_terminal)? {
-            SendTerminal::Connection(fallback) => Some(SendTerminal::Connection(
-                peek_conn_terminal(&self.conn_terminal).unwrap_or(fallback),
-            )),
-            other => Some(other),
+    /// A [`SendTerminal::Connection`] winner is resolved+frozen through
+    /// [`commit_conn`] (the carried reason only a defensive fallback if the shared
+    /// slot was somehow never recorded); every other winner is returned unchanged
+    /// and never freezes the connection slot, keeping send-scope and
+    /// connection-scope separation intact. `reset()` returns no observable terminal
+    /// and therefore never calls this (never freezes) — the MF-2 fix.
+    fn commit_send_winner(&self, w: SendTerminal) -> SendTerminal {
+        match w {
+            SendTerminal::Connection(fallback) => {
+                SendTerminal::Connection(commit_conn(&self.conn_terminal).unwrap_or(fallback))
+            }
+            other => other,
         }
     }
 }
@@ -2019,6 +2656,15 @@ impl RecvStreamReceiveCtx {
                 let winner = observe_conn_winner(&self.conn_terminal).unwrap_or(fallback);
                 self.store_and_convert(ReceiveTerminal::Connection(winner))
             }
+            // A STREAM-LOCAL internal fault (e.g. a contained callback panic on
+            // this stream). It maps DIRECTLY to a stream-scoped
+            // `ReceiveTerminal::Internal` and deliberately does NOT call
+            // `observe_conn_winner`, so it never freezes the shared connection
+            // slot on the EMPTY value — a later genuine connection cause is still
+            // delivered to the accept/open frontends (F-A / MF-1 / SF-C).
+            Some(ReceiveEvent::Internal(msg)) => {
+                self.store_and_convert(ReceiveTerminal::Internal(msg))
+            }
             // A closed channel without an explicit terminal event is an internal
             // fault, not a clean end-of-stream.
             None => self.store_and_convert(ReceiveTerminal::Internal(
@@ -2048,7 +2694,19 @@ impl RecvStream for H3RecvStream {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-        self.rctx.poll_event(cx)
+        let polled = self.rctx.poll_event(cx);
+        // On delivering `Data(b)` of length L, perform ONE `RecvState` locked
+        // transition: `buffered -= L` → decide-complete. If a pend is
+        // outstanding and buffered has fallen below the bound, complete the
+        // pended indication on THIS stream with its FULL saved length (never the
+        // drained length), re-arming its receive callbacks and reopening its
+        // flow-control window (SF-A).
+        if let std::task::Poll::Ready(Ok(Some(b))) = &polled
+            && let Some(len) = self.rctx.recv_budget.on_drained(b.len())
+        {
+            self.exec.submit_receive_complete(len);
+        }
+        polled
     }
 
     /// Stop accepting data. Discard unread data, notify peer to not send.
@@ -2335,7 +2993,15 @@ mod test {
             .expect("wait_idle should resolve after the connection closed");
     }
 
+    /// Manual-only external smoke check (MF-3): drives a real HTTP/3 GET against a
+    /// public third-party endpoint (`h2o.examp1e.net`). It depends on DNS, remote
+    /// uptime, and ALPN/cert behavior, so it is `#[ignore]`d to keep the default
+    /// suite hermetic. Run it explicitly with
+    /// `cargo test --no-default-features --features native-find -- --ignored client_test_apache`
+    /// when networking is available. The loopback `conformance` suite covers the
+    /// client path hermetically.
     #[test]
+    #[ignore = "requires external internet access (h2o.examp1e.net); run manually with --ignored"]
     fn client_test_apache() {
         util::try_setup_tracing();
         // This does not work (cloudflare servers):
@@ -2377,7 +3043,7 @@ mod callback_safety {
         };
         // The fallible send returns Err internally; the callback must not panic
         // and must return Ok across the FFI boundary.
-        assert!(connection_callback(&mut ctx, ev).is_ok());
+        assert!(connection_callback(&mut ctx, ev, &std::cell::Cell::new(false)).is_ok());
         // The one-shot slot was consumed exactly once.
         assert!(ctx.connected.is_none());
     }
@@ -2414,6 +3080,545 @@ mod callback_safety {
         let g = lock_recover(&m);
         assert_eq!(*g, 42);
     }
+
+    // ── FFI callback panic containment (SF-E / FR-007) ──────────────────────
+    //
+    // These are HERMETIC: no `Registration`, no port, no native endpoint. The
+    // native force-close is routed through the injectable [`ShutdownSeam`], so a
+    // recording no-op double stands in for the real `StreamRef`/`ConnectionRef`.
+
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::error::{SendEvent, SendTerminal};
+    use crate::msquic::{ConnectionShutdownFlags, Status, StatusCode, StreamShutdownFlags};
+    use crate::{
+        ForceShutdown, H3_INTERNAL_ERROR, PoisonFlag, ReceiveEvent, ShutdownSeam, conn_poison_disp,
+        connection_recover, guard_callback, load_winner, new_conn_terminal_slot,
+        stream_ctx_channel_pre_id, stream_poison_disp, stream_recover,
+    };
+
+    fn is_internal_err(r: &Result<(), Status>) -> bool {
+        matches!(r, Err(s) if s.0 == Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR).0)
+    }
+
+    fn is_status(r: &Result<(), Status>, code: StatusCode) -> bool {
+        matches!(r, Err(s) if s.0 == Status::new(code).0)
+    }
+
+    /// A no-op [`ShutdownSeam`] double recording every force-close request, so a
+    /// unit test can assert the exact flags/code without a native handle.
+    #[derive(Default)]
+    struct RecordingSeam {
+        calls: RefCell<Vec<(ForceShutdown, u64)>>,
+    }
+
+    impl ShutdownSeam for RecordingSeam {
+        fn force_shutdown(&self, request: ForceShutdown, code: u64) {
+            self.calls.borrow_mut().push((request, code));
+        }
+    }
+
+    /// A minimal poison-carrying ctx for direct `guard_callback` unit tests.
+    struct TestCtx {
+        poisoned: bool,
+    }
+    impl PoisonFlag for TestCtx {
+        fn is_poisoned(&self) -> bool {
+            self.poisoned
+        }
+    }
+
+    #[test]
+    fn guard_callback_passes_through_results_without_recovering() {
+        // Ok flows through; recover never runs, ctx never poisoned.
+        let mut ctx = TestCtx { poisoned: false };
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            Ok(()),
+            |_c| Ok(()),
+            |_c, _s| panic!("recover must NOT run for a real body result"),
+        );
+        assert!(got.is_ok());
+        assert!(!ctx.poisoned);
+
+        // A real Err (INTERNAL) flows through unchanged.
+        let mut ctx = TestCtx { poisoned: false };
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            Ok(()),
+            |_c| Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c, _s| panic!("recover must NOT run for a real body result"),
+        );
+        assert!(is_internal_err(&got));
+        assert!(!ctx.poisoned);
+
+        // The Phase 2 receive PENDING is a real Err and flows through unchanged.
+        let mut ctx = TestCtx { poisoned: false };
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            Ok(()),
+            |_c| Err(Status::new(StatusCode::QUIC_STATUS_PENDING)),
+            |_c, _s| panic!("recover must NOT run for a real body result"),
+        );
+        assert!(is_status(&got, StatusCode::QUIC_STATUS_PENDING));
+        assert!(!ctx.poisoned);
+    }
+
+    #[test]
+    fn guard_callback_runs_recover_once_on_panic() {
+        let mut ctx = TestCtx { poisoned: false };
+        let ran = RefCell::new(0u32);
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            Ok(()),
+            |_c| panic!("boom in body"),
+            |c: &mut TestCtx, _s| {
+                *ran.borrow_mut() += 1;
+                c.poisoned = true;
+                Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR))
+            },
+        );
+        assert!(is_internal_err(&got), "recover status is surfaced");
+        assert_eq!(*ran.borrow(), 1, "recover runs exactly once");
+        assert!(ctx.poisoned);
+    }
+
+    #[test]
+    fn guard_callback_poisoned_returns_disposition_without_body() {
+        // Poisoned + teardown disposition Ok → Ok, body not run.
+        let mut ctx = TestCtx { poisoned: true };
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            Ok(()),
+            |_c| panic!("body must NOT run when poisoned"),
+            |_c, _s| panic!("recover must NOT run when poisoned"),
+        );
+        assert!(got.is_ok());
+
+        // Poisoned + ownership-bearing disposition Err → Err, body not run.
+        let mut ctx = TestCtx { poisoned: true };
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c| panic!("body must NOT run when poisoned"),
+            |_c, _s| panic!("recover must NOT run when poisoned"),
+        );
+        assert!(is_internal_err(&got));
+    }
+
+    #[test]
+    fn connection_callback_panic_is_contained() {
+        let (mut ctx, mut crx) = conn_ctx_channel();
+        let seam = RecordingSeam::default();
+        // A panicking body is contained: process survives (test completes), the
+        // connection is force-closed via the seam, and Err(INTERNAL_ERROR) returns.
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            conn_poison_disp(&ConnectionEvent::Connected {
+                session_resumed: false,
+                negotiated_alpn: &[],
+            }),
+            |_c| panic!("boom in connection callback"),
+            |c, seam| connection_recover(c, seam, &Cell::new(false)),
+        );
+        assert!(is_internal_err(&got));
+        assert_eq!(
+            *seam.calls.borrow(),
+            vec![(
+                ForceShutdown::Connection(ConnectionShutdownFlags::NONE),
+                H3_INTERNAL_ERROR
+            )],
+            "connection force-close uses NONE + H3_INTERNAL_ERROR"
+        );
+        assert!(ctx.poisoned, "ctx is poisoned after a contained panic");
+        // Waiter-wake regression: the connect one-shot is resolved with a failure
+        // rather than left hanging.
+        let mut woken = crx.connected.take().expect("connect waiter present");
+        match woken.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("connect waiter should observe a failure, got {other:?}"),
+        }
+        // Both accept frontends were dropped (a parked acceptor observes closure).
+        assert!(ctx.bidi.is_none() && ctx.uni.is_none());
+    }
+
+    #[test]
+    fn connection_poison_short_circuit_is_event_aware() {
+        // After a contained panic poisons the ctx, a teardown event short-circuits
+        // to Ok (no-op) and a non-teardown (ownership-bearing) event to Err.
+        let (mut ctx, _crx) = conn_ctx_channel();
+        let _ = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            conn_poison_disp(&ConnectionEvent::Connected {
+                session_resumed: false,
+                negotiated_alpn: &[],
+            }),
+            |_c| panic!("boom"),
+            |c, seam| connection_recover(c, seam, &Cell::new(false)),
+        );
+        assert!(ctx.poisoned);
+
+        // Teardown (ShutdownComplete) → Ok, body not run.
+        let teardown = ConnectionEvent::ShutdownComplete {
+            handshake_completed: false,
+            peer_acknowledged_shutdown: false,
+            app_close_in_progress: false,
+        };
+        assert!(conn_poison_disp(&teardown).is_ok());
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            conn_poison_disp(&teardown),
+            |_c| panic!("body must NOT run when poisoned"),
+            |c, seam| connection_recover(c, seam, &Cell::new(false)),
+        );
+        assert!(got.is_ok());
+
+        // Non-teardown event → Err (msquic rejects). `PeerStreamStarted` cannot be
+        // forged hermetically (it carries a native `StreamRef`); its Err mapping is
+        // the same `_ => Err` catch-all exercised here via `Connected`.
+        let ownership_like = ConnectionEvent::Connected {
+            session_resumed: false,
+            negotiated_alpn: &[],
+        };
+        assert!(is_internal_err(&conn_poison_disp(&ownership_like)));
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            conn_poison_disp(&ownership_like),
+            |_c| panic!("body must NOT run when poisoned"),
+            |c, seam| connection_recover(c, seam, &Cell::new(false)),
+        );
+        assert!(is_internal_err(&got));
+    }
+
+    #[test]
+    fn connection_teardown_body_panic_is_contained_and_wakes_waiters() {
+        // A panic while handling a TEARDOWN event (ShutdownComplete) is still
+        // contained: recover force-closes, wakes the connect waiter, and poisons
+        // the ctx — so a task parked on the connect one-shot cannot hang. A
+        // subsequent teardown then short-circuits to Ok WITHOUT re-running the
+        // body, so Phase 2 terminal state is never double-completed.
+        let (mut ctx, mut crx) = conn_ctx_channel();
+        let seam = RecordingSeam::default();
+        let teardown = ConnectionEvent::ShutdownComplete {
+            handshake_completed: false,
+            peer_acknowledged_shutdown: false,
+            app_close_in_progress: false,
+        };
+        // First event: ctx not yet poisoned, so the body runs and panics.
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            conn_poison_disp(&teardown),
+            |_c| panic!("boom while handling ShutdownComplete"),
+            |c, seam| connection_recover(c, seam, &Cell::new(false)),
+        );
+        assert!(is_internal_err(&got));
+        assert_eq!(
+            *seam.calls.borrow(),
+            vec![(
+                ForceShutdown::Connection(ConnectionShutdownFlags::NONE),
+                H3_INTERNAL_ERROR
+            )],
+            "teardown-body panic still force-closes once"
+        );
+        assert!(
+            ctx.poisoned,
+            "ctx is poisoned after a contained teardown panic"
+        );
+        // Waiter-wake: the connect one-shot is resolved with a failure, not hung.
+        let mut woken = crx.connected.take().expect("connect waiter present");
+        match woken.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("connect waiter should observe a failure, got {other:?}"),
+        }
+        // A subsequent teardown short-circuits to Ok WITHOUT running the body or
+        // recover again — no double force-close, no double-completion.
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            conn_poison_disp(&teardown),
+            |_c| panic!("body must NOT run on teardown after poison"),
+            |c, seam| connection_recover(c, seam, &Cell::new(false)),
+        );
+        assert!(got.is_ok());
+        assert_eq!(
+            seam.calls.borrow().len(),
+            1,
+            "no second force-close after poison short-circuit"
+        );
+    }
+
+    /// RAII stand-in for the owned peer `Stream` that `Stream::from_raw` hands to
+    /// `H3Stream::attach` on `PeerStreamStarted`. Its `Drop` increments a shared
+    /// counter, mirroring how the real owned `Stream`'s `Drop` performs the single
+    /// native `StreamClose`. Constructing one models `from_raw` taking ownership;
+    /// the unwind dropping it models the close — so the close is directly
+    /// OBSERVABLE (counter), not merely inferred from the recover return value.
+    struct OwnedStreamStandIn(Arc<AtomicUsize>);
+    impl Drop for OwnedStreamStandIn {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn connection_peer_stream_panic_before_from_raw_rejects() {
+        // F-C: a `PeerStreamStarted` panic BEFORE `Stream::from_raw` never took
+        // native stream ownership, so no owned stand-in exists (close == 0) and
+        // `connection_recover` returns Err — msquic performs the single stream
+        // reject. The connection is still force-closed and its waiters woken.
+        let (mut ctx, mut crx) = conn_ctx_channel();
+        let seam = RecordingSeam::default();
+        // Per-invocation peer-stream ownership token, never shared with the ctx.
+        let stream_owned = Cell::new(false);
+        let closes = Arc::new(AtomicUsize::new(0));
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c| {
+                // Ownership never transferred: from_raw never runs, no stand-in.
+                let _keep_alive = &closes;
+                panic!("boom before PeerStreamStarted from_raw");
+            },
+            |c, seam| connection_recover(c, seam, &stream_owned),
+        );
+        // No stream ownership → Err: msquic performs the sole stream reject.
+        assert!(
+            is_internal_err(&got),
+            "pre-ownership PeerStreamStarted panic → Err (single msquic reject)"
+        );
+        assert_eq!(
+            closes.load(Ordering::Relaxed),
+            0,
+            "no owned stream stand-in exists, so zero close occurs"
+        );
+        // The connection itself is still force-closed exactly once.
+        assert_eq!(
+            *seam.calls.borrow(),
+            vec![(
+                ForceShutdown::Connection(ConnectionShutdownFlags::NONE),
+                H3_INTERNAL_ERROR
+            )],
+            "connection is force-closed once regardless of stream ownership"
+        );
+        assert!(ctx.poisoned);
+        // Connection waiters woken so a parked connect/accept task cannot hang.
+        let mut woken = crx.connected.take().expect("connect waiter present");
+        match woken.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("connect waiter should observe a failure, got {other:?}"),
+        }
+        assert!(ctx.bidi.is_none() && ctx.uni.is_none());
+    }
+
+    #[test]
+    fn connection_peer_stream_panic_after_from_raw_does_not_reject() {
+        // F-C: a `PeerStreamStarted` panic AFTER `Stream::from_raw` (e.g. inside
+        // `H3Stream::attach`) already took native stream ownership — the owned
+        // stream's Drop performs the single `StreamClose` (close == 1). msquic must
+        // NOT re-close it, so `connection_recover` returns Ok (no double-close),
+        // while still force-closing the CONNECTION and waking its waiters.
+        let (mut ctx, mut crx) = conn_ctx_channel();
+        let seam = RecordingSeam::default();
+        let stream_owned = Cell::new(false);
+        let closes = Arc::new(AtomicUsize::new(0));
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c| {
+                // Emulate from_raw taking stream ownership: construct the owned
+                // stand-in and mark the token the instant it transfers. The named
+                // binding lives until the panic, so the unwind's Drop performs the
+                // single close (counter += 1).
+                let _owned_stream = OwnedStreamStandIn(closes.clone());
+                stream_owned.set(true);
+                panic!("boom after PeerStreamStarted from_raw");
+            },
+            |c, seam| connection_recover(c, seam, &stream_owned),
+        );
+        // Stream ownership already taken + dropped → Ok: msquic must NOT re-close.
+        assert!(
+            got.is_ok(),
+            "post-ownership PeerStreamStarted panic → Ok (owned stream Drop closed it once)"
+        );
+        assert_eq!(
+            closes.load(Ordering::Relaxed),
+            1,
+            "the owned stream stand-in's Drop performs exactly one close"
+        );
+        // The connection is still force-closed exactly once.
+        assert_eq!(
+            *seam.calls.borrow(),
+            vec![(
+                ForceShutdown::Connection(ConnectionShutdownFlags::NONE),
+                H3_INTERNAL_ERROR
+            )],
+            "connection is force-closed once even when stream ownership was taken"
+        );
+        assert!(ctx.poisoned);
+        // Connection waiters woken so a parked connect/accept task cannot hang.
+        let mut woken = crx.connected.take().expect("connect waiter present");
+        match woken.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("connect waiter should observe a failure, got {other:?}"),
+        }
+        assert!(ctx.bidi.is_none() && ctx.uni.is_none());
+    }
+
+    #[test]
+    fn stream_callback_panic_is_contained() {
+        let (mut ctx, mut recv) = stream_ctx_channel_pre_id(new_conn_terminal_slot());
+        let seam = RecordingSeam::default();
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            stream_poison_disp(&StreamEvent::PeerSendShutdown),
+            |_c| panic!("boom in stream callback"),
+            stream_recover,
+        );
+        assert!(is_internal_err(&got));
+        assert_eq!(
+            *seam.calls.borrow(),
+            vec![(
+                ForceShutdown::Stream(StreamShutdownFlags::ABORT),
+                H3_INTERNAL_ERROR
+            )],
+            "stream force-close uses ABORT + H3_INTERNAL_ERROR"
+        );
+        assert!(ctx.poisoned);
+        // Send half woken with an internal terminal (waiter-wake regression).
+        match load_winner(&recv.send_terminal) {
+            Some(SendTerminal::Internal(_)) => {}
+            other => panic!("send terminal should be Internal, got {other:?}"),
+        }
+        match recv.send.try_recv() {
+            Ok(SendEvent::TerminalWake) => {}
+            other => panic!("send half should be woken, got {other:?}"),
+        }
+        // Receive half woken with a STREAM-LOCAL internal terminal (F-A): a
+        // stream-scoped `ReceiveEvent::Internal`, NOT a `Connection` event, so it
+        // never freezes the shared connection slot.
+        match recv.receive.try_recv() {
+            Ok(ReceiveEvent::Internal(_)) => {}
+            _ => panic!("receive half should be woken with a stream-local Internal terminal"),
+        }
+        // Pending open (StartComplete) waiter resolved with a failure, not hung.
+        match recv.start.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("open waiter should observe a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_poison_short_circuit_is_event_aware() {
+        let (mut ctx, _recv) = stream_ctx_channel_pre_id(new_conn_terminal_slot());
+        let _ = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            stream_poison_disp(&StreamEvent::PeerSendShutdown),
+            |_c| panic!("boom"),
+            stream_recover,
+        );
+        assert!(ctx.poisoned);
+
+        // Teardown (ShutdownComplete) → Ok, body not run.
+        let teardown = StreamEvent::ShutdownComplete {
+            connection_shutdown: false,
+            app_close_in_progress: false,
+            connection_shutdown_by_app: false,
+            connection_closed_remotely: false,
+            connection_error_code: 0,
+            connection_close_status: Status::new(StatusCode::QUIC_STATUS_SUCCESS),
+        };
+        assert!(stream_poison_disp(&teardown).is_ok());
+        let got = guard_callback(
+            &mut ctx,
+            &RecordingSeam::default(),
+            stream_poison_disp(&teardown),
+            |_c| panic!("body must NOT run when poisoned"),
+            stream_recover,
+        );
+        assert!(got.is_ok());
+
+        // Non-teardown event → Err.
+        assert!(is_internal_err(&stream_poison_disp(
+            &StreamEvent::PeerSendShutdown
+        )));
+    }
+
+    #[test]
+    fn stream_teardown_body_panic_is_contained_and_wakes_waiters() {
+        // A panic while handling a TEARDOWN event (ShutdownComplete) is contained:
+        // recover force-aborts, wakes both the send half and the pending open
+        // waiter, and poisons the ctx — so no waiter hangs. A subsequent teardown
+        // then short-circuits to Ok without re-running the body (no double
+        // completion of Phase 2 send/receive terminal state).
+        let (mut ctx, mut recv) = stream_ctx_channel_pre_id(new_conn_terminal_slot());
+        let seam = RecordingSeam::default();
+        let teardown = StreamEvent::ShutdownComplete {
+            connection_shutdown: false,
+            app_close_in_progress: false,
+            connection_shutdown_by_app: false,
+            connection_closed_remotely: false,
+            connection_error_code: 0,
+            connection_close_status: Status::new(StatusCode::QUIC_STATUS_SUCCESS),
+        };
+        // First event: ctx not yet poisoned, so the body runs and panics.
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            stream_poison_disp(&teardown),
+            |_c| panic!("boom while handling stream ShutdownComplete"),
+            stream_recover,
+        );
+        assert!(is_internal_err(&got));
+        assert_eq!(
+            *seam.calls.borrow(),
+            vec![(
+                ForceShutdown::Stream(StreamShutdownFlags::ABORT),
+                H3_INTERNAL_ERROR
+            )],
+            "teardown-body panic still force-aborts once"
+        );
+        assert!(ctx.poisoned);
+        // Waiter-wake: send half woken with a terminal, open waiter with a failure.
+        match recv.send.try_recv() {
+            Ok(SendEvent::TerminalWake) => {}
+            other => panic!("send half should be woken, got {other:?}"),
+        }
+        match recv.start.try_recv() {
+            Ok(Some(Err(_))) => {}
+            other => panic!("open waiter should observe a failure, got {other:?}"),
+        }
+        // A subsequent teardown short-circuits to Ok WITHOUT re-running the body
+        // or recover — no double force-abort, no double-completion.
+        let got = guard_callback(
+            &mut ctx,
+            &seam,
+            stream_poison_disp(&teardown),
+            |_c| panic!("body must NOT run on teardown after poison"),
+            stream_recover,
+        );
+        assert!(got.is_ok());
+        assert_eq!(
+            seam.calls.borrow().len(),
+            1,
+            "no second force-abort after poison short-circuit"
+        );
+    }
 }
 
 /// Phase 3 (connection terminal slot & incoming-terminal propagation) unit
@@ -2432,11 +3637,18 @@ mod connection_terminal {
         record_conn_terminal,
     };
 
+    /// A fresh per-invocation peer-stream ownership token for driving
+    /// `connection_callback` in these hermetic tests. None of these events is a
+    /// `PeerStreamStarted`, so the token is never set (F-C).
+    fn no_stream_owned() -> std::cell::Cell<bool> {
+        std::cell::Cell::new(false)
+    }
+
     /// Drive one connection event through the callback and return the frozen,
     /// converted terminal the accept frontend would report.
     fn map_event(ev: ConnectionEvent) -> ConnectionErrorIncoming {
         let (mut ctx, crx) = conn_ctx_channel();
-        assert!(connection_callback(&mut ctx, ev).is_ok());
+        assert!(connection_callback(&mut ctx, ev, &no_stream_owned()).is_ok());
         observe_terminal(&crx.terminal)
     }
 
@@ -2537,7 +3749,7 @@ mod connection_terminal {
             session_resumed: false,
             negotiated_alpn: &[],
         };
-        assert!(connection_callback(&mut ctx, ev).is_ok());
+        assert!(connection_callback(&mut ctx, ev, &no_stream_owned()).is_ok());
         assert!(connect_result(&mut crx).is_ok());
     }
 
@@ -2549,7 +3761,7 @@ mod connection_terminal {
             status: Status::new(StatusCode::QUIC_STATUS_HANDSHAKE_FAILURE),
             error_code: 0,
         };
-        assert!(connection_callback(&mut ctx, ev).is_ok());
+        assert!(connection_callback(&mut ctx, ev, &no_stream_owned()).is_ok());
         let err = connect_result(&mut crx).expect_err("early shutdown resolves as Err");
         assert_eq!(
             err.try_as_status_code().ok(),
@@ -2564,7 +3776,8 @@ mod connection_terminal {
         assert!(
             connection_callback(
                 &mut ctx,
-                ConnectionEvent::ShutdownInitiatedByPeer { error_code: 9 }
+                ConnectionEvent::ShutdownInitiatedByPeer { error_code: 9 },
+                &no_stream_owned()
             )
             .is_ok()
         );
@@ -2591,7 +3804,8 @@ mod connection_terminal {
                     handshake_completed: false,
                     peer_acknowledged_shutdown: false,
                     app_close_in_progress: false,
-                }
+                },
+                &no_stream_owned()
             )
             .is_ok()
         );
@@ -2701,13 +3915,55 @@ mod connection_terminal {
         assert!(
             connection_callback(
                 &mut ctx,
-                ConnectionEvent::ShutdownInitiatedByPeer { error_code: 11 }
+                ConnectionEvent::ShutdownInitiatedByPeer { error_code: 11 },
+                &no_stream_owned()
             )
             .is_ok()
         );
         assert!(matches!(
             observe_terminal(&crx.terminal),
             ConnectionErrorIncoming::ApplicationClose { error_code: 11 }
+        ));
+    }
+
+    #[test]
+    fn accept_delivering_a_cause_commits_and_locks_identity() {
+        // Phase 1 / Fix 1 (SC-003, accept as a committing poll): `observe_terminal`
+        // (the accept frontends' delivery) is a COMMITTING poll when it delivers a
+        // cause. Record a cause, deliver it (freezing the slot), then a later
+        // different cause does not change what a subsequent observer sees.
+        let slot = new_conn_terminal_slot();
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+        // The delivery froze the slot: a later refinement is rejected.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+        assert!(matches!(
+            observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+    }
+
+    #[test]
+    fn accept_empty_slot_non_delivery_does_not_commit() {
+        // Phase 1 / Fix 1 core: an empty slot is a NON-delivery — `observe_terminal`
+        // returns `InternalError` WITHOUT freezing (the empty `None` branch leaves
+        // the slot refinable), so a later real cause can still be recorded and
+        // delivered by a genuine observer.
+        let slot = new_conn_terminal_slot();
+        match observe_terminal(&slot) {
+            ConnectionErrorIncoming::InternalError(msg) => {
+                assert!(msg.contains("without a terminal reason"), "msg: {msg}");
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+        // The slot was NOT frozen: a subsequently-recorded genuine cause is delivered.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
         ));
     }
 }
@@ -2720,16 +3976,18 @@ mod connection_terminal {
 /// so no native `msquic::Stream` is required.
 #[cfg(test)]
 mod receive_events {
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
     use bytes::Bytes;
-    use h3::quic::{ConnectionErrorIncoming, StreamErrorIncoming};
+    use h3::quic::{ConnectionErrorIncoming, RecvStream, StreamErrorIncoming};
 
     use crate::error::ConnectionTerminal;
     use crate::msquic::{BufferRef, ReceiveFlags, Status, StatusCode, StreamEvent};
     use crate::{
-        RecvStreamReceiveCtx, new_conn_terminal_slot, record_conn_terminal, stream_callback,
-        stream_ctx_channel, stream_ctx_channel_with_conn,
+        H3RecvStream, MAX_RECV_BUFFER, NoShutdown, RecvBudget, RecvExec, RecvStreamReceiveCtx,
+        new_conn_terminal_slot, record_conn_terminal, stream_callback, stream_ctx_channel,
+        stream_ctx_channel_with_conn, stream_recover,
     };
 
     fn noop_context() -> Context<'static> {
@@ -2982,6 +4240,517 @@ mod receive_events {
             other => panic!("expected frozen LocalConnectionClose, got {other:?}"),
         }
     }
+
+    #[test]
+    fn f_a_stream_local_panic_does_not_freeze_empty_connection_slot() {
+        // F-A regression: a contained stream-callback panic recovers via
+        // `stream_recover`, which publishes a STREAM-LOCAL internal terminal
+        // (`ReceiveEvent::Internal`) and must NOT touch the shared connection
+        // slot. Polling the recovered stream surfaces the internal fault, and a
+        // later GENUINE connection cause recorded on the shared slot is still
+        // refinable and delivered to a subsequent observer — proving the slot was
+        // not frozen EMPTY (regression of MF-1 / SF-C / FR-002 / FR-003).
+        let slot = new_conn_terminal_slot();
+        let (mut ctx, _srx, mut rrx) =
+            stream_ctx_channel_with_conn(4u64.try_into().unwrap(), slot.clone());
+
+        // Recover a stream via a contained panic (no native handle: no-op seam).
+        assert!(stream_recover(&mut ctx, &NoShutdown).is_err());
+
+        // The recovered receive half reports the STREAM-LOCAL internal fault.
+        match poll(&mut rrx) {
+            Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::InternalError(_),
+            })) => {}
+            other => panic!("expected stream-local InternalError, got {other:?}"),
+        }
+
+        // The shared connection slot was NOT frozen by the stream-local panic: a
+        // genuine peer/transport connection cause recorded afterwards is still
+        // observable (not discarded, not overridden by an internal fault). A fresh
+        // stream sharing the SAME slot observes the delivered cause.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        let (mut ctx2, _srx2, mut rrx2) =
+            stream_ctx_channel_with_conn(8u64.try_into().unwrap(), slot.clone());
+        provisional_local_close(&mut ctx2);
+        match poll(&mut rrx2) {
+            Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            })) => assert_eq!(
+                error_code, 9,
+                "the genuine connection cause survives the stream-local panic"
+            ),
+            other => panic!("expected delivered ApplicationClose{{9}}, got {other:?}"),
+        }
+    }
+
+    // ----- Phase 2: per-stream receive backpressure (SF-A) -----
+
+    /// Recording receive-side seam: captures every `receive_complete` length (and
+    /// any `stop_sending` code) issued on THIS stream, so the per-stream
+    /// pending→complete cycle is asserted against the call log, not timing.
+    #[derive(Debug, Default, Clone)]
+    struct RecordingRecvExec {
+        completes: Arc<Mutex<Vec<u64>>>,
+        stops: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl RecvExec for RecordingRecvExec {
+        fn submit_stop_sending(&self, code: u64) -> Result<(), Status> {
+            self.stops.lock().unwrap().push(code);
+            Ok(())
+        }
+        fn submit_receive_complete(&self, len: u64) {
+            self.completes.lock().unwrap().push(len);
+        }
+    }
+
+    /// Drive one `StreamEvent::Receive` and RETURN the callback result (so a
+    /// `QUIC_STATUS_PENDING` return is observable).
+    fn feed_receive_result(
+        ctx: &mut crate::StreamSendCtx,
+        data: &[u8],
+        flags: ReceiveFlags,
+    ) -> Result<(), Status> {
+        let bufs = [BufferRef::from(data)];
+        let mut total = data.len() as u64;
+        let ev = StreamEvent::Receive {
+            absolute_offset: 0,
+            total_buffer_length: &mut total,
+            buffers: &bufs,
+            flags,
+        };
+        stream_callback(ctx, ev)
+    }
+
+    fn is_pending(res: &Result<(), Status>) -> bool {
+        matches!(res, Err(s) if s.try_as_status_code() == Ok(StatusCode::QUIC_STATUS_PENDING))
+    }
+
+    /// SC-004 primary (hermetic, per-stream, faithful flood): a slow ("stalled")
+    /// consumer that lags the sender. The peer genuinely offers ≥ 8× the
+    /// per-stream bound THROUGH the real receive callback/seam on ONE stream;
+    /// every over-budget indication returns `QUIC_STATUS_PENDING` (modelling
+    /// native pausing the stream until `receive_complete`), and the lagging
+    /// consumer drains just enough to re-arm. Across the entire flood the
+    /// measured buffered PEAK stays ≤ `MAX_RECV_BUFFER` + one indication — the
+    /// peak comes from REAL offers that returned PENDING, not from a counter.
+    #[test]
+    fn stalled_receive_is_bounded() {
+        const CHUNK: usize = 300 * 1024; // 300 KiB indications
+
+        let (mut ctx, _sctx, rctx) = stream_ctx_channel(0u64.try_into().unwrap());
+        let rec = RecordingRecvExec::default();
+        let completes = rec.completes.clone();
+        let mut recv = H3RecvStream::with_exec(Box::new(rec), rctx);
+        let mut cx = noop_context();
+
+        let offer_target = 8 * MAX_RECV_BUFFER; // >= 8 MiB genuinely offered
+        let data = vec![0xC3u8; CHUNK];
+
+        let mut offered = 0usize;
+        let mut peak = 0usize;
+        let mut pend_returns = 0usize;
+        while offered < offer_target {
+            if recv.rctx.recv_budget.pend_outstanding() {
+                // Native has paused THIS stream (the callback returned PENDING and
+                // will not be called again until re-armed): no further indication
+                // is delivered. The lagging consumer drains exactly ONE buffered
+                // indication, which re-arms the window via the RecvExec seam.
+                match recv.poll_data(&mut cx) {
+                    Poll::Ready(Ok(Some(_))) => {}
+                    other => panic!("expected buffered data while stalled, got {other:?}"),
+                }
+                continue;
+            }
+            // A REAL offer through the real receive callback/seam.
+            let res = feed_receive_result(&mut ctx, &data, ReceiveFlags::NONE);
+            offered += CHUNK;
+            peak = peak.max(recv.rctx.recv_budget.buffered());
+            if is_pending(&res) {
+                pend_returns += 1;
+                assert!(recv.rctx.recv_budget.pend_outstanding());
+                // The saved length is this FULL indication (never a drained one).
+                assert_eq!(
+                    recv.rctx.recv_budget.pending_indication_len() as usize,
+                    CHUNK
+                );
+            } else {
+                assert!(res.is_ok(), "sub-bound offer must be Ok, got {res:?}");
+            }
+        }
+
+        // Genuinely offered >= 8x the bound, and the peer really hit the bound.
+        assert!(offered >= offer_target);
+        assert!(pend_returns > 0, "over-budget offers must return PENDING");
+        // The flood may end on a PENDING offer; drain the remaining buffered data
+        // so that final pend is completed too (each pend gets exactly one
+        // completion). This never exceeds the peak already measured.
+        while recv.rctx.recv_budget.pend_outstanding() {
+            match recv.poll_data(&mut cx) {
+                Poll::Ready(Ok(Some(_))) => {}
+                other => panic!("expected buffered data while draining final pend, got {other:?}"),
+            }
+        }
+        println!(
+            "stalled_receive_is_bounded: offered={offered} bound={MAX_RECV_BUFFER} \
+             chunk={CHUNK} peak={peak} pend_returns={pend_returns} completes={}",
+            completes.lock().unwrap().len()
+        );
+        // Bounded peak: it reached the bound but never exceeded bound + one
+        // in-flight indication, independent of how much was offered.
+        assert!(
+            peak >= MAX_RECV_BUFFER,
+            "peak {peak} should reach the bound"
+        );
+        assert!(
+            peak <= MAX_RECV_BUFFER + CHUNK,
+            "peak {peak} must stay <= bound + one indication ({})",
+            MAX_RECV_BUFFER + CHUNK
+        );
+        // Each PENDING was completed exactly once via the seam, always with the
+        // FULL saved indication length.
+        let c = completes.lock().unwrap();
+        assert_eq!(
+            c.len(),
+            pend_returns,
+            "exactly one receive_complete per pend"
+        );
+        assert!(
+            c.iter().all(|&l| l as usize == CHUNK),
+            "completions must use the FULL saved indication length"
+        );
+    }
+
+    /// Single-transition race, faithfully interleaved (finding 2): models a drain
+    /// that runs BEFORE the callback's PENDING return path completes, exercising
+    /// the real receive channel AND the real `RecvExec` seam. Sequence:
+    ///
+    /// 1. pre-fill just below the bound (sub-bound offers, left undrained);
+    /// 2. the callback's locked transition for the crossing indication runs —
+    ///    increment + decide-pend committed and the bytes PUBLISHED under the
+    ///    lock (via `admit`), yielding the not-yet-acted-on pend outcome;
+    /// 3. the drain INTERLEAVES HERE, before the callback returns PENDING:
+    ///    `poll_data` observes the committed state, subtracts, and issues exactly
+    ///    one `receive_complete` through the seam with the FULL SAVED length
+    ///    (distinct from the drained length);
+    /// 4. only then does the callback's return path resolve to PENDING.
+    ///
+    /// Asserts: no counter underflow, the pend is not lost (exactly one completion
+    /// with the FULL saved length), and buffered accounting is exact.
+    #[test]
+    fn recv_state_transition_no_underflow_no_lost_pend() {
+        use crate::{Admit, ReceiveEvent};
+
+        const PRE: usize = 340 * 1024; // 3 pre-fill chunks = 1020 KiB (< bound)
+        const RACE: usize = 200 * 1024; // the crossing indication (distinct size)
+
+        let (mut ctx, _sctx, rctx) = stream_ctx_channel(0u64.try_into().unwrap());
+        let rec = RecordingRecvExec::default();
+        let completes = rec.completes.clone();
+        let mut recv = H3RecvStream::with_exec(Box::new(rec), rctx);
+        let mut cx = noop_context();
+
+        // (1) Pre-fill to just below the bound WITHOUT draining.
+        let pre = vec![0u8; PRE];
+        for _ in 0..3 {
+            assert!(feed_receive_result(&mut ctx, &pre, ReceiveFlags::NONE).is_ok());
+        }
+        assert_eq!(recv.rctx.recv_budget.buffered(), 3 * PRE);
+        assert!(!recv.rctx.recv_budget.pend_outstanding());
+
+        // (2) The callback's locked transition for the crossing indication:
+        // exactly what the Receive arm does — `admit` commits the increment +
+        // pend and PUBLISHES the bytes under the lock, returning the pend outcome
+        // the callback has NOT yet acted on.
+        let racing = Bytes::from(vec![0xEEu8; RACE]);
+        let outcome = recv.rctx.recv_budget.admit(RACE, || {
+            ctx.receive
+                .as_ref()
+                .expect("frontend live")
+                .unbounded_send(ReceiveEvent::Data(racing))
+                .is_ok()
+        });
+        assert!(matches!(outcome, Admit::Pend));
+        assert!(recv.rctx.recv_budget.pend_outstanding());
+        assert_eq!(
+            recv.rctx.recv_budget.pending_indication_len() as usize,
+            RACE
+        );
+        assert_eq!(recv.rctx.recv_budget.buffered(), 3 * PRE + RACE);
+
+        // (3) INTERLEAVE: the drain runs NOW, before the callback's PENDING return
+        // path completes. It observes the committed pend, subtracts the FIRST
+        // buffered indication (PRE bytes), and — via the real `RecvExec` seam —
+        // issues exactly one `receive_complete` with the FULL SAVED length (RACE),
+        // NOT the drained length (PRE).
+        match recv.poll_data(&mut cx) {
+            Poll::Ready(Ok(Some(b))) => {
+                assert_eq!(b.len(), PRE, "FIFO: the first buffered chunk drains first")
+            }
+            other => panic!("expected first buffered chunk, got {other:?}"),
+        }
+        assert_eq!(
+            completes.lock().unwrap().as_slice(),
+            &[RACE as u64],
+            "pend not lost: one completion with the FULL saved length, not the drained length"
+        );
+        // No underflow, exact accounting: buffered decreased by exactly PRE.
+        assert_eq!(recv.rctx.recv_budget.buffered(), 3 * PRE + RACE - PRE);
+        assert!(!recv.rctx.recv_budget.pend_outstanding(), "window reopened");
+
+        // (4) The callback's return path now resolves to PENDING (asserted via
+        // `outcome` above); the early completion from (3) is absorbed — draining
+        // the rest issues no further completion and never underflows.
+        let mut drained = PRE;
+        while let Poll::Ready(Ok(Some(b))) = recv.poll_data(&mut cx) {
+            drained += b.len();
+        }
+        assert_eq!(
+            drained,
+            3 * PRE + RACE,
+            "all bytes drained exactly, no loss"
+        );
+        assert_eq!(recv.rctx.recv_budget.buffered(), 0);
+        assert_eq!(
+            completes.lock().unwrap().len(),
+            1,
+            "exactly one completion total"
+        );
+    }
+
+    /// Genuine concurrent race (finding 2): a writer thread runs the callback's
+    /// `admit` publish-last transition while a reader thread drains and completes,
+    /// hammering the single `RecvState` lock. Because the publish is the LAST step
+    /// of `admit` (accounting first), a reader can never observe bytes before the
+    /// increment lands — the `debug_assert!` in `on_drained` would fire on any
+    /// underflow (this test would panic if the ordering regressed). Confirms the
+    /// invariants under a real thread race: every published byte is eventually
+    /// drained (buffered returns to exactly 0), no underflow, and pends are never
+    /// stranded.
+    #[test]
+    fn drain_before_pend_return_is_absorbed() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        const ITERS: usize = 20_000;
+        const CHUNK: usize = 4096;
+
+        let budget = Arc::new(RecvBudget::default());
+        let (tx, rx) = mpsc::channel::<usize>();
+
+        let writer = {
+            let budget = budget.clone();
+            thread::spawn(move || {
+                for _ in 0..ITERS {
+                    // Exactly the callback's transition: the publish (channel send)
+                    // is the LAST step, under the lock, after the increment.
+                    budget.admit(CHUNK, || tx.send(CHUNK).is_ok());
+                }
+                drop(tx);
+            })
+        };
+        let reader = {
+            let budget = budget.clone();
+            thread::spawn(move || {
+                let mut completes = 0usize;
+                let mut drained = 0usize;
+                // Drain concurrently as bytes are published; a drain that raced
+                // ahead of an increment would underflow (caught by debug_assert).
+                while let Ok(len) = rx.recv() {
+                    if budget.on_drained(len).is_some() {
+                        completes += 1;
+                    }
+                    drained += len;
+                }
+                (completes, drained)
+            })
+        };
+
+        writer.join().unwrap();
+        let (completes, drained) = reader.join().unwrap();
+
+        // Every published byte drained exactly; the counter never underflowed.
+        assert_eq!(drained, ITERS * CHUNK);
+        assert_eq!(
+            budget.buffered(),
+            0,
+            "buffered returns to exactly 0 after the race"
+        );
+        // The stream is never left stranded PENDING with buffered below the bound.
+        assert!(
+            !budget.pend_outstanding(),
+            "no pend left outstanding after the race"
+        );
+        println!("drain_before_pend_return_is_absorbed: completes={completes} drained={drained}");
+    }
+
+    /// Rollback-on-failed-publication (finding 1): if the frontend receiver is
+    /// gone, the over-budget indication's locked transition PUBLISHES (send) and
+    /// fails; the whole `RecvState` mutation (buffered, pend, saved length, peak)
+    /// must be rolled back UNDER THE SAME LOCK, leaving accounting exactly as if
+    /// the indication never arrived — and the callback must NOT return PENDING
+    /// (a dropped frontend can never leave a stream stranded PENDING).
+    #[test]
+    fn dropped_frontend_rolls_back_recv_state() {
+        let (mut ctx, _sctx, rctx) = stream_ctx_channel(0u64.try_into().unwrap());
+
+        // A prior sub-bound indication succeeds, establishing non-zero baseline
+        // accounting (buffered and peak) that MUST survive a later failed publish.
+        let small = vec![0u8; 4096];
+        assert!(feed_receive_result(&mut ctx, &small, ReceiveFlags::NONE).is_ok());
+        let buffered_before = ctx.recv_budget.buffered();
+        let peak_before = ctx.recv_budget.peak();
+        assert_eq!(buffered_before, 4096);
+        assert!(!ctx.recv_budget.pend_outstanding());
+
+        // Drop the frontend receiver: every subsequent publication (send) fails.
+        drop(rctx);
+
+        // An over-bound indication whose publish fails: without rollback the buggy
+        // path would leave buffered = 4096 + big, pend_outstanding = true and
+        // pending_indication_len = big. With the fix, `admit` reverts all of it.
+        let big = vec![0xABu8; MAX_RECV_BUFFER];
+        let res = feed_receive_result(&mut ctx, &big, ReceiveFlags::NONE);
+        assert!(
+            res.is_ok(),
+            "a dropped frontend must NOT strand the stream PENDING, got {res:?}"
+        );
+        assert_eq!(
+            ctx.recv_budget.buffered(),
+            buffered_before,
+            "buffered rolled back exactly to the pre-indication value"
+        );
+        assert_eq!(
+            ctx.recv_budget.peak(),
+            peak_before,
+            "peak rolled back exactly (no phantom growth)"
+        );
+        assert!(
+            !ctx.recv_budget.pend_outstanding(),
+            "no pend left outstanding after a failed publish"
+        );
+        assert_eq!(
+            ctx.recv_budget.pending_indication_len(),
+            0,
+            "saved indication length rolled back"
+        );
+        // The dropped frontend is observed: the sender half is taken.
+        assert!(
+            ctx.receive.is_none(),
+            "dropped frontend detaches the sender"
+        );
+    }
+
+    /// SC-005 no regression: a promptly-draining consumer sees identical data,
+    /// ordering, and terminal signalling, and `receive_complete` is NEVER issued
+    /// for sub-bound traffic (it can never block a prompt consumer).
+    #[test]
+    fn prompt_drain_no_regression() {
+        let (mut ctx, _sctx, rctx) = stream_ctx_channel(0u64.try_into().unwrap());
+        let rec = RecordingRecvExec::default();
+        let completes = rec.completes.clone();
+        let mut recv = H3RecvStream::with_exec(Box::new(rec), rctx);
+        let mut cx = noop_context();
+
+        // Interleave feeds and drains with sub-bound data plus a trailing FIN.
+        for i in 0..8u8 {
+            assert!(feed_receive_result(&mut ctx, &[i, i, i], ReceiveFlags::NONE).is_ok());
+            match recv.poll_data(&mut cx) {
+                Poll::Ready(Ok(Some(b))) => assert_eq!(&b[..], &[i, i, i]),
+                other => panic!("expected data {i}, got {other:?}"),
+            }
+        }
+        // A FIN riding a final data indication: data first, then clean EOF.
+        assert!(feed_receive_result(&mut ctx, &[9, 9], ReceiveFlags::FIN).is_ok());
+        match recv.poll_data(&mut cx) {
+            Poll::Ready(Ok(Some(b))) => assert_eq!(&b[..], &[9, 9]),
+            other => panic!("expected trailing data, got {other:?}"),
+        }
+        assert!(matches!(recv.poll_data(&mut cx), Poll::Ready(Ok(None))));
+        // Sticky clean EOF.
+        assert!(matches!(recv.poll_data(&mut cx), Poll::Ready(Ok(None))));
+
+        // No backpressure completion ever issued for a prompt, sub-bound consumer.
+        assert!(
+            completes.lock().unwrap().is_empty(),
+            "receive_complete must never fire for sub-bound prompt draining"
+        );
+        assert_eq!(recv.rctx.recv_budget.buffered(), 0);
+        assert!(!recv.rctx.recv_budget.pend_outstanding());
+    }
+
+    /// Per-stream independence: stalling ONE stream at its bound does not affect
+    /// another stream on the same connection — each has its own 1 MiB budget.
+    #[test]
+    fn stalled_stream_does_not_affect_peer_stream() {
+        // Stalled stream: fill to the bound.
+        let (mut stalled_ctx, _s1, stalled_rctx) = stream_ctx_channel(0u64.try_into().unwrap());
+        let rec1 = RecordingRecvExec::default();
+        let stalled = H3RecvStream::with_exec(Box::new(rec1), stalled_rctx);
+        let chunk = vec![0u8; MAX_RECV_BUFFER];
+        assert!(
+            is_pending(&feed_receive_result(
+                &mut stalled_ctx,
+                &chunk,
+                ReceiveFlags::NONE
+            )),
+            "one full-bound indication pends the stalled stream"
+        );
+        assert!(stalled.rctx.recv_budget.pend_outstanding());
+
+        // Independent stream: its own budget is untouched; sub-bound traffic is
+        // accepted normally and never pends.
+        let (mut other_ctx, _s2, other_rctx) = stream_ctx_channel(4u64.try_into().unwrap());
+        let rec2 = RecordingRecvExec::default();
+        let mut other = H3RecvStream::with_exec(Box::new(rec2), other_rctx);
+        let mut cx = noop_context();
+        for i in 0..4u8 {
+            assert!(
+                feed_receive_result(&mut other_ctx, &[i, i], ReceiveFlags::NONE).is_ok(),
+                "peer stream must not be paused by the stalled stream"
+            );
+            match other.poll_data(&mut cx) {
+                Poll::Ready(Ok(Some(b))) => assert_eq!(&b[..], &[i, i]),
+                o => panic!("expected peer data {i}, got {o:?}"),
+            }
+        }
+        assert!(!other.rctx.recv_budget.pend_outstanding());
+        assert!(other.rctx.recv_budget.peak() < MAX_RECV_BUFFER);
+        // The stalled stream is still pended (independent budgets).
+        assert!(stalled.rctx.recv_budget.pend_outstanding());
+    }
+
+    /// Pre-size: a multi-buffer indication is copied into a single, summed-length
+    /// allocation and concatenated in order (proving the pre-sum path).
+    #[test]
+    fn multi_buffer_indication_is_presized_and_concatenated() {
+        let (mut ctx, _sctx, mut rrx) = stream_ctx_channel(0u64.try_into().unwrap());
+        let a = [1u8, 2, 3];
+        let b = [4u8, 5];
+        let c = [6u8, 7, 8, 9];
+        let bufs = [
+            BufferRef::from(&a[..]),
+            BufferRef::from(&b[..]),
+            BufferRef::from(&c[..]),
+        ];
+        let mut total = (a.len() + b.len() + c.len()) as u64;
+        let ev = StreamEvent::Receive {
+            absolute_offset: 0,
+            total_buffer_length: &mut total,
+            buffers: &bufs,
+            flags: ReceiveFlags::NONE,
+        };
+        assert!(stream_callback(&mut ctx, ev).is_ok());
+        match poll(&mut rrx) {
+            Poll::Ready(Ok(Some(bytes))) => {
+                assert_eq!(&bytes[..], &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+                assert_eq!(bytes.len(), (a.len() + b.len() + c.len()));
+            }
+            other => panic!("expected concatenated data, got {other:?}"),
+        }
+        assert_eq!(rrx.recv_budget.buffered(), 9);
+    }
 }
 
 /// Phase 5 (safe stream open & identity) unit tests: prove the pure stream-ID
@@ -3181,6 +4950,79 @@ mod stream_open_identity {
         assert!(matches!(
             stream_open_conn_error(&slot),
             ConnectionErrorIncoming::Timeout
+        ));
+    }
+
+    #[test]
+    fn classify_start_outcome_failed_start_commits_connection_cause() {
+        // Phase 1 / SF-C: a delivered connection cause on a failed start COMMITS
+        // (freezes) the shared slot, so a later refinement does not change what
+        // other observers see (SC-003, stream-open delivery point).
+        let slot = new_conn_terminal_slot();
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        let status = Status::new(StatusCode::QUIC_STATUS_ABORTED);
+        match classify_start_outcome(Err(status), &slot) {
+            Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code: 9 },
+            }) => {}
+            other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
+        }
+        // Frozen on delivery: a later refinement is rejected.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+    }
+
+    #[test]
+    fn classify_start_outcome_failed_start_empty_slot_does_not_commit() {
+        // Phase 1 / SF-C non-delivery: an empty slot surfaces `Unknown` WITHOUT
+        // freezing, so a later real cause can still be recorded and delivered.
+        let slot = new_conn_terminal_slot();
+        let status = Status::new(StatusCode::QUIC_STATUS_ABORTED);
+        match classify_start_outcome(Err(status), &slot) {
+            Err(StreamErrorIncoming::Unknown(_)) => {}
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+    }
+
+    #[test]
+    fn stream_open_conn_error_commits_connection_cause() {
+        // Phase 1 / SF-C: the cancellation-branch delivery (`stream_open_conn_error`)
+        // commits the shared slot when a cause is present; a later refinement is
+        // rejected.
+        let slot = new_conn_terminal_slot();
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            stream_open_conn_error(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+    }
+
+    #[test]
+    fn stream_open_conn_error_empty_slot_does_not_commit() {
+        // Phase 1 / SF-C non-delivery: an empty slot maps to `InternalError` WITHOUT
+        // freezing, leaving the slot refinable for a later genuine cause.
+        let slot = new_conn_terminal_slot();
+        match stream_open_conn_error(&slot) {
+            ConnectionErrorIncoming::InternalError(_) => {}
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
         ));
     }
 
@@ -4511,6 +6353,292 @@ mod send_seam {
             "a cancelled completion still reclaims the box exactly once"
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 1: terminal-cause commit-on-delivery (MF-1, MF-2, SC-003 send side).
+    // Dual-callback-ordering seam tests: the connection cause is injected DURING
+    // the executor downcall (via `InjectingExec`) so the immediate native error and
+    // the connection-cause recording interleave exactly as under concurrent
+    // callbacks, exercising the `resolve_terminal` (non-freezing) /
+    // `commit_send_winner` (freeze-on-delivery) split rather than a pre-populated
+    // short-circuit.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Send-side seam that records a connection terminal into the SHARED slot
+    /// *during* the executor downcall and then returns an immediate native error —
+    /// modelling the MF-1 window in which the connection callback records the cause
+    /// concurrently with an immediate send/finish/reset failure. `submit_send`
+    /// routes through the shared owned-buffer transaction so the buffer is reclaimed
+    /// exactly as the immediate-`Err` arm requires.
+    #[derive(Debug)]
+    struct InjectingExec {
+        slot: ConnTerminalSlot,
+        cause: ConnectionTerminal,
+        status: Status,
+    }
+
+    impl InjectingExec {
+        fn new(slot: ConnTerminalSlot, cause: ConnectionTerminal) -> Self {
+            Self {
+                slot,
+                cause,
+                status: Status::from(StatusCode::QUIC_STATUS_INVALID_PARAMETER),
+            }
+        }
+    }
+
+    impl SendExec for InjectingExec {
+        fn submit_send(&mut self, buf: SendBuffer) -> Result<(), Status> {
+            let status = self.status.clone();
+            let slot = self.slot.clone();
+            let cause = self.cause.clone();
+            crate::submit_owned_send(buf, move |_buffers, _cc| {
+                record_conn_terminal(&slot, cause);
+                Err(status)
+            })
+        }
+        fn submit_graceful(&mut self) -> Result<(), Status> {
+            record_conn_terminal(&self.slot, self.cause.clone());
+            Err(self.status.clone())
+        }
+        fn submit_reset(&mut self, _code: u64) -> Result<(), Status> {
+            record_conn_terminal(&self.slot, self.cause.clone());
+            Err(self.status.clone())
+        }
+    }
+
+    #[test]
+    fn mf1_send_data_immediate_error_delivers_injected_connection_cause() {
+        // SC-001 / MF-1: the shared slot is EMPTY until the executor downcall
+        // records the cause, so the send slot never becomes `Connection` before the
+        // immediate `Err` — exactly the concurrent-callback race. The send_data
+        // return itself must deliver the specific connection cause (code 9), not
+        // `Unknown(status)`.
+        let slot = new_conn_terminal_slot();
+        let exec = Box::new(InjectingExec::new(
+            slot.clone(),
+            ConnectionTerminal::PeerApplication(9),
+        ));
+        let (sctx, _ctx) = test_send_ctx_with_conn(slot.clone());
+        let mut s = H3SendStream::with_exec(exec, sctx);
+
+        match SendStream::<Bytes>::send_data(&mut s, Frame::Data(Bytes::from_static(b"data"))) {
+            Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            }) => assert_eq!(
+                error_code, 9,
+                "specific connection cause, not Unknown(status)"
+            ),
+            other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
+        }
+        // The send slot ends holding Connection(PeerApplication(9)), not Failed.
+        match crate::load_winner(&s.sctx.send_terminal) {
+            Some(crate::error::SendTerminal::Connection(ConnectionTerminal::PeerApplication(
+                9,
+            ))) => {}
+            other => panic!("expected send slot Connection(PeerApplication(9)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mf1_poll_finish_immediate_error_delivers_injected_connection_cause() {
+        // SC-001 / MF-1 for the graceful-submit downcall: an idle poll_finish
+        // submits the graceful shutdown, which injects the cause and fails
+        // immediately; the poll return delivers the specific connection cause.
+        let slot = new_conn_terminal_slot();
+        let exec = Box::new(InjectingExec::new(
+            slot.clone(),
+            ConnectionTerminal::PeerApplication(9),
+        ));
+        let (sctx, _ctx) = test_send_ctx_with_conn(slot.clone());
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        match SendStream::<Bytes>::poll_finish(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            })) => assert_eq!(error_code, 9),
+            other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
+        }
+        match crate::load_winner(&s.sctx.send_terminal) {
+            Some(crate::error::SendTerminal::Connection(ConnectionTerminal::PeerApplication(
+                9,
+            ))) => {}
+            other => panic!("expected send slot Connection(PeerApplication(9)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mf1_reset_injected_cause_surfaced_by_subsequent_poll() {
+        // SC-001 / MF-1 for reset: reset() returns NOTHING to h3, so the injected
+        // cause cannot be read from the reset() return; it is recorded during the
+        // reset downcall and published as the send winner WITHOUT freezing. A
+        // subsequent poll_finish surfaces the specific connection cause (code 9),
+        // confirming the injected connection cause won the resolve after reset.
+        let slot = new_conn_terminal_slot();
+        let exec = Box::new(InjectingExec::new(
+            slot.clone(),
+            ConnectionTerminal::PeerApplication(9),
+        ));
+        let (sctx, _ctx) = test_send_ctx_with_conn(slot.clone());
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        SendStream::<Bytes>::reset(&mut s, 5);
+        match SendStream::<Bytes>::poll_finish(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            })) => assert_eq!(
+                error_code, 9,
+                "reset did not freeze; the cause is delivered later"
+            ),
+            other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_prefers_recorded_connection_over_provisional_marker() {
+        // Provisional-winner regression (resolve precedence): drive the send slot
+        // to the provisional `ProvisionalAbort` marker (a cancelled SendComplete
+        // with no published cause), then record a connection cause on the shared
+        // slot. `resolve_terminal` must peek the connection slot as a fallback for
+        // the provisional winner, so a subsequent poll delivers the specific
+        // connection cause (code 9) instead of masking it with `ProvisionalAbort`.
+        let slot = new_conn_terminal_slot();
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx_with_conn(slot.clone());
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        submit_then_cancel(&h, &mut s, &mut ctx);
+        // Process the cancelled completion with NO cause: the provisional marker is
+        // retained (unobserved), poll is Pending.
+        assert!(matches!(
+            SendStream::<Bytes>::poll_ready(&mut s, &mut cx),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            matches!(
+                crate::load_winner(&s.sctx.send_terminal),
+                Some(crate::error::SendTerminal::ProvisionalAbort)
+            ),
+            "the send slot holds the retained provisional marker"
+        );
+
+        // A connection cause is recorded on the shared slot AFTER the provisional.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
+            std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+            })) => assert_eq!(
+                error_code, 9,
+                "connection cause takes precedence over provisional"
+            ),
+            other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mf2_graceful_finish_does_not_commit_connection_slot() {
+        // SC-002 / MF-2: a graceful finish that returns success must NOT commit the
+        // connection slot even though a provisional connection cause was prepared as
+        // reducer input; a subsequently-published specific cause is still delivered
+        // to a later observer.
+        let slot = new_conn_terminal_slot();
+        let h = CountingHandle::default();
+        let exec = Box::new(CountingExec::new(h.clone(), VecDeque::new()));
+        let (sctx, mut ctx) = test_send_ctx_with_conn(slot.clone());
+        let mut s = H3SendStream::with_exec(exec, sctx);
+        let mut cx = noop_cx();
+
+        // Start finish (submits graceful, sets finish_started), then queue the
+        // graceful FinishComplete on the ordered channel.
+        assert!(matches!(
+            SendStream::<Bytes>::poll_finish(&mut s, &mut cx),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(h.gracefuls.load(Relaxed), 1);
+        stream_callback(
+            &mut ctx,
+            StreamEvent::SendShutdownComplete { graceful: true },
+        )
+        .unwrap();
+
+        // A provisional connection cause is prepared as reducer input.
+        record_conn_terminal(&slot, ConnectionTerminal::LocalClose);
+
+        // The graceful finish wins and returns success WITHOUT committing the slot.
+        assert!(matches!(
+            SendStream::<Bytes>::poll_finish(&mut s, &mut cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+
+        // The slot is still refinable (not observed): a later specific cause refines
+        // it and a genuine observer delivers code 9.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        match crate::observe_terminal(&slot) {
+            ConnectionErrorIncoming::ApplicationClose { error_code } => assert_eq!(
+                error_code, 9,
+                "graceful finish must not freeze a provisional cause"
+            ),
+            other => panic!("expected refined ApplicationClose{{9}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sc003_send_delivery_locks_identity_both_orderings() {
+        // SC-003 / consistency, both orderings: after a send delivery surfaces a
+        // connection cause it is committed (frozen), so a later refinement does not
+        // change what a subsequent accept observer (`observe_terminal`) sees.
+
+        // (a) deliver-before-record: an immediate send error delivers and freezes.
+        {
+            let slot = new_conn_terminal_slot();
+            let exec = Box::new(InjectingExec::new(
+                slot.clone(),
+                ConnectionTerminal::PeerApplication(9),
+            ));
+            let (sctx, _ctx) = test_send_ctx_with_conn(slot.clone());
+            let mut s = H3SendStream::with_exec(exec, sctx);
+
+            assert!(matches!(
+                SendStream::<Bytes>::send_data(&mut s, Frame::Data(Bytes::from_static(b"d"))),
+                Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error: ConnectionErrorIncoming::ApplicationClose { error_code: 9 },
+                })
+            ));
+            record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+            assert!(matches!(
+                crate::observe_terminal(&slot),
+                ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+            ));
+        }
+
+        // (b) record-before-deliver: the cause is recorded first; a poll_ready
+        //     delivery surfaces and locks it; a later refinement is still rejected.
+        {
+            let slot = new_conn_terminal_slot();
+            let h = CountingHandle::default();
+            let exec = Box::new(CountingExec::new(h, VecDeque::new()));
+            let (sctx, _ctx) = test_send_ctx_with_conn(slot.clone());
+            let mut s = H3SendStream::with_exec(exec, sctx);
+            let mut cx = noop_cx();
+
+            record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+            match SendStream::<Bytes>::poll_ready(&mut s, &mut cx) {
+                std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+                })) => assert_eq!(error_code, 9),
+                other => panic!("expected ApplicationClose{{9}}, got {other:?}"),
+            }
+            record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+            assert!(matches!(
+                crate::observe_terminal(&slot),
+                ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+            ));
+        }
+    }
 }
 
 /// Phase 7 downcall clamp tests: the recv-side `stop_sending` and the
@@ -4671,6 +6799,7 @@ mod downcall_clamp {
                 send_terminal,
                 conn_terminal,
                 receive,
+                recv_budget,
             } = recv;
             Ok(OpeningStream {
                 stream: Arc::new(s),
@@ -4680,6 +6809,7 @@ mod downcall_clamp {
                     send_terminal,
                     conn_terminal,
                     receive,
+                    recv_budget,
                 },
             })
         }
@@ -4749,9 +6879,212 @@ mod downcall_clamp {
             drop(opener);
         }
     }
-}
 
-/// Phase 8 (Conformance) — end-to-end loopback tests over a real 127.0.0.1
+    #[test]
+    fn poll_open_inner_fail_fast_commits_connection_cause_both_orderings() {
+        // Phase 1 / SF-C (SC-003): the REAL `poll_open_inner` fail-fast delivery
+        // (step 1) commits (freezes) the connection slot on delivery, so a later
+        // refinement does not change what a subsequent observer sees — verified for
+        // both callback orderings against a real (unstarted) connection.
+        let reg = Registration::new(&RegistrationConfig::default()).unwrap();
+
+        // (a) record-before-deliver: the cause is recorded, then the open delivers
+        //     and freezes it; a later refinement is rejected.
+        {
+            let inner =
+                Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
+            let guard = RundownGuard::new(reg.state().clone());
+            let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
+            record_conn_terminal(conn.terminal(), ConnectionTerminal::PeerApplication(9));
+            let mut opener = StreamOpener::with_open_exec(
+                conn.clone(),
+                Box::new(CancellingOpenExec { record: None }),
+            );
+            let mut cx = noop_cx();
+
+            match OpenStreams::<Bytes>::poll_open_bidi(&mut opener, &mut cx) {
+                std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+                })) => assert_eq!(error_code, 9, "fail-fast delivers the recorded cause"),
+                other => panic!("expected ApplicationClose{{9}} from fail-fast, got {other:?}"),
+            }
+            // The fail-fast delivery froze the slot: a later refinement is rejected.
+            record_conn_terminal(conn.terminal(), ConnectionTerminal::PeerApplication(7));
+            assert!(matches!(
+                crate::observe_terminal(conn.terminal()),
+                ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+            ));
+            drop(opener);
+        }
+
+        // (b) empty-then-record on a fresh open: with no cause the fail-fast does
+        //     not fire; a cause recorded before the next poll is then delivered and
+        //     frozen, and a later refinement is rejected.
+        {
+            let inner =
+                Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
+            let guard = RundownGuard::new(reg.state().clone());
+            let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
+            record_conn_terminal(conn.terminal(), ConnectionTerminal::PeerApplication(5));
+            let mut opener = StreamOpener::with_open_exec(
+                conn.clone(),
+                Box::new(CancellingOpenExec { record: None }),
+            );
+            let mut cx = noop_cx();
+
+            match OpenStreams::<Bytes>::poll_open_send(&mut opener, &mut cx) {
+                std::task::Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error: ConnectionErrorIncoming::ApplicationClose { error_code },
+                })) => assert_eq!(error_code, 5),
+                other => panic!("expected ApplicationClose{{5}} from fail-fast, got {other:?}"),
+            }
+            record_conn_terminal(conn.terminal(), ConnectionTerminal::PeerApplication(6));
+            assert!(matches!(
+                crate::observe_terminal(conn.terminal()),
+                ConnectionErrorIncoming::ApplicationClose { error_code: 5 }
+            ));
+            drop(opener);
+        }
+    }
+
+    /// Build a real (unstarted) adapter [`crate::Connection`] whose incoming-stream
+    /// channels and shared terminal slot the test controls, so the actual
+    /// `poll_accept_recv`/`poll_accept_bidi` frontends can be driven without a
+    /// live peer. The returned [`crate::ConnCtxSender`] owns the `uni`/`bidi`
+    /// senders: dropping it closes both channels (`poll_next` → `None`), which is
+    /// exactly the channel-closure path the accept frontends terminate on.
+    ///
+    /// Drop order matters: the caller binds `(reg, connection, ctx)` so that at
+    /// end of scope `connection` (and its `ConnHandle`) drops before `reg`, i.e.
+    /// the native `ConnectionClose` runs while the registration is still alive.
+    fn accept_frontend_connection() -> (Registration, crate::Connection, crate::ConnCtxSender) {
+        let reg = Registration::new(&RegistrationConfig::default()).unwrap();
+        let inner =
+            Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
+        let guard = RundownGuard::new(reg.state().clone());
+        let (ctx, crx) = crate::conn_ctx_channel();
+        let conn = Arc::new(ConnHandle::new(inner, guard, crx.terminal.clone()));
+        let opener = StreamOpener::new(conn.clone());
+        let connection = crate::Connection {
+            conn,
+            ctx: crx,
+            opener,
+        };
+        (reg, connection, ctx)
+    }
+
+    #[test]
+    fn poll_accept_recv_delivering_cause_commits_and_locks_identity() {
+        // Phase 1 / Fix 1 (SC-003) — accept as a COMMITTING poll, cause-delivery
+        // ordering, driven through the real `poll_accept_recv` frontend: a
+        // connection cause is recorded, the incoming-stream channel then closes,
+        // and the accept poll delivers+commits (freezes) the cause. A later
+        // refinement is rejected because delivery froze the slot.
+        let (_reg, mut connection, ctx) = accept_frontend_connection();
+        let slot = connection.ctx.terminal.clone();
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        drop(ctx); // close the uni/bidi channels: accept observes channel closure
+        let mut cx = noop_cx();
+        match <crate::Connection as h3::quic::Connection<Bytes>>::poll_accept_recv(
+            &mut connection,
+            &mut cx,
+        ) {
+            std::task::Poll::Ready(Err(ConnectionErrorIncoming::ApplicationClose {
+                error_code,
+            })) => assert_eq!(error_code, 9),
+            other => panic!("expected ApplicationClose{{9}} from accept delivery, got {other:?}"),
+        }
+        // Delivery froze the slot: a later different cause does not change what a
+        // subsequent observer sees.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+        drop(connection);
+    }
+
+    #[test]
+    fn poll_accept_recv_empty_slot_non_delivery_does_not_commit() {
+        // Phase 1 / Fix 1 core — accept as a NON-delivery, empty-slot ordering,
+        // driven through the real `poll_accept_recv` frontend: the channel closes
+        // with NO recorded terminal, so the poll returns the synthetic
+        // `InternalError` WITHOUT freezing. A subsequently-recorded genuine cause
+        // is therefore still observable by a later consumer.
+        let (_reg, mut connection, ctx) = accept_frontend_connection();
+        let slot = connection.ctx.terminal.clone();
+        drop(ctx); // close the channels with an empty slot
+        let mut cx = noop_cx();
+        match <crate::Connection as h3::quic::Connection<Bytes>>::poll_accept_recv(
+            &mut connection,
+            &mut cx,
+        ) {
+            std::task::Poll::Ready(Err(ConnectionErrorIncoming::InternalError(msg))) => {
+                assert!(msg.contains("without a terminal reason"), "msg: {msg}");
+            }
+            other => panic!("expected InternalError from empty-slot non-delivery, got {other:?}"),
+        }
+        // The non-delivery did not freeze: a later genuine cause is delivered.
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+        drop(connection);
+    }
+
+    #[test]
+    fn poll_accept_bidi_delivering_cause_commits_and_locks_identity() {
+        // Same committing-poll delivery invariant as the recv case, driven through
+        // the real `poll_accept_bidi` frontend (both accept frontends share the
+        // `observe_terminal` → `commit_conn` delivery seam).
+        let (_reg, mut connection, ctx) = accept_frontend_connection();
+        let slot = connection.ctx.terminal.clone();
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        drop(ctx);
+        let mut cx = noop_cx();
+        match <crate::Connection as h3::quic::Connection<Bytes>>::poll_accept_bidi(
+            &mut connection,
+            &mut cx,
+        ) {
+            std::task::Poll::Ready(Err(ConnectionErrorIncoming::ApplicationClose {
+                error_code,
+            })) => assert_eq!(error_code, 9),
+            other => panic!("expected ApplicationClose{{9}} from accept delivery, got {other:?}"),
+        }
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(7));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+        drop(connection);
+    }
+
+    #[test]
+    fn poll_accept_bidi_empty_slot_non_delivery_does_not_commit() {
+        // Empty-slot non-delivery invariant driven through the real
+        // `poll_accept_bidi` frontend.
+        let (_reg, mut connection, ctx) = accept_frontend_connection();
+        let slot = connection.ctx.terminal.clone();
+        drop(ctx);
+        let mut cx = noop_cx();
+        match <crate::Connection as h3::quic::Connection<Bytes>>::poll_accept_bidi(
+            &mut connection,
+            &mut cx,
+        ) {
+            std::task::Poll::Ready(Err(ConnectionErrorIncoming::InternalError(msg))) => {
+                assert!(msg.contains("without a terminal reason"), "msg: {msg}");
+            }
+            other => panic!("expected InternalError from empty-slot non-delivery, got {other:?}"),
+        }
+        record_conn_terminal(&slot, ConnectionTerminal::PeerApplication(9));
+        assert!(matches!(
+            crate::observe_terminal(&slot),
+            ConnectionErrorIncoming::ApplicationClose { error_code: 9 }
+        ));
+        drop(connection);
+    }
+}
 /// msquic connection, mirroring `listener::basic_server_test` but driving the
 /// raw `h3::quic` trait surface (open/accept bidi streams, `send_data`,
 /// `reset`, `stop_sending`, connection `close`) directly so each error-
@@ -4802,9 +7135,7 @@ mod conformance {
     };
 
     use crate::test::util::{get_test_cred, try_setup_tracing};
-    use crate::{Connection, H3Stream, Listener, Registration};
-
-    const H3_INTERNAL_ERROR: u64 = 0x0102;
+    use crate::{Connection, H3_INTERNAL_ERROR, H3Stream, Listener, Registration};
 
     // ── poll_fn adapters over the &mut self trait methods (buffer type = Bytes) ──
 
@@ -5293,5 +7624,55 @@ mod conformance {
             drop(server);
             drop(client);
         });
+    }
+}
+
+/// SC-008 NEGATIVE configuration check (SF-L). This is an *expected-FAILURE*
+/// assertion, NOT an `--all-features`/both-enabled success gate: it spawns a
+/// nested `cargo check` that enables BOTH mutually-exclusive provenance features
+/// and asserts the build FAILS with the upstream `msquic` build-script message
+/// `feature src and find are mutually exclusive`. The failure originates in the
+/// upstream dependency's build script (which runs before this crate compiles), so
+/// the crate does not (and cannot) intercept the both-enabled case at crate level
+/// — this test asserts the failure's presence and origin, nothing more.
+///
+/// `#[ignore]`d because it drives a real `cargo` subprocess (slow, and it uses a
+/// separate `CARGO_TARGET_DIR` to avoid the outer build lock). Run it explicitly:
+/// `cargo test --no-default-features --features native-find -- --ignored both_features_mutually_exclusive_negative`
+#[cfg(test)]
+mod feature_config_negative {
+    #[test]
+    #[ignore = "NEGATIVE config check: spawns a nested `cargo check` expected to FAIL; run manually with --ignored"]
+    fn both_features_mutually_exclusive_negative() {
+        use std::process::Command;
+
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        // Isolated target dir so this nested invocation does not contend for the
+        // outer `cargo test` build lock.
+        let neg_target = format!("{manifest_dir}/target/neg-both-features");
+
+        let output = Command::new(&cargo)
+            .current_dir(manifest_dir)
+            .env("CARGO_TARGET_DIR", &neg_target)
+            .args([
+                "check",
+                "--no-default-features",
+                "--features",
+                "native-find,native-src",
+            ])
+            .output()
+            .expect("failed to spawn nested cargo check");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "enabling BOTH native-find + native-src MUST fail the build; got success.\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("feature src and find are mutually exclusive"),
+            "expected the upstream msquic build-script mutual-exclusion message; \
+             the failure must originate upstream (not a crate-level guard).\nstderr:\n{stderr}"
+        );
     }
 }

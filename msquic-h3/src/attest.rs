@@ -207,8 +207,11 @@ mod tests {
         } else if cfg!(feature = "native-src") {
             [2, 5, 1]
         } else {
-            // No provenance selected: the link step would already have failed, so
-            // this branch is only reached by `cargo check`. Keep the source pin.
+            // No provenance selected: this is a supported type-check-only
+            // configuration (the crate compiles without linking a native
+            // library; a real build/link would fail at link time). This
+            // `expected_version()` is test-only, so the branch is effectively
+            // unreached in practice. Keep the source pin as a defensive default.
             [2, 5, 1]
         }
     }

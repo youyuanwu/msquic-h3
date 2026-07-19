@@ -1,4 +1,11 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    cell::Cell,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use futures::ready;
 use futures::{
@@ -8,6 +15,10 @@ use futures::{
 use msquic::{BufferRef, ListenerEvent, ListenerRef, Status};
 
 use crate::registration::{RundownGuard, RundownState};
+use crate::{
+    CbClass, NoShutdown, PoisonFlag, ShutdownSeam, guard_callback, internal_error_status,
+    report_contained_panic,
+};
 
 pub struct Listener {
     inner: msquic::Listener,
@@ -20,6 +31,16 @@ pub struct Listener {
 struct ListenerCtxSender {
     conn: Option<mpsc::UnboundedSender<Option<crate::Connection>>>,
     shutdown: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    /// Set by [`listener_recover`] after a contained callback panic (SF-E), so
+    /// [`guard_callback`] short-circuits every subsequent event on this ctx.
+    /// Interior-mutable because the listener callback is an `Fn` closure holding
+    /// the ctx by shared reference.
+    ///
+    /// NOTE (F-B): connection ownership state is deliberately NOT stored here.
+    /// msquic runs listener callbacks IN PARALLEL, so a shared ownership bit
+    /// would race across concurrent invocations. Ownership is tracked in a
+    /// per-invocation `Cell<bool>` created inside the handler instead.
+    poisoned: AtomicBool,
 }
 struct ListenerCtxReceiver {
     conn: mpsc::UnboundedReceiver<Option<crate::Connection>>,
@@ -34,12 +55,79 @@ fn listener_ctx_channel() -> (ListenerCtxSender, ListenerCtxReceiver) {
         ListenerCtxSender {
             conn: Some(tx),
             shutdown: std::sync::Mutex::new(Some(sh_tx)),
+            poisoned: AtomicBool::new(false),
         },
         ListenerCtxReceiver {
             conn: rx,
             shutdown: std::sync::Mutex::new(Some(sh_rx)),
         },
     )
+}
+
+impl PoisonFlag for &ListenerCtxSender {
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Relaxed)
+    }
+}
+
+/// Event-aware poison disposition for the listener callback (SF-E). Once the ctx
+/// is poisoned, a `NewConnection` (ownership-bearing) is rejected with
+/// `INTERNAL_ERROR` so msquic performs the single reject without the adapter
+/// attempting `from_raw`; a `StopComplete` (teardown) is a safe `Ok(())` no-op.
+fn listener_poison_disp(ev: &ListenerEvent) -> Result<(), Status> {
+    match ev {
+        ListenerEvent::StopComplete { .. } => Ok(()),
+        _ => Err(internal_error_status()),
+    }
+}
+
+/// Ownership-aware panic-recovery action for the listener callback (SF-E). The
+/// listener never force-closes (its seam is a no-op): it mirrors the
+/// `ConfigFailedClose` close-or-reject contract. If ownership was already taken
+/// this invocation (`owned.get() == true`), the unwind's `Drop` already closed
+/// the owned connection, so returning `Ok(())` prevents msquic from also
+/// rejecting it (a double-close). Otherwise ownership never transferred, so
+/// returning `Err(INTERNAL_ERROR)` lets msquic perform the single reject. Either
+/// branch yields exactly one close/reject with no leaked handle. Marks the ctx
+/// poisoned.
+///
+/// `owned` is a PER-INVOCATION token (F-B): msquic runs listener callbacks in
+/// parallel, so ownership must never be read from shared ctx state — a fresh
+/// `Cell<bool>` is created in the handler and captured by both the body and this
+/// recover closure, so concurrent invocations cannot corrupt each other's
+/// close-or-reject decision.
+///
+/// It ALSO wakes both listener terminal waiters — mirroring [`StopComplete`
+/// handling in `listener_callback`] — so a pending `accept()` and a pending
+/// `shutdown()` cannot hang after the panic. This is essential because once the
+/// ctx is poisoned a later `StopComplete` is short-circuited to a no-op `Ok(())`
+/// by [`listener_poison_disp`] and would never signal them.
+fn listener_recover(
+    ctx: &mut &ListenerCtxSender,
+    _seam: &dyn ShutdownSeam,
+    owned: &Cell<bool>,
+) -> Result<(), Status> {
+    report_contained_panic(CbClass::Listener);
+    let ownership_taken = owned.get();
+    // Wake both terminal paths so no waiter hangs: signal end-of-connections to
+    // any pending `accept()`, and resolve the `shutdown()`/StopComplete waiter.
+    // Mirrors the `StopComplete` arm of `listener_callback`.
+    if let Some(tx) = ctx.conn.as_ref() {
+        let _ = tx.unbounded_send(None);
+    }
+    let sh = crate::lock_recover(&ctx.shutdown).take();
+    if let Some(sh) = sh {
+        let _ = sh.send(());
+    }
+    ctx.poisoned.store(true, Ordering::Relaxed);
+    if ownership_taken {
+        // Ownership already transferred; the unwind's Drop closed the owned
+        // connection. Do NOT also reject (avoids the native double-close assert).
+        Ok(())
+    } else {
+        // Ownership never transferred; msquic performs the single reject/close.
+        Err(internal_error_status())
+    }
 }
 
 /// The single-outcome decision for a listener `NewConnection` event, factored
@@ -100,7 +188,12 @@ fn listener_callback(
     ev: ListenerEvent,
     config: &Arc<msquic::Configuration>,
     state: &Arc<RundownState>,
+    owned: &Cell<bool>,
 ) -> Result<(), Status> {
+    // `owned` is a PER-INVOCATION token (F-B); it starts `false` for every
+    // callback (fresh `Cell` per invocation in the handler), so there is no
+    // stale prior state to reset and no shared bit that a parallel callback
+    // could race.
     match ev {
         ListenerEvent::NewConnection {
             info: _,
@@ -119,8 +212,12 @@ fn listener_callback(
             // no `from_raw` and no Rust-side close — native `listener.c` performs
             // the single close on our returned `Err`.
             let decision = decide_new_connection(config, move || {
-                // `set_configuration` succeeded: only NOW take ownership.
+                // `set_configuration` succeeded: only NOW take ownership. Mark the
+                // per-invocation token the instant it transfers, so a subsequent
+                // panic's `listener_recover` knows the unwind's Drop already closed
+                // the owned connection (and must not also reject it).
                 let inner = unsafe { msquic::Connection::from_raw(connection.as_raw()) };
+                owned.set(true);
                 let conn = crate::Connection::attach(inner, guard);
                 match ctx.conn.as_ref() {
                     Some(tx) => match tx.unbounded_send(Some(conn)) {
@@ -169,8 +266,25 @@ impl Listener {
     ) -> Result<Self, Status> {
         let (tx, rx) = listener_ctx_channel();
         let state = reg.state().clone();
-        let handler =
-            move |_: ListenerRef, ev: ListenerEvent| listener_callback(&tx, ev, &config, &state);
+        let handler = move |_: ListenerRef, ev: ListenerEvent| {
+            let disp = listener_poison_disp(&ev);
+            // `C = &ListenerCtxSender`: the listener callback is an `Fn` closure,
+            // so the ctx is held (and mutated via interior atomics) through a
+            // shared reference. `guard_callback` still takes `&mut C` uniformly.
+            let mut ctx_ref: &ListenerCtxSender = &tx;
+            // Per-invocation ownership token (F-B): a FRESH `Cell` for every
+            // callback, so parallel listener callbacks never share ownership
+            // state. Captured by both the body (sets it after `from_raw`) and the
+            // recover closure (reads it).
+            let owned = Cell::new(false);
+            guard_callback(
+                &mut ctx_ref,
+                &NoShutdown,
+                disp,
+                |c| listener_callback(c, ev, &config, &state, &owned),
+                |c, seam| listener_recover(c, seam, &owned),
+            )
+        };
         // Reserve the listener's guard BEFORE opening the native handle:
         // `ListenerOpen` acquires the registration rundown before it returns, so
         // reserving first ensures an in-flight construction is always counted.
@@ -509,5 +623,296 @@ mod new_conn_decision {
     fn delivery_failure_reports_drop_owned() {
         let decision = decide_new_connection(Ok(()), || false);
         assert!(matches!(decision, NewConnDecision::DeliveryFailedDropOwned));
+    }
+}
+
+/// FFI callback panic containment (SF-E / FR-007) for the listener class.
+/// HERMETIC: a native `ConnectionRef` cannot be forged, so the ownership-aware
+/// [`listener_recover`] is exercised through [`guard_callback`] with a body that
+/// mirrors [`listener_callback`]'s `ownership_taken` handling (reset at the start
+/// of the invocation, set the instant `from_raw` would take ownership). The
+/// listener never force-closes, so `Err(INTERNAL_ERROR)` models msquic performing
+/// exactly one reject and `Ok(())` models the owned-connection `Drop` performing
+/// the single close (never both — no double-close, no leak).
+#[cfg(test)]
+mod callback_safety {
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use msquic::{ListenerEvent, Status, StatusCode};
+
+    use super::{
+        ListenerCtxReceiver, ListenerCtxSender, listener_ctx_channel, listener_poison_disp,
+        listener_recover,
+    };
+    use crate::{NoShutdown, guard_callback};
+
+    fn is_internal_err(r: &Result<(), Status>) -> bool {
+        matches!(r, Err(s) if s.0 == Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR).0)
+    }
+
+    /// RAII stand-in for the owned `Connection` that `from_raw` hands over. Its
+    /// `Drop` increments a shared counter, mirroring how the real owned
+    /// `Connection`'s `Drop` performs the single native close. Constructing one
+    /// models taking ownership; the unwind dropping it models the close — so the
+    /// close becomes directly OBSERVABLE (counter), not merely inferred from the
+    /// recover return value.
+    struct OwnedStandIn(Arc<AtomicUsize>);
+    impl Drop for OwnedStandIn {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Assert both listener terminal waiters were signalled by `listener_recover`,
+    /// so a pending `accept()` and a pending `shutdown()` cannot hang after a
+    /// contained panic. `accept()` must observe the end-of-connections sentinel
+    /// (`None`) and `shutdown()`'s one-shot must be resolved.
+    fn assert_both_waiters_woken(rx: &mut ListenerCtxReceiver) {
+        match rx.conn.try_recv() {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("accept received a connection, expected end sentinel"),
+            Err(_) => panic!("accept waiter not woken (channel empty) — would hang"),
+        }
+        let mut lk = crate::lock_recover(&rx.shutdown);
+        let sh = lk.as_mut().expect("shutdown receiver present");
+        match sh.try_recv() {
+            Ok(Some(())) => {}
+            Ok(None) => panic!("shutdown waiter not resolved — would hang"),
+            Err(_) => panic!("shutdown sender dropped without resolving"),
+        }
+    }
+
+    #[test]
+    fn listener_callback_panic_before_from_raw_rejects() {
+        let (tx, mut rx) = listener_ctx_channel();
+        // Close counter: no owned stand-in is ever created on this path.
+        let closes = Arc::new(AtomicUsize::new(0));
+        // Per-invocation ownership token (F-B): local, never shared with the ctx.
+        let owned = Cell::new(false);
+        let mut ctx_ref: &ListenerCtxSender = &tx;
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c| {
+                // Ownership never transferred, so no `OwnedStandIn` is constructed
+                // (from_raw never runs) and `owned` stays false.
+                let _keep_alive = &closes;
+                // Panic BEFORE taking ownership (from_raw never runs).
+                panic!("boom before from_raw");
+            },
+            |c, seam| listener_recover(c, seam, &owned),
+        );
+        // Ownership never transferred → recover returns Err: msquic performs the
+        // single reject (reject == 1), and ZERO owned-connection close happened.
+        assert!(is_internal_err(&got), "the single reject is the Err return");
+        assert_eq!(
+            closes.load(Ordering::Relaxed),
+            0,
+            "no owned stand-in exists, so zero close occurs (msquic rejects instead)"
+        );
+        assert!(tx.poisoned.load(Ordering::Relaxed));
+        // Both terminal waiters are woken so accept()/shutdown() cannot hang.
+        assert_both_waiters_woken(&mut rx);
+    }
+
+    #[test]
+    fn listener_callback_panic_after_from_raw_does_not_reject() {
+        let (tx, mut rx) = listener_ctx_channel();
+        // Close counter: the owned stand-in's Drop increments it exactly once.
+        let closes = Arc::new(AtomicUsize::new(0));
+        let owned = Cell::new(false);
+        let mut ctx_ref: &ListenerCtxSender = &tx;
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c| {
+                // Emulate from_raw taking ownership: construct the owned stand-in
+                // and mark the per-invocation token the instant it transfers. The
+                // named binding lives until the panic, so the unwind's Drop
+                // performs the single close (counter += 1).
+                let _owned_standin = OwnedStandIn(closes.clone());
+                owned.set(true);
+                panic!("boom after from_raw");
+            },
+            |c, seam| listener_recover(c, seam, &owned),
+        );
+        // Ownership already taken + dropped → msquic must NOT reject (Ok): the
+        // owned-connection Drop performed the single close (no double-close).
+        assert!(got.is_ok(), "recover returns Ok so msquic does NOT reject");
+        assert_eq!(
+            closes.load(Ordering::Relaxed),
+            1,
+            "the owned stand-in's Drop performs exactly one close"
+        );
+        assert!(tx.poisoned.load(Ordering::Relaxed));
+        // Even on the owned-connection close path, both terminal waiters are woken
+        // so accept()/shutdown() cannot hang.
+        assert_both_waiters_woken(&mut rx);
+    }
+
+    /// F-B: the close-or-reject decision is INVOCATION-LOCAL. msquic runs listener
+    /// callbacks in PARALLEL, one per accepted connection, so ownership must be
+    /// tracked in a per-call token, never a shared ctx bit. This models two
+    /// concurrent callbacks with TWO SEPARATE listener contexts (mirroring
+    /// msquic's real per-connection parallel callbacks) so neither invocation's
+    /// poison can short-circuit the other: invocation A takes ownership then
+    /// panics → Ok / exactly one close; invocation B panics pre-ownership → Err /
+    /// exactly one reject / zero close. BOTH recovery paths genuinely run (each
+    /// ctx is poisoned only by its own `listener_recover`), and each keeps its own
+    /// decision with zero cross-talk. If ownership were a shared bit, A's set or
+    /// B's reset would corrupt the other's outcome.
+    #[test]
+    fn listener_ownership_decision_is_invocation_local() {
+        // Two INDEPENDENT contexts: A's recovery poisons only ctx A, so B's
+        // guard_callback poison check never short-circuits B — both bodies panic
+        // and both recovery paths run to completion.
+        let (tx_a, _rx_a) = listener_ctx_channel();
+        let (tx_b, _rx_b) = listener_ctx_channel();
+
+        // Independent per-invocation tokens and close counters.
+        let owned_a = Cell::new(false);
+        let owned_b = Cell::new(false);
+        let closes_a = Arc::new(AtomicUsize::new(0));
+        let closes_b = Arc::new(AtomicUsize::new(0));
+
+        // Invocation A: takes ownership (from_raw ran) then panics → its owned
+        // stand-in Drop performs the single close.
+        let mut ctx_a: &ListenerCtxSender = &tx_a;
+        let got_a = guard_callback(
+            &mut ctx_a,
+            &NoShutdown,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c| {
+                let _owned_standin = OwnedStandIn(closes_a.clone());
+                owned_a.set(true);
+                panic!("A panics after ownership");
+            },
+            |c, seam| listener_recover(c, seam, &owned_a),
+        );
+
+        // Invocation B: never takes ownership, then panics → msquic performs the
+        // single reject and no owned stand-in is ever constructed (close == 0).
+        let mut ctx_b: &ListenerCtxSender = &tx_b;
+        let got_b = guard_callback(
+            &mut ctx_b,
+            &NoShutdown,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c| {
+                let _keep_alive = &closes_b;
+                panic!("B panics before ownership");
+            },
+            |c, seam| listener_recover(c, seam, &owned_b),
+        );
+
+        // BOTH recovery paths actually executed: `poisoned` is set ONLY inside
+        // `listener_recover`, so each ctx being poisoned proves its recover ran
+        // (B was NOT masked by A's poison).
+        assert!(
+            tx_a.poisoned.load(Ordering::Relaxed),
+            "A's recover ran (ctx A poisoned)"
+        );
+        assert!(
+            tx_b.poisoned.load(Ordering::Relaxed),
+            "B's recover ran (ctx B poisoned) — not short-circuited by A"
+        );
+
+        // A: Ok (no reject) + exactly one close via the owned Drop, zero rejects.
+        assert!(got_a.is_ok(), "A took ownership → Ok (no msquic reject)");
+        assert_eq!(
+            closes_a.load(Ordering::Relaxed),
+            1,
+            "A's owned stand-in closed exactly once"
+        );
+        // B: Err (single reject) + zero close — B saw its OWN false token, not A's.
+        assert!(
+            is_internal_err(&got_b),
+            "B never took ownership → Err (single msquic reject), unaffected by A"
+        );
+        assert_eq!(
+            closes_b.load(Ordering::Relaxed),
+            0,
+            "B constructed no owned stand-in, so zero close (msquic rejects instead)"
+        );
+
+        // Tokens are independent: neither invocation mutated the other's.
+        assert!(owned_a.get(), "A token stayed true");
+        assert!(!owned_b.get(), "B token stayed false");
+    }
+
+    #[test]
+    fn listener_poison_short_circuit_is_event_aware() {
+        let (tx, _rx) = listener_ctx_channel();
+        tx.poisoned.store(true, Ordering::Relaxed);
+        let owned = Cell::new(false);
+        let mut ctx_ref: &ListenerCtxSender = &tx;
+
+        // Teardown (StopComplete) → Ok, body not run.
+        let teardown = ListenerEvent::StopComplete {
+            app_close_in_progress: false,
+        };
+        assert!(listener_poison_disp(&teardown).is_ok());
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            listener_poison_disp(&teardown),
+            |_c| panic!("body must NOT run when poisoned"),
+            |c, seam| listener_recover(c, seam, &owned),
+        );
+        assert!(got.is_ok());
+
+        // Ownership-bearing / non-teardown disposition → Err, body not run.
+        // `NewConnection` carries a native `ConnectionRef` and cannot be forged
+        // hermetically; its Err mapping is the `_ => Err` catch-all modeled here.
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            Err(Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR)),
+            |_c| panic!("body must NOT run when poisoned"),
+            |c, seam| listener_recover(c, seam, &owned),
+        );
+        assert!(is_internal_err(&got));
+    }
+
+    #[test]
+    fn listener_teardown_body_panic_is_contained_and_wakes_waiters() {
+        // A panic while handling a TEARDOWN event (StopComplete) is contained:
+        // recover wakes both terminal waiters and poisons the ctx, so a pending
+        // accept()/shutdown() cannot hang. A subsequent StopComplete then
+        // short-circuits to a no-op Ok without re-running the body.
+        let (tx, mut rx) = listener_ctx_channel();
+        let owned = Cell::new(false);
+        let mut ctx_ref: &ListenerCtxSender = &tx;
+        let teardown = ListenerEvent::StopComplete {
+            app_close_in_progress: false,
+        };
+        // First event: ctx not yet poisoned, so the body runs and panics.
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            listener_poison_disp(&teardown),
+            |_c| panic!("boom while handling StopComplete"),
+            |c, seam| listener_recover(c, seam, &owned),
+        );
+        // No ownership taken during teardown → recover returns Err (harmless for a
+        // teardown, whose return msquic ignores). The key guarantees follow.
+        assert!(is_internal_err(&got));
+        assert!(tx.poisoned.load(Ordering::Relaxed));
+        // Both terminal waiters woken so nothing hangs after a teardown-body panic.
+        assert_both_waiters_woken(&mut rx);
+
+        // A subsequent StopComplete short-circuits to a no-op Ok without running
+        // the body (poison short-circuit), so waiters are not signalled twice.
+        let got = guard_callback(
+            &mut ctx_ref,
+            &NoShutdown,
+            listener_poison_disp(&teardown),
+            |_c| panic!("body must NOT run on teardown after poison"),
+            |c, seam| listener_recover(c, seam, &owned),
+        );
+        assert!(got.is_ok());
     }
 }
