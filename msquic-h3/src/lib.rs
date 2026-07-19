@@ -15,6 +15,8 @@ pub(crate) use h3::quic::ConnectionErrorIncoming;
 use msquic::{Status, StatusCode};
 
 mod buffer;
+mod config;
+pub use config::{ConfigError, H3Config, H3ConfigBuilder};
 mod callback;
 pub(crate) use callback::{
     CbClass, ForceShutdown, NoShutdown, PoisonFlag, ShutdownSeam, guard_callback,
@@ -54,8 +56,8 @@ pub(crate) use crate::buffer::SendBuffer;
 pub(crate) use stream::{
     Admit, MAX_RECV_BUFFER, PreIdReceivers, PreIdTail, ReceiveEvent, RecvBudget, RecvExec,
     RecvStreamReceiveCtx, SendExec, SendStreamReceiveCtx, StreamSendCtx, stream_callback,
-    stream_ctx_channel, stream_ctx_channel_pre_id, stream_ctx_channel_with_conn,
-    stream_poison_disp, stream_recover, submit_owned_send,
+    stream_ctx_channel, stream_ctx_channel_pre_id, stream_ctx_channel_with_config,
+    stream_ctx_channel_with_conn, stream_poison_disp, stream_recover, submit_owned_send,
 };
 pub use stream::{H3RecvStream, H3SendStream, H3Stream};
 pub(crate) use stream::{OpenExec, OpeningStream, StreamOpenExecutor};

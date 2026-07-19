@@ -8,9 +8,12 @@ where every `0.0.z` bump may contain breaking changes.
 
 ## [Unreleased]
 
-Post-`0.0.7` crate-review fixes. No public API break: the adapter surface is
-unchanged and these are behavioral/robustness corrections plus test and
-packaging hardening.
+Post-`0.0.7` crate-review fixes. No breaking public API change: existing
+constructors and the adapter surface keep their signatures and behavior. This
+release does **add** an additive public configuration API (see **Added** —
+`H3Config` plus two `*_with_config` constructors); the additions are opt-in and
+existing call sites are unaffected. The remaining changes are behavioral/
+robustness corrections plus test and packaging hardening.
 
 ### Fixed
 
@@ -52,6 +55,21 @@ packaging hardening.
 
 ### Added
 
+- **Configurable memory budgets (`H3Config`).** A new public `H3Config`
+  (with `H3ConfigBuilder` and `ConfigError`) carries validated per-stream
+  budgets — `max_send_bytes` (default 16 MiB), `max_recv_bytes` (default 1 MiB),
+  and a new `max_recv_units` (default 16384) — supplied at construction via the
+  additive `Connection::connect_with_config` / `Listener::with_config`; the
+  existing `Connection::connect` / `Listener::new` apply the defaults unchanged.
+  The receive path now enforces a per-stream **unit-count** budget alongside the
+  byte budget, so the callback returns `QUIC_STATUS_PENDING` when either bound is
+  reached — closing a paced-tiny-frame allocation-amplification OOM (a 1-byte-
+  paced peer is bounded to ≤ 16384 buffered units/stream instead of ~1,048,576).
+  The send side has no aggregate cap (the h3 trait contract calls the synchronous
+  `send_data` before its only async readiness hook, so a send cannot be deferred
+  as backpressure); per-connection send memory scales as
+  `max_send_bytes × concurrent streams`, documented with a recommendation to cap
+  concurrent streams at the application level.
 - **docs.rs metadata + provenance policy.** `[package.metadata.docs.rs]` pins
   the `native-src` provenance and `--cfg docsrs` for a self-contained doc build.
   Selecting neither provenance is a supported type-check-only configuration (no

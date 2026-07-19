@@ -23,6 +23,10 @@ use crate::{
 pub struct Listener {
     inner: msquic::Listener,
     conn: ListenerCtxReceiver,
+    // The listener-wide `H3Config` is not stored here: it is captured by `Copy`
+    // into the accept callback closure (see `with_config`), which is the single
+    // source of truth passed to every accepted `Connection::attach`. Keeping a
+    // second copy on the struct would be dead, drift-prone state.
     // Dropped last: `inner`'s ListenerClose releases the native rundown ref
     // before this guard decrements and wakes `wait_idle` waiters.
     _guard: RundownGuard,
@@ -189,6 +193,7 @@ fn listener_callback(
     config: &Arc<msquic::Configuration>,
     state: &Arc<RundownState>,
     owned: &Cell<bool>,
+    h3config: crate::H3Config,
 ) -> Result<(), Status> {
     // `owned` is a PER-INVOCATION token (F-B); it starts `false` for every
     // callback (fresh `Cell` per invocation in the handler), so there is no
@@ -218,7 +223,7 @@ fn listener_callback(
                 // the owned connection (and must not also reject it).
                 let inner = unsafe { msquic::Connection::from_raw(connection.as_raw()) };
                 owned.set(true);
-                let conn = crate::Connection::attach(inner, guard);
+                let conn = crate::Connection::attach(inner, guard, h3config);
                 match ctx.conn.as_ref() {
                     Some(tx) => match tx.unbounded_send(Some(conn)) {
                         Ok(()) => true,
@@ -258,11 +263,27 @@ fn listener_callback(
 }
 
 impl Listener {
+    /// Create a listener using the default memory budgets ([`H3Config::default`]).
+    ///
+    /// [`H3Config::default`]: crate::H3Config::default
     pub fn new(
         reg: &crate::Registration,
         config: Arc<msquic::Configuration>,
         alpn: &[BufferRef],
         local_addr: Option<SocketAddr>,
+    ) -> Result<Self, Status> {
+        Self::with_config(reg, config, alpn, local_addr, crate::H3Config::default())
+    }
+
+    /// Create a listener with an explicit [`H3Config`](crate::H3Config),
+    /// applied to every connection it accepts (and thus to every stream those
+    /// connections open/accept).
+    pub fn with_config(
+        reg: &crate::Registration,
+        config: Arc<msquic::Configuration>,
+        alpn: &[BufferRef],
+        local_addr: Option<SocketAddr>,
+        h3config: crate::H3Config,
     ) -> Result<Self, Status> {
         let (tx, rx) = listener_ctx_channel();
         let state = reg.state().clone();
@@ -281,7 +302,7 @@ impl Listener {
                 &mut ctx_ref,
                 &NoShutdown,
                 disp,
-                |c| listener_callback(c, ev, &config, &state, &owned),
+                |c| listener_callback(c, ev, &config, &state, &owned, h3config),
                 |c, seam| listener_recover(c, seam, &owned),
             )
         };

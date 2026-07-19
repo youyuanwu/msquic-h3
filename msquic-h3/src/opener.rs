@@ -279,7 +279,7 @@ mod stream_open_identity {
 
     #[test]
     fn accept_stream_id_success_takes_no_terminal() {
-        let (mut ctx, crx) = conn_ctx_channel();
+        let (mut ctx, crx) = conn_ctx_channel(crate::H3Config::default());
         let id = accept_stream_id(&mut ctx, || Ok(8)).expect("valid id accepted");
         assert_eq!(id.into_inner(), 8);
         // No terminal published; both acceptor senders remain open.
@@ -289,7 +289,7 @@ mod stream_open_identity {
 
     #[test]
     fn accept_stream_id_query_failure_publishes_internal_and_wakes_acceptors() {
-        let (mut ctx, crx) = conn_ctx_channel();
+        let (mut ctx, crx) = conn_ctx_channel(crate::H3Config::default());
         let status = Status::new(StatusCode::QUIC_STATUS_INTERNAL_ERROR);
         // A native get_stream_id failure returns its Status from the callback...
         let err = accept_stream_id(&mut ctx, || Err(status.clone())).expect_err("query failed");
@@ -308,7 +308,7 @@ mod stream_open_identity {
 
     #[test]
     fn accept_stream_id_invalid_id_publishes_internal_and_returns_internal_status() {
-        let (mut ctx, crx) = conn_ctx_channel();
+        let (mut ctx, crx) = conn_ctx_channel(crate::H3Config::default());
         // A (synthetic) out-of-range ID fails h3 validation: internal terminal,
         // QUIC_STATUS_INTERNAL_ERROR returned so msquic closes the stream.
         let err = accept_stream_id(&mut ctx, || Ok(u64::MAX)).expect_err("invalid id rejected");
@@ -327,7 +327,7 @@ mod stream_open_identity {
     fn already_published_peer_terminal_wins_over_internal() {
         // An accepted-stream failure records Internal, but a peer application
         // close published first is preserved (first-writer-wins).
-        let (mut ctx, crx) = conn_ctx_channel();
+        let (mut ctx, crx) = conn_ctx_channel(crate::H3Config::default());
         record_conn_terminal(&ctx.terminal, ConnectionTerminal::PeerApplication(7));
         let _ = accept_stream_id(&mut ctx, || Ok(u64::MAX)).expect_err("invalid id rejected");
         // The winning terminal is the earlier peer close, not the internal fault.
@@ -342,7 +342,7 @@ mod stream_open_identity {
         // Drive the exact seam the callback uses, but arm it through the
         // RECEIVER-side handle a live `Connection` frontend holds — proving the
         // failpoint atomic is shared with the callback's sender-side clone.
-        let (mut ctx, crx) = conn_ctx_channel();
+        let (mut ctx, crx) = conn_ctx_channel(crate::H3Config::default());
         crx.accepted_id_failpoint.arm_query_fail();
         // The callback consults its own (shared) sender-side handle.
         let fp = ctx.accepted_id_failpoint.clone();
@@ -362,7 +362,7 @@ mod stream_open_identity {
 
     #[test]
     fn accepted_id_failpoint_invalid_seam_rejects() {
-        let (mut ctx, crx) = conn_ctx_channel();
+        let (mut ctx, crx) = conn_ctx_channel(crate::H3Config::default());
         // Arm through the receiver-side (frontend) handle; read via the sender.
         crx.accepted_id_failpoint.arm_invalid_id();
         let fp = ctx.accepted_id_failpoint.clone();
@@ -542,7 +542,7 @@ mod stream_open_identity {
             })
             .unwrap();
         let guard = RundownGuard::new(reg.state().clone());
-        let conn = crate::Connection::attach(inner, guard);
+        let conn = crate::Connection::attach(inner, guard, crate::H3Config::default());
 
         // Arm query-fail through the live `Connection`; the shared atomic the
         // accept path consults trips once then consumes itself.
@@ -666,7 +666,12 @@ mod downcall_clamp {
             let inner =
                 Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
             let guard = RundownGuard::new(reg.state().clone());
-            let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
+            let conn = Arc::new(ConnHandle::new(
+                inner,
+                guard,
+                new_conn_terminal_slot(),
+                crate::H3Config::default(),
+            ));
 
             let rec = RecordingOpenExec::default();
             let codes = rec.codes.clone();
@@ -714,7 +719,7 @@ mod downcall_clamp {
             if let Some(reason) = self.record.clone() {
                 record_conn_terminal(conn.terminal(), reason);
             }
-            let (ctx, recv) = stream_ctx_channel_pre_id(conn.terminal().clone());
+            let (ctx, recv) = stream_ctx_channel_pre_id(conn.terminal().clone(), conn.config());
             let flag = if uni {
                 StreamOpenFlags::UNIDIRECTIONAL
             } else {
@@ -731,6 +736,7 @@ mod downcall_clamp {
                 conn_terminal,
                 receive,
                 recv_budget,
+                max_send_bytes,
             } = recv;
             Ok(OpeningStream {
                 stream: Arc::new(s),
@@ -741,6 +747,7 @@ mod downcall_clamp {
                     conn_terminal,
                     receive,
                     recv_budget,
+                    max_send_bytes,
                 },
             })
         }
@@ -766,7 +773,12 @@ mod downcall_clamp {
             let inner =
                 Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
             let guard = RundownGuard::new(reg.state().clone());
-            let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
+            let conn = Arc::new(ConnHandle::new(
+                inner,
+                guard,
+                new_conn_terminal_slot(),
+                crate::H3Config::default(),
+            ));
             let mut opener =
                 StreamOpener::with_open_exec(conn, Box::new(CancellingOpenExec { record: None }));
             let mut cx = noop_cx();
@@ -790,7 +802,12 @@ mod downcall_clamp {
             let inner =
                 Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
             let guard = RundownGuard::new(reg.state().clone());
-            let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
+            let conn = Arc::new(ConnHandle::new(
+                inner,
+                guard,
+                new_conn_terminal_slot(),
+                crate::H3Config::default(),
+            ));
             let mut opener = StreamOpener::with_open_exec(
                 conn,
                 Box::new(CancellingOpenExec {
@@ -825,7 +842,12 @@ mod downcall_clamp {
             let inner =
                 Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
             let guard = RundownGuard::new(reg.state().clone());
-            let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
+            let conn = Arc::new(ConnHandle::new(
+                inner,
+                guard,
+                new_conn_terminal_slot(),
+                crate::H3Config::default(),
+            ));
             record_conn_terminal(conn.terminal(), ConnectionTerminal::PeerApplication(9));
             let mut opener = StreamOpener::with_open_exec(
                 conn.clone(),
@@ -855,7 +877,12 @@ mod downcall_clamp {
             let inner =
                 Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
             let guard = RundownGuard::new(reg.state().clone());
-            let conn = Arc::new(ConnHandle::new(inner, guard, new_conn_terminal_slot()));
+            let conn = Arc::new(ConnHandle::new(
+                inner,
+                guard,
+                new_conn_terminal_slot(),
+                crate::H3Config::default(),
+            ));
             record_conn_terminal(conn.terminal(), ConnectionTerminal::PeerApplication(5));
             let mut opener = StreamOpener::with_open_exec(
                 conn.clone(),
@@ -893,8 +920,13 @@ mod downcall_clamp {
         let inner =
             Connection::open(reg.raw(), |_: ConnectionRef, _: ConnectionEvent| Ok(())).unwrap();
         let guard = RundownGuard::new(reg.state().clone());
-        let (ctx, crx) = crate::conn_ctx_channel();
-        let conn = Arc::new(ConnHandle::new(inner, guard, crx.terminal.clone()));
+        let (ctx, crx) = crate::conn_ctx_channel(crate::H3Config::default());
+        let conn = Arc::new(ConnHandle::new(
+            inner,
+            guard,
+            crx.terminal.clone(),
+            crate::H3Config::default(),
+        ));
         let opener = StreamOpener::new(conn.clone());
         let connection = crate::Connection {
             conn,

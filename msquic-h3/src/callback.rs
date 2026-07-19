@@ -142,7 +142,7 @@ mod callback_safety {
 
     #[test]
     fn connection_callback_connected_with_dropped_receiver_is_noop() {
-        let (mut ctx, rx) = conn_ctx_channel();
+        let (mut ctx, rx) = conn_ctx_channel(crate::H3Config::default());
         // Frontend gone: the `Connected` one-shot receiver is dropped.
         drop(rx);
         let ev = ConnectionEvent::Connected {
@@ -323,7 +323,7 @@ mod callback_safety {
 
     #[test]
     fn connection_callback_panic_is_contained() {
-        let (mut ctx, mut crx) = conn_ctx_channel();
+        let (mut ctx, mut crx) = conn_ctx_channel(crate::H3Config::default());
         let seam = RecordingSeam::default();
         // A panicking body is contained: process survives (test completes), the
         // connection is force-closed via the seam, and Err(INTERNAL_ERROR) returns.
@@ -362,7 +362,7 @@ mod callback_safety {
     fn connection_poison_short_circuit_is_event_aware() {
         // After a contained panic poisons the ctx, a teardown event short-circuits
         // to Ok (no-op) and a non-teardown (ownership-bearing) event to Err.
-        let (mut ctx, _crx) = conn_ctx_channel();
+        let (mut ctx, _crx) = conn_ctx_channel(crate::H3Config::default());
         let _ = guard_callback(
             &mut ctx,
             &RecordingSeam::default(),
@@ -416,7 +416,7 @@ mod callback_safety {
         // the ctx — so a task parked on the connect one-shot cannot hang. A
         // subsequent teardown then short-circuits to Ok WITHOUT re-running the
         // body, so Phase 2 terminal state is never double-completed.
-        let (mut ctx, mut crx) = conn_ctx_channel();
+        let (mut ctx, mut crx) = conn_ctx_channel(crate::H3Config::default());
         let seam = RecordingSeam::default();
         let teardown = ConnectionEvent::ShutdownComplete {
             handshake_completed: false,
@@ -486,7 +486,7 @@ mod callback_safety {
         // native stream ownership, so no owned stand-in exists (close == 0) and
         // `connection_recover` returns Err — msquic performs the single stream
         // reject. The connection is still force-closed and its waiters woken.
-        let (mut ctx, mut crx) = conn_ctx_channel();
+        let (mut ctx, mut crx) = conn_ctx_channel(crate::H3Config::default());
         let seam = RecordingSeam::default();
         // Per-invocation peer-stream ownership token, never shared with the ctx.
         let stream_owned = Cell::new(false);
@@ -538,7 +538,7 @@ mod callback_safety {
         // stream's Drop performs the single `StreamClose` (close == 1). msquic must
         // NOT re-close it, so `connection_recover` returns Ok (no double-close),
         // while still force-closing the CONNECTION and waking its waiters.
-        let (mut ctx, mut crx) = conn_ctx_channel();
+        let (mut ctx, mut crx) = conn_ctx_channel(crate::H3Config::default());
         let seam = RecordingSeam::default();
         let stream_owned = Cell::new(false);
         let closes = Arc::new(AtomicUsize::new(0));
@@ -588,7 +588,8 @@ mod callback_safety {
 
     #[test]
     fn stream_callback_panic_is_contained() {
-        let (mut ctx, mut recv) = stream_ctx_channel_pre_id(new_conn_terminal_slot());
+        let (mut ctx, mut recv) =
+            stream_ctx_channel_pre_id(new_conn_terminal_slot(), crate::H3Config::default());
         let seam = RecordingSeam::default();
         let got = guard_callback(
             &mut ctx,
@@ -632,7 +633,8 @@ mod callback_safety {
 
     #[test]
     fn stream_poison_short_circuit_is_event_aware() {
-        let (mut ctx, _recv) = stream_ctx_channel_pre_id(new_conn_terminal_slot());
+        let (mut ctx, _recv) =
+            stream_ctx_channel_pre_id(new_conn_terminal_slot(), crate::H3Config::default());
         let _ = guard_callback(
             &mut ctx,
             &RecordingSeam::default(),
@@ -674,7 +676,8 @@ mod callback_safety {
         // waiter, and poisons the ctx — so no waiter hangs. A subsequent teardown
         // then short-circuits to Ok without re-running the body (no double
         // completion of Phase 2 send/receive terminal state).
-        let (mut ctx, mut recv) = stream_ctx_channel_pre_id(new_conn_terminal_slot());
+        let (mut ctx, mut recv) =
+            stream_ctx_channel_pre_id(new_conn_terminal_slot(), crate::H3Config::default());
         let seam = RecordingSeam::default();
         let teardown = StreamEvent::ShutdownComplete {
             connection_shutdown: false,

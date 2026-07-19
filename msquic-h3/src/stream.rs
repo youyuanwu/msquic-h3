@@ -23,13 +23,14 @@ use msquic::{
 };
 
 use crate::buffer::{SendBuffer, SendLen, classify_send_len, copy_into_send_buffer};
+use crate::config::DEFAULT_MAX_RECV_UNITS;
 use crate::error::{
     ConnectionTerminal, ReceiveTerminal, SendCommand, SendEvent, SendInput, SendPayload, SendPoll,
     SendState, SendTerminal, clamp_application_code, convert_recv, convert_send, convert_send_op,
     transition,
 };
 use crate::{
-    CbClass, ConnHandle, ConnTerminalSlot, ForceShutdown, H3_INTERNAL_ERROR, PoisonFlag,
+    CbClass, ConnHandle, ConnTerminalSlot, ForceShutdown, H3_INTERNAL_ERROR, H3Config, PoisonFlag,
     SendTerminalSlot, ShutdownSeam, classify_conn_shutdown, commit_conn, guard_callback,
     internal_error_status, load_winner, lock_recover, new_send_terminal_slot, observe_conn_winner,
     peek_conn_terminal, publish_send, record_conn_terminal, report_contained_panic,
@@ -255,6 +256,11 @@ pub(crate) const MAX_RECV_BUFFER: usize = 1024 * 1024; // 1 MiB per stream
 struct RecvState {
     /// Undrained bytes currently sitting in this stream's receive channel.
     buffered: usize,
+    /// Undrained receive UNITS (queued `Data` events) on this stream. Charged
+    /// exactly once per admitted non-empty indication and released one-per-drain
+    /// in `on_drained` (matching `poll_data`'s one-event-per-poll consumption).
+    /// An empty indication enqueues no `Data` event and takes no unit.
+    units: usize,
     /// True once this stream returned `QUIC_STATUS_PENDING` and has not yet been
     /// re-armed via `receive_complete`.
     pend_outstanding: bool,
@@ -263,18 +269,37 @@ struct RecvState {
     /// frees the budget.
     pending_indication_len: u64,
     /// Peak `buffered` ever observed on this stream (test/measurement
-    /// observation for the SC-004 bound; must stay ≤ `MAX_RECV_BUFFER` + one
+    /// observation for the SC-003 byte bound; must stay ≤ `max_bytes` + one
     /// in-flight indication).
     peak: usize,
+    /// Peak `units` ever observed on this stream (test/measurement observation
+    /// for the SC-002/SC-003 unit bound; must stay ≤ `max_units`).
+    peak_units: usize,
 }
 
 /// Per-stream receive budget, shared (as an `Arc`) between the stream callback
 /// (writer) and the `poll_data` drain (reader). Each local or accepted stream
-/// owns its own independent 1 MiB budget; there is no connection-wide meter. See
-/// [`RecvState`].
-#[derive(Debug, Default)]
+/// owns its own independent budget sourced from the connection's [`H3Config`];
+/// there is no connection-wide meter. See [`RecvState`].
+///
+/// `max_bytes` is the per-stream byte ceiling (default [`MAX_RECV_BUFFER`]).
+/// `max_units` is the per-stream buffered-unit ceiling (default
+/// [`DEFAULT_MAX_RECV_UNITS`]); it bounds the count of queued receive
+/// allocations independently of their byte total, closing the paced-tiny-frame
+/// allocation-amplification vector.
+#[derive(Debug)]
 pub(crate) struct RecvBudget {
     state: Mutex<RecvState>,
+    /// Per-stream buffered-byte ceiling (config-sourced).
+    max_bytes: usize,
+    /// Per-stream buffered-unit ceiling (config-sourced).
+    max_units: usize,
+}
+
+impl Default for RecvBudget {
+    fn default() -> Self {
+        Self::new(MAX_RECV_BUFFER, DEFAULT_MAX_RECV_UNITS)
+    }
 }
 
 /// Outcome of the callback-side [`RecvBudget::admit`] transition.
@@ -292,6 +317,15 @@ pub(crate) enum Admit {
 }
 
 impl RecvBudget {
+    /// Build a receive budget with explicit per-stream caps (from [`H3Config`]).
+    pub(crate) fn new(max_bytes: usize, max_units: usize) -> Self {
+        Self {
+            state: Mutex::new(RecvState::default()),
+            max_bytes,
+            max_units,
+        }
+    }
+
     /// Lock the receive state, recovering a poisoned lock rather than panicking
     /// (FFI callbacks must never unwind across the msquic boundary).
     fn lock(&self) -> MutexGuard<'_, RecvState> {
@@ -300,7 +334,10 @@ impl RecvBudget {
 
     /// Callback-side single synchronized transition — **accounting BEFORE
     /// drain-visibility, publish and decision atomic under one lock**. Adds a
-    /// full indication of `total` bytes, decides whether the stream must pend
+    /// full indication of `total` bytes, charges one buffered UNIT when
+    /// `charge_unit` is set (a non-empty indication that will enqueue a `Data`
+    /// event — an empty indication enqueues nothing and takes no unit), decides
+    /// whether the stream must pend on EITHER the byte or the unit ceiling
     /// (saving this indication's FULL length), and then — still holding the
     /// lock, as the LAST step — runs `publish` to make the bytes drain-visible.
     /// `publish` returns `true` on a successful hand-off (or when there is
@@ -309,11 +346,13 @@ impl RecvBudget {
     /// never observe stale accounting, and [`Admit::PublishFailed`] is returned.
     /// Because the publish is the last step, a concurrent drain can never
     /// subtract before the increment lands.
-    fn admit(&self, total: usize, publish: impl FnOnce() -> bool) -> Admit {
+    fn admit(&self, total: usize, charge_unit: bool, publish: impl FnOnce() -> bool) -> Admit {
         let mut st = self.lock();
         // Snapshot for exact rollback if the publication fails.
         let prev_buffered = st.buffered;
+        let prev_units = st.units;
         let prev_peak = st.peak;
+        let prev_peak_units = st.peak_units;
         let prev_pend = st.pend_outstanding;
         let prev_len = st.pending_indication_len;
 
@@ -321,7 +360,13 @@ impl RecvBudget {
         if st.buffered > st.peak {
             st.peak = st.buffered;
         }
-        let pend = st.buffered >= MAX_RECV_BUFFER;
+        if charge_unit {
+            st.units += 1;
+            if st.units > st.peak_units {
+                st.peak_units = st.units;
+            }
+        }
+        let pend = st.buffered >= self.max_bytes || st.units >= self.max_units;
         if pend {
             st.pend_outstanding = true;
             st.pending_indication_len = total as u64;
@@ -330,10 +375,13 @@ impl RecvBudget {
         if publish() {
             if pend { Admit::Pend } else { Admit::Accepted }
         } else {
-            // Roll the whole transition back: buffered, peak watermark, and the
-            // pend fields all return to their pre-indication values.
+            // Roll the whole transition back: buffered, units, both peak
+            // watermarks, and the pend fields all return to their pre-indication
+            // values (no leaked unit charge on a failed publish).
             st.buffered = prev_buffered;
+            st.units = prev_units;
             st.peak = prev_peak;
+            st.peak_units = prev_peak_units;
             st.pend_outstanding = prev_pend;
             st.pending_indication_len = prev_len;
             Admit::PublishFailed
@@ -341,9 +389,11 @@ impl RecvBudget {
     }
 
     /// Drain-side single synchronized transition. Subtracts `len` drained bytes
-    /// and, if a pend is outstanding and the budget has fallen below the bound,
-    /// clears the pend and returns the FULL saved indication length to hand to
-    /// `receive_complete` (re-arming the stream). Returns `None` otherwise.
+    /// AND releases exactly one buffered unit (each delivered `Data` event
+    /// consumed exactly one queued unit) and, if a pend is outstanding and BOTH
+    /// the byte and unit budgets have fallen below their bounds, clears the pend
+    /// and returns the FULL saved indication length to hand to `receive_complete`
+    /// (re-arming the stream). Returns `None` otherwise.
     fn on_drained(&self, len: usize) -> Option<u64> {
         let mut st = self.lock();
         // The publish-last ordering in `admit` guarantees the increment for these
@@ -356,7 +406,15 @@ impl RecvBudget {
             st.buffered
         );
         st.buffered = st.buffered.saturating_sub(len);
-        if st.pend_outstanding && st.buffered < MAX_RECV_BUFFER {
+        // A delivered `Data` event always corresponds to exactly one charged
+        // unit (empty indications enqueue no event), so this never underflows.
+        debug_assert!(
+            st.units >= 1,
+            "recv units underflow on drain: units={}",
+            st.units
+        );
+        st.units = st.units.saturating_sub(1);
+        if st.pend_outstanding && st.buffered < self.max_bytes && st.units < self.max_units {
             st.pend_outstanding = false;
             let complete = st.pending_indication_len;
             st.pending_indication_len = 0;
@@ -375,11 +433,26 @@ impl RecvBudget {
     fn peak(&self) -> usize {
         self.lock().peak
     }
+    fn units(&self) -> usize {
+        self.lock().units
+    }
+    fn peak_units(&self) -> usize {
+        self.lock().peak_units
+    }
     fn pend_outstanding(&self) -> bool {
         self.lock().pend_outstanding
     }
     fn pending_indication_len(&self) -> u64 {
         self.lock().pending_indication_len
+    }
+    /// Config-sourced per-stream byte ceiling (threading assertion).
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+    /// Config-sourced per-stream unit ceiling (threading assertion; Phase 2
+    /// enforces it).
+    pub(crate) fn max_units(&self) -> usize {
+        self.max_units
     }
 }
 
@@ -489,6 +562,12 @@ pub(crate) struct SendStreamReceiveCtx {
     /// Single ordered send-event source (MF-1): data completion, terminal wake,
     /// and finish completion. The reducer observes it only as a [`SendPoll`].
     pub(crate) send: mpsc::UnboundedReceiver<SendEvent>,
+    /// Per-stream `send_data` payload ceiling (config-sourced, default
+    /// [`MAX_ADAPTER_SEND`]). Read by `send_data` to classify/reject oversized
+    /// payloads before any allocation.
+    ///
+    /// [`MAX_ADAPTER_SEND`]: crate::error::MAX_ADAPTER_SEND
+    pub(crate) max_send_bytes: u64,
     /// Pure send-side reducer bookkeeping (replaces the old `send_inprogress`).
     pub(crate) reducer: SendState,
 }
@@ -509,9 +588,9 @@ pub(crate) struct PreIdReceivers {
     pub(crate) receive: mpsc::UnboundedReceiver<ReceiveEvent>,
     /// Per-stream receive budget (SF-A), carried into the receive half's ctx.
     pub(crate) recv_budget: Arc<RecvBudget>,
+    /// Per-stream `send_data` ceiling (config-sourced), moved into the send half.
+    pub(crate) max_send_bytes: u64,
 }
-
-/// A locally opened stream whose native handle is started but whose h3
 /// [`h3::quic::StreamId`] is not yet known. Private to [`StreamOpener`]; the
 /// only stream form allowed to exist without a cached ID. On a successful
 /// `StartComplete` it is consumed into an [`H3Stream`] with concrete ID fields
@@ -538,6 +617,8 @@ pub(crate) struct PreIdTail {
     pub(crate) receive: mpsc::UnboundedReceiver<ReceiveEvent>,
     /// Per-stream receive budget (SF-A), carried into the receive half's ctx.
     pub(crate) recv_budget: Arc<RecvBudget>,
+    /// Per-stream `send_data` ceiling (config-sourced), moved into the send half.
+    pub(crate) max_send_bytes: u64,
 }
 
 impl OpeningStream {
@@ -556,6 +637,7 @@ impl OpeningStream {
             conn_terminal,
             receive,
             recv_budget,
+            max_send_bytes,
         } = tail;
         H3Stream {
             send: H3SendStream {
@@ -567,6 +649,7 @@ impl OpeningStream {
                     send_terminal,
                     conn_terminal: conn_terminal.clone(),
                     send,
+                    max_send_bytes,
                     reducer: SendState::new(),
                 },
             },
@@ -595,12 +678,16 @@ impl OpeningStream {
 /// the receivers so both frontend halves resolve+freeze the same winner.
 pub(crate) fn stream_ctx_channel_pre_id(
     conn_terminal: ConnTerminalSlot,
+    config: H3Config,
 ) -> (StreamSendCtx, PreIdReceivers) {
     let (start_tx, start_rx) = oneshot::channel::<Result<u64, Status>>();
     let (send_tx, send_rx) = mpsc::unbounded();
     let send_terminal = new_send_terminal_slot();
     let (receive_tx, receive_rx) = mpsc::unbounded();
-    let recv_budget = Arc::new(RecvBudget::default());
+    let recv_budget = Arc::new(RecvBudget::new(
+        config.max_recv_bytes(),
+        config.max_recv_units(),
+    ));
     (
         StreamSendCtx {
             start: Some(start_tx),
@@ -619,6 +706,7 @@ pub(crate) fn stream_ctx_channel_pre_id(
             conn_terminal,
             receive: receive_rx,
             recv_budget,
+            max_send_bytes: config.max_send_bytes(),
         },
     )
 }
@@ -626,8 +714,9 @@ pub(crate) fn stream_ctx_channel_pre_id(
 /// ID-bearing stream channel builder used where the identity is already known
 /// (accepted streams and tests). Splits the pre-ID receivers into the two
 /// frontend halves' ctxs directly. Creates a fresh, standalone connection
-/// terminal slot; tests that need to drive connection-terminal refinement use
-/// [`stream_ctx_channel_with_conn`] to inject a shared slot.
+/// terminal slot and uses the default [`H3Config`]; tests that need to drive
+/// connection-terminal refinement use [`stream_ctx_channel_with_conn`], and
+/// tests that need custom caps use [`stream_ctx_channel_with_config`].
 #[cfg(test)]
 pub(crate) fn stream_ctx_channel(
     id: h3::quic::StreamId,
@@ -637,13 +726,26 @@ pub(crate) fn stream_ctx_channel(
 
 /// ID-bearing stream channel builder sharing an explicit connection terminal
 /// slot with the caller, so a test can record/refine the connection terminal and
-/// observe how the stream halves resolve+freeze it (FR-013).
+/// observe how the stream halves resolve+freeze it (FR-013). Uses the default
+/// [`H3Config`].
 #[cfg(test)]
 pub(crate) fn stream_ctx_channel_with_conn(
     id: h3::quic::StreamId,
     conn_terminal: ConnTerminalSlot,
 ) -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamReceiveCtx) {
-    let (ctx, recv) = stream_ctx_channel_pre_id(conn_terminal);
+    stream_ctx_channel_with_config(id, conn_terminal, H3Config::default())
+}
+
+/// ID-bearing stream channel builder with an explicit [`H3Config`], so a test
+/// can assert the connection's caps thread into both stream halves (the
+/// `RecvBudget` byte/unit caps and the send ceiling).
+#[cfg(test)]
+pub(crate) fn stream_ctx_channel_with_config(
+    id: h3::quic::StreamId,
+    conn_terminal: ConnTerminalSlot,
+    config: H3Config,
+) -> (StreamSendCtx, SendStreamReceiveCtx, RecvStreamReceiveCtx) {
+    let (ctx, recv) = stream_ctx_channel_pre_id(conn_terminal, config);
     let PreIdReceivers {
         start: _,
         send,
@@ -651,6 +753,7 @@ pub(crate) fn stream_ctx_channel_with_conn(
         conn_terminal,
         receive,
         recv_budget,
+        max_send_bytes,
     } = recv;
     (
         ctx,
@@ -659,6 +762,7 @@ pub(crate) fn stream_ctx_channel_with_conn(
             send_terminal,
             conn_terminal: conn_terminal.clone(),
             send,
+            max_send_bytes,
             reducer: SendState::new(),
         },
         RecvStreamReceiveCtx {
@@ -755,11 +859,14 @@ pub(crate) fn stream_callback(ctx: &mut StreamSendCtx, ev: StreamEvent) -> Resul
                     }
                 }
                 let b = b.freeze();
+                // An empty, non-FIN indication enqueues no `Data` event and so
+                // takes no unit; a non-empty indication charges exactly one unit.
+                let charge_unit = !b.is_empty();
                 // ONE synchronized transition: increment → decide-pend (saving
                 // this indication's FULL length) → publish under the lock. On a
                 // failed publication the whole mutation is rolled back inside
                 // `admit`, so a dropped frontend leaves accounting untouched.
-                match ctx.recv_budget.admit(total, || {
+                match ctx.recv_budget.admit(total, charge_unit, || {
                     // An empty, non-FIN notification produces NO event (Finding
                     // 8): a zero-length receive is not by itself end-of-stream,
                     // and counts as a successful (no-op) publication.
@@ -946,13 +1053,16 @@ impl H3Stream {
     ///
     /// `conn_terminal` is the accepting connection's SHARED terminal slot, so an
     /// accepted stream reports the same refinable connection cause the accept
-    /// frontends do (FR-013).
+    /// frontends do (FR-013). `config` is the accepting connection's memory
+    /// budget, so the accepted stream inherits the same caps as a locally-opened
+    /// one (FR-009).
     pub(crate) fn attach(
         stream: msquic::Stream,
         id: h3::quic::StreamId,
         conn_terminal: ConnTerminalSlot,
+        config: H3Config,
     ) -> Self {
-        let (mut ctx, recv) = stream_ctx_channel_pre_id(conn_terminal);
+        let (mut ctx, recv) = stream_ctx_channel_pre_id(conn_terminal, config);
         let handler = move |stream_ref: StreamRef, ev: StreamEvent| {
             let disp = stream_poison_disp(&ev);
             guard_callback(
@@ -975,6 +1085,7 @@ impl H3Stream {
                 conn_terminal: recv.conn_terminal,
                 receive: recv.receive,
                 recv_budget: recv.recv_budget,
+                max_send_bytes: recv.max_send_bytes,
             },
         }
         .finalize(id)
@@ -988,7 +1099,7 @@ impl H3Stream {
         tracing::instrument(skip_all, level = "trace", err, ret)
     )]
     fn open_and_start(conn: &ConnHandle, uni: bool) -> Result<OpeningStream, Status> {
-        let (mut ctx, recv) = stream_ctx_channel_pre_id(conn.terminal().clone());
+        let (mut ctx, recv) = stream_ctx_channel_pre_id(conn.terminal().clone(), conn.config());
         let handler = move |stream_ref: StreamRef, ev: StreamEvent| {
             let disp = stream_poison_disp(&ev);
             guard_callback(
@@ -1017,8 +1128,31 @@ impl H3Stream {
                 conn_terminal: recv.conn_terminal,
                 receive: recv.receive,
                 recv_budget: recv.recv_budget,
+                max_send_bytes: recv.max_send_bytes,
             },
         })
+    }
+}
+
+/// Test-only accessors that read the LIVE per-stream budgets a fully-constructed
+/// stream is actually enforcing, so an end-to-end loopback test can confirm the
+/// connection's [`H3Config`] threaded all the way through the real
+/// `PeerStreamStarted`/`attach`/`finalize` (accepted) and `open_and_start`
+/// (locally-opened) hand-offs — not just through the shared seam helper.
+#[cfg(test)]
+impl H3Stream {
+    /// The live per-stream receive caps `(max_recv_bytes, max_recv_units)` this
+    /// stream's `RecvBudget` is enforcing.
+    pub(crate) fn recv_budget_caps(&self) -> (usize, usize) {
+        (
+            self.recv.rctx.recv_budget.max_bytes(),
+            self.recv.rctx.recv_budget.max_units(),
+        )
+    }
+
+    /// The live per-stream `send_data` ceiling this stream is enforcing.
+    pub(crate) fn max_send_bytes(&self) -> u64 {
+        self.send.sctx.max_send_bytes
     }
 }
 
@@ -1103,7 +1237,7 @@ impl<B: Buf> SendStream<B> for H3SendStream {
         // when the reducer returns `SubmitSend`, so nothing is copied on a
         // terminal / misuse / oversized / empty path.
         let mut wb: h3::quic::WriteBuf<B> = data.into();
-        let payload = classify_payload(wb.remaining());
+        let payload = classify_payload(wb.remaining(), self.sctx.max_send_bytes);
         let mut input = SendInput::SendRequested {
             payload,
             terminal: self.sctx.resolve_terminal(),
@@ -1334,12 +1468,16 @@ impl SendStreamReceiveCtx {
 }
 
 /// Classify a `send_data` payload length into a [`SendPayload`] before any
-/// allocation. The `NonEmpty` upper bound is `MAX_ADAPTER_SEND` (< `u32::MAX`),
-/// so the `as u32` cast never truncates.
-fn classify_payload(remaining: usize) -> SendPayload {
-    match classify_send_len(remaining) {
+/// allocation. The `NonEmpty` upper bound is the configured `ceiling`
+/// (`<= u32::MAX` by [`H3Config`] validation), so the `as u32` cast never
+/// truncates.
+fn classify_payload(remaining: usize, ceiling: u64) -> SendPayload {
+    match classify_send_len(remaining, ceiling) {
         SendLen::Empty => SendPayload::Empty,
-        SendLen::Oversized => SendPayload::Oversized { len: remaining },
+        SendLen::Oversized => SendPayload::Oversized {
+            len: remaining,
+            ceiling,
+        },
         SendLen::NonEmpty => SendPayload::NonEmpty {
             len: remaining as u32,
         },
@@ -2031,7 +2169,7 @@ mod receive_events {
         // pend and PUBLISHES the bytes under the lock, returning the pend outcome
         // the callback has NOT yet acted on.
         let racing = Bytes::from(vec![0xEEu8; RACE]);
-        let outcome = recv.rctx.recv_budget.admit(RACE, || {
+        let outcome = recv.rctx.recv_budget.admit(RACE, true, || {
             ctx.receive
                 .as_ref()
                 .expect("frontend live")
@@ -2112,7 +2250,7 @@ mod receive_events {
                 for _ in 0..ITERS {
                     // Exactly the callback's transition: the publish (channel send)
                     // is the LAST step, under the lock, after the increment.
-                    budget.admit(CHUNK, || tx.send(CHUNK).is_ok());
+                    budget.admit(CHUNK, true, || tx.send(CHUNK).is_ok());
                 }
                 drop(tx);
             })
@@ -2317,5 +2455,446 @@ mod receive_events {
             other => panic!("expected concatenated data, got {other:?}"),
         }
         assert_eq!(rrx.recv_budget.buffered(), 9);
+    }
+
+    // ----- Phase 2: per-stream receive UNIT-count backpressure -----
+
+    use super::stream_ctx_channel_with_config;
+    use crate::H3Config;
+    use crate::config::DEFAULT_MAX_RECV_UNITS;
+
+    /// SC-002 (the key regression): a PENDING-honoring paced driver offers ≥
+    /// 100,000 ONE-BYTE frames one at a time on a **drain-one-per-pend cyclic**
+    /// model. It offers frames until the callback returns `QUIC_STATUS_PENDING`
+    /// (native has paused THIS stream); it then STOPS offering and drains
+    /// EXACTLY ONE buffered unit, which must produce EXACTLY ONE recorded native
+    /// `receive_complete` (the re-arm) through the `RecvExec` seam before any
+    /// further offer. The application never gets ahead of the flood — it only
+    /// consumes the single unit needed to re-open the window — so the peak
+    /// buffered UNIT count stays ≤ `max_recv_units` (16384) and peak bytes ≤
+    /// `max_recv_bytes` + one indication. (Old behaviour would have buffered
+    /// ~1,048,576 units.)
+    ///
+    /// Retaining the `RecordingRecvExec` completion log lets the driver assert
+    /// the seam actually fired `receive_complete` once per pend, rather than
+    /// merely observing an internal flag clear: if `poll_data` cleared the pend
+    /// state without invoking the native `receive_complete`, a real MsQuic
+    /// stream would stay permanently paused, and this test now fails.
+    #[test]
+    fn paced_tiny_frames_are_bounded_by_the_unit_cap() {
+        let (mut ctx, _sctx, rctx) = stream_ctx_channel(0u64.try_into().unwrap());
+        let rec = RecordingRecvExec::default();
+        // RETAIN the completion log so we can assert each pend is re-armed by
+        // exactly one recorded native `receive_complete`.
+        let completes = rec.completes.clone();
+        let mut recv = H3RecvStream::with_exec(Box::new(rec), rctx);
+        let mut cx = noop_context();
+
+        const OFFER_TARGET: usize = 100_000;
+        let mut offered = 0usize;
+        let mut peak_units = 0usize;
+        let mut peak_bytes = 0usize;
+        let mut pend_returns = 0usize;
+        let mut completions = 0usize;
+
+        // Drain exactly one buffered unit and require exactly one NEW recorded
+        // `receive_complete` (the re-arm). Returns after asserting the pend
+        // cleared.
+        let drain_one_and_require_rearm =
+            |recv: &mut H3RecvStream, cx: &mut Context<'_>, completions: &mut usize| {
+                let before = completes.lock().unwrap().len();
+                match recv.poll_data(cx) {
+                    Poll::Ready(Ok(Some(_))) => {}
+                    other => panic!("expected buffered data while paced-stalled, got {other:?}"),
+                }
+                let after = completes.lock().unwrap().len();
+                assert_eq!(
+                    after,
+                    before + 1,
+                    "each pend must be re-armed by exactly ONE recorded receive_complete"
+                );
+                assert!(
+                    !recv.rctx.recv_budget.pend_outstanding(),
+                    "draining one unit below the cap must clear the pend"
+                );
+                *completions += 1;
+            };
+
+        while offered < OFFER_TARGET {
+            if recv.rctx.recv_budget.pend_outstanding() {
+                // Native has paused THIS stream after PENDING: no further
+                // indication is delivered until the app drains one buffered unit,
+                // which must re-arm the window via a recorded `receive_complete`.
+                drain_one_and_require_rearm(&mut recv, &mut cx, &mut completions);
+                continue;
+            }
+            // A REAL one-byte offer through the real receive callback/seam.
+            let res = feed_receive_result(&mut ctx, &[0xAB], ReceiveFlags::NONE);
+            offered += 1;
+            peak_units = peak_units.max(recv.rctx.recv_budget.units());
+            peak_bytes = peak_bytes.max(recv.rctx.recv_budget.buffered());
+            if is_pending(&res) {
+                pend_returns += 1;
+                assert!(recv.rctx.recv_budget.pend_outstanding());
+            } else {
+                assert!(res.is_ok(), "sub-cap offer must be Ok, got {res:?}");
+            }
+        }
+
+        // Drain a final outstanding pend (if the last offer pended) so the
+        // recorded-completion count matches the pend count exactly.
+        if recv.rctx.recv_budget.pend_outstanding() {
+            drain_one_and_require_rearm(&mut recv, &mut cx, &mut completions);
+        }
+
+        assert!(offered >= OFFER_TARGET);
+        assert!(pend_returns > 0, "the unit cap must engage backpressure");
+        // Exactly one recorded native `receive_complete` per pend (the seam
+        // genuinely re-armed the stream every time it paused).
+        assert_eq!(
+            completions, pend_returns,
+            "exactly one drain-driven re-arm per pend"
+        );
+        assert_eq!(
+            completes.lock().unwrap().len(),
+            pend_returns,
+            "the native receive_complete seam fired exactly once per pend"
+        );
+        // The unit count is bounded by the cap — never the ~1M it would reach
+        // without unit accounting.
+        assert_eq!(
+            peak_units, DEFAULT_MAX_RECV_UNITS,
+            "peak units must reach and stay at the unit cap ({DEFAULT_MAX_RECV_UNITS})"
+        );
+        assert_eq!(recv.rctx.recv_budget.peak_units(), DEFAULT_MAX_RECV_UNITS);
+        // With one-byte frames the byte budget is nowhere near binding.
+        assert!(
+            peak_bytes <= MAX_RECV_BUFFER + 1,
+            "peak bytes {peak_bytes} must stay <= byte budget + one indication"
+        );
+        assert!(
+            peak_units < 1_048_576,
+            "the unit cap prevents the ~1,048,576-unit amplification (peak={peak_units})"
+        );
+    }
+
+    /// SC-003 (exact, no tie): frames each ≥ F = 128 bytes fill the BYTE budget
+    /// (reached at ≤ 8192 units) strictly before the unit cap (16384). Feeding
+    /// 128-byte frames until backpressure, the buffered byte total reaches the
+    /// byte budget within one indication AND the unit count stays STRICTLY below
+    /// the unit cap.
+    #[test]
+    fn frames_at_or_above_128_bytes_bind_on_bytes_first() {
+        const F: usize = 128;
+        let (mut ctx, _sctx, _rctx) = stream_ctx_channel(0u64.try_into().unwrap());
+        let frame = vec![0x5Au8; F];
+
+        let mut res = feed_receive_result(&mut ctx, &frame, ReceiveFlags::NONE);
+        while !is_pending(&res) {
+            res = feed_receive_result(&mut ctx, &frame, ReceiveFlags::NONE);
+        }
+        let buffered = ctx.recv_budget.buffered();
+        let units = ctx.recv_budget.units();
+        // The byte budget bound first, within one indication.
+        assert!(
+            (MAX_RECV_BUFFER..=MAX_RECV_BUFFER + F).contains(&buffered),
+            "buffered {buffered} should reach the byte budget within one indication"
+        );
+        // The unit count stayed STRICTLY below the unit cap (no tie): 1 MiB / 128
+        // = 8192 units < 16384.
+        assert!(
+            units < DEFAULT_MAX_RECV_UNITS,
+            "units {units} must be strictly below the unit cap ({DEFAULT_MAX_RECV_UNITS})"
+        );
+        assert_eq!(
+            units,
+            MAX_RECV_BUFFER / F,
+            "byte budget bound at 8192 units"
+        );
+    }
+
+    /// SC-004 (recv unit half): a smaller `max_recv_units` engages receive
+    /// backpressure at exactly the configured unit count (byte budget kept at its
+    /// default so it cannot bind).
+    #[test]
+    fn custom_recv_unit_cap_engages_backpressure_at_configured_value() {
+        const UNITS: usize = 8;
+        let cfg = H3Config::builder()
+            .with_max_recv_units(UNITS)
+            .build()
+            .unwrap();
+        let (mut ctx, _sctx, _rctx) =
+            stream_ctx_channel_with_config(0u64.try_into().unwrap(), new_conn_terminal_slot(), cfg);
+
+        // The first UNITS-1 one-byte offers stay sub-cap; the UNITS-th pends.
+        for i in 0..UNITS - 1 {
+            assert!(
+                feed_receive_result(&mut ctx, &[0x11], ReceiveFlags::NONE).is_ok(),
+                "offer {i} below the unit cap must be Ok"
+            );
+        }
+        let res = feed_receive_result(&mut ctx, &[0x11], ReceiveFlags::NONE);
+        assert!(is_pending(&res), "the configured unit cap must pend");
+        assert_eq!(ctx.recv_budget.units(), UNITS);
+        assert!(ctx.recv_budget.pend_outstanding());
+    }
+
+    /// SC-004 (recv byte half): a smaller `max_recv_bytes` engages receive
+    /// backpressure at the configured byte budget (unit cap kept at its default
+    /// so it cannot bind).
+    #[test]
+    fn custom_recv_byte_cap_engages_backpressure_at_configured_value() {
+        const BYTES: usize = 512;
+        const F: usize = 128;
+        let cfg = H3Config::builder()
+            .with_max_recv_bytes(BYTES)
+            .build()
+            .unwrap();
+        let (mut ctx, _sctx, _rctx) =
+            stream_ctx_channel_with_config(0u64.try_into().unwrap(), new_conn_terminal_slot(), cfg);
+
+        let frame = vec![0x22u8; F];
+        for _ in 0..(BYTES / F) - 1 {
+            assert!(feed_receive_result(&mut ctx, &frame, ReceiveFlags::NONE).is_ok());
+        }
+        let res = feed_receive_result(&mut ctx, &frame, ReceiveFlags::NONE);
+        assert!(is_pending(&res), "the configured byte budget must pend");
+        assert_eq!(ctx.recv_budget.buffered(), BYTES);
+        // The byte budget, not the (default, huge) unit cap, was the binding cap.
+        assert!(ctx.recv_budget.units() < DEFAULT_MAX_RECV_UNITS);
+    }
+
+    /// SC-005 (a): repeated admit/consume cycles return BOTH the unit count and
+    /// the byte total to zero — no monotonic growth.
+    #[test]
+    fn admit_consume_cycles_are_leak_free() {
+        let (mut ctx, _sctx, rctx) = stream_ctx_channel(0u64.try_into().unwrap());
+        let rec = RecordingRecvExec::default();
+        let mut recv = H3RecvStream::with_exec(Box::new(rec), rctx);
+        let mut cx = noop_context();
+
+        for _ in 0..1_000 {
+            assert!(feed_receive_result(&mut ctx, &[0x42], ReceiveFlags::NONE).is_ok());
+            match recv.poll_data(&mut cx) {
+                Poll::Ready(Ok(Some(b))) => assert_eq!(&b[..], &[0x42]),
+                other => panic!("expected data, got {other:?}"),
+            }
+        }
+        // No drift: both counters return to zero and the peak never grew beyond a
+        // single in-flight unit.
+        assert_eq!(
+            recv.rctx.recv_budget.units(),
+            0,
+            "unit count returns to zero"
+        );
+        assert_eq!(
+            recv.rctx.recv_budget.buffered(),
+            0,
+            "byte total returns to zero"
+        );
+        assert_eq!(
+            recv.rctx.recv_budget.peak_units(),
+            1,
+            "at most one unit buffered at a time"
+        );
+        assert!(!recv.rctx.recv_budget.pend_outstanding());
+    }
+
+    /// SC-005 (b): a forced channel-publish failure (dropped frontend) rolls back
+    /// the unit charge — `units` is unchanged after the failed admit.
+    #[test]
+    fn failed_publish_rolls_back_the_unit_charge() {
+        let (mut ctx, _sctx, rctx) = stream_ctx_channel(0u64.try_into().unwrap());
+
+        // One successful non-empty indication establishes a live, undrained unit.
+        assert!(feed_receive_result(&mut ctx, &[0x01], ReceiveFlags::NONE).is_ok());
+        let units_before = ctx.recv_budget.units();
+        let buffered_before = ctx.recv_budget.buffered();
+        assert_eq!(units_before, 1);
+
+        // Drop the frontend receiver: the next publish (send) fails.
+        drop(rctx);
+
+        let res = feed_receive_result(&mut ctx, &[0x02], ReceiveFlags::NONE);
+        assert!(res.is_ok(), "a dropped frontend must not strand PENDING");
+        assert_eq!(
+            ctx.recv_budget.units(),
+            units_before,
+            "the unit charge was rolled back (no leaked unit)"
+        );
+        assert_eq!(
+            ctx.recv_budget.buffered(),
+            buffered_before,
+            "bytes rolled back too"
+        );
+        assert!(
+            ctx.receive.is_none(),
+            "dropped frontend detaches the sender"
+        );
+    }
+
+    /// SC-005 (c): an EMPTY, non-FIN indication enqueues no `Data` event and so
+    /// consumes NO unit (and no bytes).
+    #[test]
+    fn empty_indication_consumes_no_unit() {
+        let (mut ctx, _sctx, _rctx) = stream_ctx_channel(0u64.try_into().unwrap());
+        assert!(feed_receive_result(&mut ctx, &[], ReceiveFlags::NONE).is_ok());
+        assert_eq!(
+            ctx.recv_budget.units(),
+            0,
+            "empty indication charges no unit"
+        );
+        assert_eq!(
+            ctx.recv_budget.buffered(),
+            0,
+            "empty indication buffers no bytes"
+        );
+    }
+
+    /// Teardown-at-cap: a stream terminated (peer reset) while sitting at the unit
+    /// cap drains its buffered units and surfaces the terminal cleanly — no hang,
+    /// no panic, no counter underflow — driven entirely via the recv seam.
+    #[test]
+    fn teardown_while_at_unit_cap_releases_cleanly() {
+        const UNITS: usize = 16;
+        let cfg = H3Config::builder()
+            .with_max_recv_units(UNITS)
+            .build()
+            .unwrap();
+        let (mut ctx, _sctx, rctx) =
+            stream_ctx_channel_with_config(0u64.try_into().unwrap(), new_conn_terminal_slot(), cfg);
+        let rec = RecordingRecvExec::default();
+        let mut recv = H3RecvStream::with_exec(Box::new(rec), rctx);
+        let mut cx = noop_context();
+
+        // Fill to the unit cap: the UNITS-th one-byte offer pends.
+        let mut res = Ok(());
+        for _ in 0..UNITS {
+            res = feed_receive_result(&mut ctx, &[0x07], ReceiveFlags::NONE);
+        }
+        assert!(is_pending(&res), "at the unit cap the stream must pend");
+        assert_eq!(recv.rctx.recv_budget.units(), UNITS);
+
+        // Terminate the stream while at the cap (peer reset via the recv seam).
+        assert!(stream_callback(&mut ctx, StreamEvent::PeerSendAborted { error_code: 5 }).is_ok());
+
+        // Drain: buffered data comes first (FIFO), then the terminal — releasing
+        // every unit cleanly with no hang and no panic.
+        let mut drained = 0usize;
+        loop {
+            match recv.poll_data(&mut cx) {
+                Poll::Ready(Ok(Some(_))) => drained += 1,
+                Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                    assert_eq!(error_code, 5);
+                    break;
+                }
+                other => panic!("expected data then terminal, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            drained, UNITS,
+            "all buffered units drained before the terminal"
+        );
+        assert_eq!(
+            recv.rctx.recv_budget.units(),
+            0,
+            "units released cleanly to zero"
+        );
+    }
+}
+
+/// Phase 1 (config foundation & threading) unit tests: prove a connection's
+/// [`H3Config`] caps reach BOTH stream halves via the same seam
+/// (`stream_ctx_channel*`) that `H3Stream::attach` (peer-accepted) and
+/// `OpeningStream::finalize` (locally-opened) funnel through, that distinct
+/// per-connection configs stay isolated, and that the defaults equal the
+/// historical constants (behavior unchanged). Hermetic (no network).
+#[cfg(test)]
+mod config_threading {
+    use crate::error::MAX_ADAPTER_SEND;
+    use crate::{H3Config, MAX_RECV_BUFFER, new_conn_terminal_slot};
+
+    use super::stream_ctx_channel_with_config;
+
+    fn custom_config() -> H3Config {
+        H3Config::builder()
+            .with_max_send_bytes(4096)
+            .with_max_recv_bytes(8192)
+            .with_max_recv_units(7)
+            .build()
+            .unwrap()
+    }
+
+    /// A custom config threads into a stream ctx built via the seam (the exact
+    /// path both a locally-opened and a peer-accepted stream take through
+    /// `stream_ctx_channel_pre_id`): the receive byte/unit caps and the send
+    /// ceiling all equal the configured values.
+    #[test]
+    fn custom_config_threads_recv_and_send_caps() {
+        let cfg = custom_config();
+        let (_ctx, sctx, rctx) =
+            stream_ctx_channel_with_config(4u64.try_into().unwrap(), new_conn_terminal_slot(), cfg);
+        assert_eq!(rctx.recv_budget.max_bytes(), 8192);
+        assert_eq!(rctx.recv_budget.max_units(), 7);
+        assert_eq!(sctx.max_send_bytes, 4096);
+    }
+
+    /// The same custom config reaching an ACCEPTED-shaped stream (distinct
+    /// conn-terminal slot, mimicking `H3Stream::attach`'s dedicated seam call)
+    /// carries the identical caps: peer-accepted streams inherit the connection
+    /// config (FR-009).
+    #[test]
+    fn custom_config_threads_to_accepted_shaped_stream() {
+        let cfg = custom_config();
+        let accepted_slot = new_conn_terminal_slot();
+        let (_ctx, sctx, rctx) =
+            stream_ctx_channel_with_config(6u64.try_into().unwrap(), accepted_slot, cfg);
+        assert_eq!(rctx.recv_budget.max_bytes(), 8192);
+        assert_eq!(rctx.recv_budget.max_units(), 7);
+        assert_eq!(sctx.max_send_bytes, 4096);
+    }
+
+    /// Default-config construction yields caps equal to the historical constants
+    /// (no behavioral change).
+    #[test]
+    fn default_config_threads_the_historical_constants() {
+        let (_ctx, sctx, rctx) = stream_ctx_channel_with_config(
+            4u64.try_into().unwrap(),
+            new_conn_terminal_slot(),
+            H3Config::default(),
+        );
+        assert_eq!(rctx.recv_budget.max_bytes(), MAX_RECV_BUFFER);
+        assert_eq!(rctx.recv_budget.max_units(), 16384);
+        assert_eq!(sctx.max_send_bytes, MAX_ADAPTER_SEND);
+    }
+
+    /// Two connections with different configs produce streams with their own
+    /// respective caps — no cross-talk (Spec per-connection independence).
+    #[test]
+    fn two_configs_are_isolated() {
+        let a = H3Config::builder()
+            .with_max_send_bytes(1024)
+            .with_max_recv_bytes(2048)
+            .with_max_recv_units(3)
+            .build()
+            .unwrap();
+        let b = H3Config::builder()
+            .with_max_send_bytes(9999)
+            .with_max_recv_bytes(55555)
+            .with_max_recv_units(99)
+            .build()
+            .unwrap();
+        let (_ca, sa, ra) =
+            stream_ctx_channel_with_config(4u64.try_into().unwrap(), new_conn_terminal_slot(), a);
+        let (_cb, sb, rb) =
+            stream_ctx_channel_with_config(8u64.try_into().unwrap(), new_conn_terminal_slot(), b);
+
+        assert_eq!(ra.recv_budget.max_bytes(), 2048);
+        assert_eq!(ra.recv_budget.max_units(), 3);
+        assert_eq!(sa.max_send_bytes, 1024);
+
+        assert_eq!(rb.recv_budget.max_bytes(), 55555);
+        assert_eq!(rb.recv_budget.max_units(), 99);
+        assert_eq!(sb.max_send_bytes, 9999);
     }
 }

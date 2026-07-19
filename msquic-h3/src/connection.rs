@@ -28,10 +28,10 @@ use msquic::{
 use crate::error::{ConnectionTerminal, convert_conn};
 use crate::registration::{Registration, RundownGuard};
 use crate::{
-    CbClass, ConnTerminalSlot, ConnTerminalState, ForceShutdown, H3_INTERNAL_ERROR, H3RecvStream,
-    H3SendStream, H3Stream, PoisonFlag, ShutdownSeam, StreamOpener, classify_transport,
-    commit_conn, guard_callback, internal_error_status, lock_recover, record_conn_terminal,
-    report_contained_panic,
+    CbClass, ConnTerminalSlot, ConnTerminalState, ForceShutdown, H3_INTERNAL_ERROR, H3Config,
+    H3RecvStream, H3SendStream, H3Stream, PoisonFlag, ShutdownSeam, StreamOpener,
+    classify_transport, commit_conn, guard_callback, internal_error_status, lock_recover,
+    record_conn_terminal, report_contained_panic,
 };
 
 /// Owns the raw msquic connection handle together with its [`RundownGuard`].
@@ -48,6 +48,9 @@ pub(crate) struct ConnHandle {
     /// context so the stream opener (`OpenStreams::close`) can record a local
     /// close through the borrowed handle.
     terminal: ConnTerminalSlot,
+    /// Per-connection memory-budget configuration (Copy). Read by the
+    /// [`StreamOpener`] so locally-opened streams inherit the connection's caps.
+    config: H3Config,
     _guard: RundownGuard,
 }
 
@@ -56,10 +59,12 @@ impl ConnHandle {
         inner: msquic::Connection,
         guard: RundownGuard,
         terminal: ConnTerminalSlot,
+        config: H3Config,
     ) -> Self {
         Self {
             inner,
             terminal,
+            config,
             _guard: guard,
         }
     }
@@ -67,6 +72,11 @@ impl ConnHandle {
     /// The shared connection terminal-reason slot.
     pub(crate) fn terminal(&self) -> &ConnTerminalSlot {
         &self.terminal
+    }
+
+    /// The per-connection memory-budget configuration.
+    pub(crate) fn config(&self) -> H3Config {
+        self.config
     }
 }
 
@@ -93,6 +103,10 @@ pub(crate) struct ConnCtxSender {
     pub(crate) uni: Option<mpsc::UnboundedSender<Option<crate::H3Stream>>>,
     /// Shared connection terminal-reason slot (writer side).
     pub(crate) terminal: ConnTerminalSlot,
+    /// Per-connection memory-budget configuration (Copy). Read in the
+    /// `PeerStreamStarted` arm so peer-accepted streams inherit the connection's
+    /// caps (the dual carrier alongside [`ConnHandle::config`]).
+    pub(crate) config: H3Config,
     /// Set by [`connection_recover`] after a contained callback panic (SF-E), so
     /// [`guard_callback`] short-circuits every subsequent event on this ctx.
     pub(crate) poisoned: bool,
@@ -125,7 +139,7 @@ pub(crate) struct ConnCtxReceiver {
     pub(crate) accepted_id_failpoint: Arc<AcceptedIdFailpoint>,
 }
 
-pub(crate) fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
+pub(crate) fn conn_ctx_channel(config: H3Config) -> (ConnCtxSender, ConnCtxReceiver) {
     let (conn_tx, conn_rx) = oneshot::channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (bidi_tx, bidi_rx) = mpsc::unbounded();
@@ -142,6 +156,7 @@ pub(crate) fn conn_ctx_channel() -> (ConnCtxSender, ConnCtxReceiver) {
             bidi: Some(bidi_tx),
             uni: Some(uni_tx),
             terminal: terminal.clone(),
+            config,
             poisoned: false,
             #[cfg(test)]
             accepted_id_failpoint: accepted_id_failpoint.clone(),
@@ -326,7 +341,7 @@ pub(crate) fn connection_callback(
             // (the `stream_set.c` reject-and-close double-close hazard, F-C).
             let owned = unsafe { msquic::Stream::from_raw(stream.as_raw()) };
             stream_owned.set(true);
-            let h3 = crate::H3Stream::attach(owned, id, ctx.terminal.clone());
+            let h3 = crate::H3Stream::attach(owned, id, ctx.terminal.clone(), ctx.config);
             let target = if flags.contains(StreamOpenFlags::UNIDIRECTIONAL) {
                 ctx.uni.as_ref()
             } else {
@@ -435,6 +450,8 @@ pub(crate) fn connection_recover(
 }
 
 impl Connection {
+    /// Connect to `server_name:server_port` using the default memory budgets
+    /// ([`H3Config::default`]).
     ///
     /// The rundown count is reserved synchronously when this is called (before
     /// the returned future is polled), so even a queued/unpolled connect is
@@ -446,11 +463,26 @@ impl Connection {
         server_name: &'a str,
         server_port: u16,
     ) -> impl std::future::Future<Output = Result<Self, Status>> + 'a {
+        Self::connect_with_config(reg, config, server_name, server_port, H3Config::default())
+    }
+
+    /// Connect to `server_name:server_port` with an explicit [`H3Config`].
+    ///
+    /// Identical to [`connect`](Self::connect) except the supplied memory
+    /// budgets are threaded into the connection and every stream it opens or
+    /// accepts.
+    pub fn connect_with_config<'a>(
+        reg: &'a Registration,
+        config: &'a Configuration,
+        server_name: &'a str,
+        server_port: u16,
+        h3config: H3Config,
+    ) -> impl std::future::Future<Output = Result<Self, Status>> + 'a {
         // Reserved now, before the caller ever polls. If the future is dropped
         // without completing, the guard drops and decrements.
         let guard = RundownGuard::new(reg.state().clone());
         async move {
-            let (mut ctx, mut crx) = conn_ctx_channel();
+            let (mut ctx, mut crx) = conn_ctx_channel(h3config);
             let handler = move |conn_ref: ConnectionRef, ev: ConnectionEvent| {
                 let disp = conn_poison_disp(&ev);
                 // Per-invocation peer-stream ownership token (F-C): a fresh `Cell`
@@ -471,7 +503,12 @@ impl Connection {
             // path uses ConnHandle's proven ConnectionClose-then-guard drop
             // order rather than the async future's unspecified capture layout.
             let inner = msquic::Connection::open(reg.raw(), handler)?;
-            let conn = Arc::new(ConnHandle::new(inner, guard, crx.terminal.clone()));
+            let conn = Arc::new(ConnHandle::new(
+                inner,
+                guard,
+                crx.terminal.clone(),
+                h3config,
+            ));
             conn.start(config, server_name, server_port)?;
             // wait for connection. The one-shot carries `Result<(), Status>`: a
             // transport/peer shutdown before `Connected` resolves it with the
@@ -495,8 +532,12 @@ impl Connection {
     }
 
     /// attach to an accepted connection
-    pub(crate) fn attach(inner: msquic::Connection, guard: RundownGuard) -> Self {
-        let (mut ctx, crx) = conn_ctx_channel();
+    pub(crate) fn attach(
+        inner: msquic::Connection,
+        guard: RundownGuard,
+        h3config: H3Config,
+    ) -> Self {
+        let (mut ctx, crx) = conn_ctx_channel(h3config);
         let handler = move |conn_ref: ConnectionRef, ev: ConnectionEvent| {
             let disp = conn_poison_disp(&ev);
             // Per-invocation peer-stream ownership token (F-C); see `connect`.
@@ -510,7 +551,12 @@ impl Connection {
             )
         };
         inner.set_callback_handler(handler);
-        let conn = Arc::new(ConnHandle::new(inner, guard, crx.terminal.clone()));
+        let conn = Arc::new(ConnHandle::new(
+            inner,
+            guard,
+            crx.terminal.clone(),
+            h3config,
+        ));
 
         let opener = StreamOpener::new(conn.clone());
 
@@ -687,5 +733,55 @@ impl<B: Buf> OpenStreams<B> for Connection {
 
     fn close(&mut self, code: h3::error::Code, reason: &[u8]) {
         OpenStreams::<B>::close(&mut self.opener, code, reason)
+    }
+}
+
+/// Phase 1 (config threading) unit tests for the per-connection carrier: the
+/// same [`H3Config`] a listener passes into `Connection::attach` is stored on
+/// BOTH per-connection carriers — the callback-side `ConnCtxSender` (read in the
+/// `PeerStreamStarted` arm to build peer-accepted streams) and, via the same
+/// seam, the `ConnHandle` (read by `StreamOpener` for locally-opened streams).
+/// This asserts the dual carrier the accepted/local paths both depend on.
+#[cfg(test)]
+mod config_carrier {
+    use super::conn_ctx_channel;
+    use crate::H3Config;
+
+    fn custom() -> H3Config {
+        H3Config::builder()
+            .with_max_send_bytes(4096)
+            .with_max_recv_bytes(8192)
+            .with_max_recv_units(7)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn conn_ctx_channel_stores_config_on_the_sender_carrier() {
+        let cfg = custom();
+        let (sender, _recv) = conn_ctx_channel(cfg);
+        // The `PeerStreamStarted` arm reads `ctx.config` and passes it into
+        // `H3Stream::attach`; assert the value the callback will hand accepted
+        // streams equals the connection's configured caps.
+        assert_eq!(sender.config, cfg);
+        assert_eq!(sender.config.max_send_bytes(), 4096);
+        assert_eq!(sender.config.max_recv_bytes(), 8192);
+        assert_eq!(sender.config.max_recv_units(), 7);
+    }
+
+    #[test]
+    fn two_connections_keep_independent_configs() {
+        let a = H3Config::builder().with_max_recv_units(3).build().unwrap();
+        let b = H3Config::builder().with_max_recv_units(99).build().unwrap();
+        let (sa, _ra) = conn_ctx_channel(a);
+        let (sb, _rb) = conn_ctx_channel(b);
+        assert_eq!(sa.config.max_recv_units(), 3);
+        assert_eq!(sb.config.max_recv_units(), 99);
+    }
+
+    #[test]
+    fn default_config_carrier_matches_defaults() {
+        let (sender, _recv) = conn_ctx_channel(H3Config::default());
+        assert_eq!(sender.config, H3Config::default());
     }
 }

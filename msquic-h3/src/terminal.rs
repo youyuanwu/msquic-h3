@@ -256,7 +256,7 @@ mod connection_terminal {
     /// Drive one connection event through the callback and return the frozen,
     /// converted terminal the accept frontend would report.
     fn map_event(ev: ConnectionEvent) -> ConnectionErrorIncoming {
-        let (mut ctx, crx) = conn_ctx_channel();
+        let (mut ctx, crx) = conn_ctx_channel(crate::H3Config::default());
         assert!(connection_callback(&mut ctx, ev, &no_stream_owned()).is_ok());
         observe_terminal(&crx.terminal)
     }
@@ -353,7 +353,7 @@ mod connection_terminal {
 
     #[test]
     fn connected_resolves_ok() {
-        let (mut ctx, mut crx) = conn_ctx_channel();
+        let (mut ctx, mut crx) = conn_ctx_channel(crate::H3Config::default());
         let ev = ConnectionEvent::Connected {
             session_resumed: false,
             negotiated_alpn: &[],
@@ -364,7 +364,7 @@ mod connection_terminal {
 
     #[test]
     fn connected_waiter_resolves_with_transport_status_on_early_shutdown() {
-        let (mut ctx, mut crx) = conn_ctx_channel();
+        let (mut ctx, mut crx) = conn_ctx_channel(crate::H3Config::default());
         // Transport shutdown before Connected carries the real status.
         let ev = ConnectionEvent::ShutdownInitiatedByTransport {
             status: Status::new(StatusCode::QUIC_STATUS_HANDSHAKE_FAILURE),
@@ -381,7 +381,7 @@ mod connection_terminal {
 
     #[test]
     fn connected_waiter_resolves_on_peer_shutdown_before_connected() {
-        let (mut ctx, mut crx) = conn_ctx_channel();
+        let (mut ctx, mut crx) = conn_ctx_channel(crate::H3Config::default());
         assert!(
             connection_callback(
                 &mut ctx,
@@ -405,7 +405,7 @@ mod connection_terminal {
 
     #[test]
     fn connected_waiter_resolves_on_bare_shutdown_complete() {
-        let (mut ctx, mut crx) = conn_ctx_channel();
+        let (mut ctx, mut crx) = conn_ctx_channel(crate::H3Config::default());
         assert!(
             connection_callback(
                 &mut ctx,
@@ -519,7 +519,7 @@ mod connection_terminal {
     fn callback_records_local_close_provisionally_then_refines() {
         // Simulate OpenStreams::close (records LocalClose) racing a peer cause
         // that lands before the frontend observes: the specific cause wins.
-        let (mut ctx, crx) = conn_ctx_channel();
+        let (mut ctx, crx) = conn_ctx_channel(crate::H3Config::default());
         record_conn_terminal(&ctx.terminal, ConnectionTerminal::LocalClose);
         assert!(
             connection_callback(
