@@ -1,3 +1,21 @@
+// Native-provenance guard (SF-L / FR-010). NEITHER `native-find` nor `native-src`
+// selected is the ONLY provenance misconfiguration reachable at this crate's
+// compile time, and it otherwise silently mis-defaults `attest.rs`. Gated on
+// `not(docsrs)` so the docs.rs build (which sets `native-src`, see
+// `[package.metadata.docs.rs]` in Cargo.toml) is unaffected. The BOTH-enabled
+// case is intercepted FIRST by the upstream `msquic` build script
+// (`panic!("feature src and find are mutually exclusive")`), which runs before
+// this crate compiles; a crate-level `compile_error!` cannot preempt an upstream
+// build script, so it is deliberately NOT guarded here (see README/CHANGELOG and
+// the SC-008 negative check).
+#[cfg(all(not(feature = "native-find"), not(feature = "native-src"), not(docsrs)))]
+compile_error!(
+    "no native provenance selected: enable exactly one of the mutually-exclusive \
+     features `native-find` or `native-src` (e.g. \
+     `--no-default-features --features native-find` for a system-package libmsquic, \
+     or `--features native-src` to build from vendored source); see README/CHANGELOG"
+);
+
 use std::{
     ffi::c_void,
     pin::Pin,
@@ -2930,7 +2948,15 @@ mod test {
             .expect("wait_idle should resolve after the connection closed");
     }
 
+    /// Manual-only external smoke check (MF-3): drives a real HTTP/3 GET against a
+    /// public third-party endpoint (`h2o.examp1e.net`). It depends on DNS, remote
+    /// uptime, and ALPN/cert behavior, so it is `#[ignore]`d to keep the default
+    /// suite hermetic. Run it explicitly with
+    /// `cargo test --no-default-features --features native-find -- --ignored client_test_apache`
+    /// when networking is available. The loopback `conformance` suite covers the
+    /// client path hermetically.
     #[test]
+    #[ignore = "requires external internet access (h2o.examp1e.net); run manually with --ignored"]
     fn client_test_apache() {
         util::try_setup_tracing();
         // This does not work (cloudflare servers):
@@ -7322,5 +7348,55 @@ mod conformance {
             drop(server);
             drop(client);
         });
+    }
+}
+
+/// SC-008 NEGATIVE configuration check (SF-L). This is an *expected-FAILURE*
+/// assertion, NOT an `--all-features`/both-enabled success gate: it spawns a
+/// nested `cargo check` that enables BOTH mutually-exclusive provenance features
+/// and asserts the build FAILS with the upstream `msquic` build-script message
+/// `feature src and find are mutually exclusive`. The failure originates in the
+/// upstream dependency's build script (which runs before this crate compiles), so
+/// the crate does not (and cannot) intercept the both-enabled case at crate level
+/// — this test asserts the failure's presence and origin, nothing more.
+///
+/// `#[ignore]`d because it drives a real `cargo` subprocess (slow, and it uses a
+/// separate `CARGO_TARGET_DIR` to avoid the outer build lock). Run it explicitly:
+/// `cargo test --no-default-features --features native-find -- --ignored both_features_mutually_exclusive_negative`
+#[cfg(test)]
+mod feature_config_negative {
+    #[test]
+    #[ignore = "NEGATIVE config check: spawns a nested `cargo check` expected to FAIL; run manually with --ignored"]
+    fn both_features_mutually_exclusive_negative() {
+        use std::process::Command;
+
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        // Isolated target dir so this nested invocation does not contend for the
+        // outer `cargo test` build lock.
+        let neg_target = format!("{manifest_dir}/target/neg-both-features");
+
+        let output = Command::new(&cargo)
+            .current_dir(manifest_dir)
+            .env("CARGO_TARGET_DIR", &neg_target)
+            .args([
+                "check",
+                "--no-default-features",
+                "--features",
+                "native-find,native-src",
+            ])
+            .output()
+            .expect("failed to spawn nested cargo check");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "enabling BOTH native-find + native-src MUST fail the build; got success.\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("feature src and find are mutually exclusive"),
+            "expected the upstream msquic build-script mutual-exclusion message; \
+             the failure must originate upstream (not a crate-level guard).\nstderr:\n{stderr}"
+        );
     }
 }

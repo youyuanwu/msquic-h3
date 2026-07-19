@@ -207,8 +207,12 @@ mod tests {
         } else if cfg!(feature = "native-src") {
             [2, 5, 1]
         } else {
-            // No provenance selected: the link step would already have failed, so
-            // this branch is only reached by `cargo check`. Keep the source pin.
+            // No provenance selected: unreachable in a normal build — the
+            // crate-level `compile_error!` in `lib.rs` now rejects the
+            // neither-enabled case (SF-L / FR-010), and the link step would fail
+            // regardless. Retained as a test-only defensive default (this branch
+            // is only reachable under `docsrs`, which disables that guard for the
+            // link-free doc build). Keep the source pin.
             [2, 5, 1]
         }
     }
