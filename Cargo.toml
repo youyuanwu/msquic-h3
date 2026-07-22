@@ -74,7 +74,7 @@ tracing = { version = "0.1", features = ["log"] }
 # library is chosen per invocation from the command line. `native-find` is the
 # canonical local row on this Linux/2.5.8 host.
 msquic = { version = "2.5.1-beta", default-features = false }
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 # Backend feature exposes h3's internal `proto::frame::Frame` / `WriteBuf` builders
 # so seam tests can construct a real data-carrying `WriteBuf<Bytes>` exactly as
 # h3's own frontend does. Dev-only: not enabled for the published library build.
